@@ -1,0 +1,18 @@
+{
+  "name": "student-learning-platform-demo",
+  "version": "0.1.0",
+  "description": "课程服务平台本地插件",
+  "author": {
+    "name": "fangk"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "课程服务平台",
+    "shortDescription": "面向课程资料阅读、问答与疑点管理的本地平台",
+    "longDescription": "课程服务平台提供 PDF 阅读、AI 问答、疑点管理与知识库沉淀等能力，可作为本地课程服务项目接入 Codex 市场。",
+    "developerName": "fangk",
+    "category": "Education",
+    "capabilities": [],
+    "defaultPrompt": "帮我打开课程服务平台并继续完善功能。"
+  }
+}

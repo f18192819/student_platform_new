@@ -1,0 +1,6 @@
+uuid: course-service-platform
+name: 课程服务平台
+name_zh: 课程服务平台
+description: 面向课程学习、PDF阅读、疑点管理与AI问答的一体化学习服务平台。
+type: service
+logo: frontend/dist/favicon.svg
