@@ -10,14 +10,23 @@ if (!inputPath || !outputPath) {
 }
 
 const COURSE_HOME_URL = 'https://learn.tsinghua.edu.cn/f/wlxt/index/course/student/'
-const LOGIN_ENTRY_URL = 'https://learn.tsinghua.edu.cn/'
 const LEARN_HOST = 'learn.tsinghua.edu.cn'
 const LOGIN_HOST = 'id.tsinghua.edu.cn'
+const CREDENTIAL_ERROR_PATTERNS = [
+  /用户名.{0,12}密码.{0,12}(错误|不正确|有误)/,
+  /(账号|用户名).{0,12}(不存在|错误|不正确)/,
+  /密码.{0,12}(错误|不正确|有误)/,
+  /invalid.{0,12}(username|password|credential)/i,
+]
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function normalize(text) {
   return typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : ''
+}
+
+function isCredentialError(message) {
+  return CREDENTIAL_ERROR_PATTERNS.some((pattern) => pattern.test(message))
 }
 
 async function fileExists(targetPath) {
@@ -174,12 +183,10 @@ async function submitCredentials(page, username, password) {
   await userInput.fill(username)
   await passInput.fill(password)
 
+  const previousUrl = page.url()
   const submitButton = page.locator("a.btn.btn-lg.btn-primary.btn-block, button[type='submit'], input[type='submit']").first()
   if ((await submitButton.count()) > 0) {
-    await Promise.allSettled([
-      page.waitForLoadState('domcontentloaded', { timeout: 30000 }),
-      submitButton.click({ force: true }),
-    ])
+    await submitButton.click({ force: true })
   } else {
     await page.evaluate(() => {
       if (typeof window.doLogin === 'function') {
@@ -192,12 +199,25 @@ async function submitCredentials(page, username, password) {
       }
     })
   }
+
+  // The old code waited for the already-completed DOMContentLoaded event and
+  // then inspected the login page too early. Give the SSO request a chance to
+  // navigate before classifying any message as an authentication failure.
+  if (page.url() === previousUrl) {
+    await Promise.race([
+      page.waitForURL((url) => url.toString() !== previousUrl, { timeout: 10000 }).catch(() => {}),
+      sleep(1800),
+    ])
+  }
+  await sleep(600)
 }
 
 async function waitForLoggedInLearnPage(context, initialPage) {
   const deadline = Date.now() + 180000
   let lastPage = initialPage
   let secondaryAuthSubmitted = false
+  let repeatedCredentialError = ''
+  let credentialErrorFirstSeenAt = 0
 
   while (Date.now() < deadline) {
     const currentPage = getPreferredPage(context, lastPage)
@@ -236,18 +256,32 @@ async function waitForLoggedInLearnPage(context, initialPage) {
         }
       }
 
-      const note = normalize(
-        await currentPage
+      const feedback = normalize(
+        (await currentPage
           .locator('#msg_note, #c_note, .alert-danger, .alert')
-          .first()
-          .textContent()
-          .catch(() => ''),
+          .allTextContents()
+          .catch(() => []))
+          .map(normalize)
+          .filter(Boolean)
+          .join(' '),
       )
-      if (note) {
-        throw new Error(`统一认证返回提示：${note}`)
+      const loginFormVisible = await currentPage
+        .locator('#i_user:visible, input[name="i_user"]:visible')
+        .count()
+        .catch(() => 0)
+      if (feedback && loginFormVisible > 0 && isCredentialError(feedback)) {
+        if (feedback !== repeatedCredentialError) {
+          repeatedCredentialError = feedback
+          credentialErrorFirstSeenAt = Date.now()
+        } else if (Date.now() - credentialErrorFirstSeenAt >= 2000) {
+          throw new Error(`统一认证明确拒绝了本次凭据：${feedback}`)
+        }
+      } else if (!feedback || loginFormVisible === 0) {
+        repeatedCredentialError = ''
+        credentialErrorFirstSeenAt = 0
       }
-      const captchaVisible = await currentPage.locator('#c_code:not(.hidden)').count().catch(() => 0)
-      if (captchaVisible > 0) {
+      const captchaVisible = await currentPage.locator('#c_code').isVisible().catch(() => false)
+      if (captchaVisible) {
         throw new Error('统一认证页面要求图形验证码，当前自动登录无法继续。')
       }
     }

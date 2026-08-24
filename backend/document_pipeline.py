@@ -384,7 +384,37 @@ def _block_bbox(item: dict[str, Any]) -> list[float] | None:
   return bbox if bbox[2] > bbox[0] and bbox[3] > bbox[1] else None
 
 
-def _middle_layout_blocks(payload: Any) -> list[dict[str, Any]]:
+def _block_image_path(value: Any) -> str:
+  """Find MinerU's image path without depending on one output schema version."""
+  if isinstance(value, dict):
+    for key in ('image_path', 'img_path'):
+      candidate = str(value.get(key) or '').strip()
+      if candidate:
+        return candidate
+    for nested in value.values():
+      if candidate := _block_image_path(nested):
+        return candidate
+  elif isinstance(value, list):
+    for nested in value:
+      if candidate := _block_image_path(nested):
+        return candidate
+  return ''
+
+
+def _image_asset_path(raw_path: str, artifact_parent: str) -> str:
+  normalized = raw_path.replace('\\', '/').lstrip('/')
+  parts = [part for part in normalized.split('/') if part not in {'', '.'}]
+  if not parts or '..' in parts:
+    return ''
+  if len(parts) == 1:
+    parts.insert(0, 'images')
+  prefix = [part for part in artifact_parent.replace('\\', '/').split('/') if part not in {'', '.'}]
+  if '..' in prefix:
+    return ''
+  return '/'.join([*prefix, *parts])
+
+
+def _middle_layout_blocks(payload: Any, artifact_parent: str = '') -> list[dict[str, Any]]:
   """Extract page-native PDF coordinates from MinerU's middle.json."""
   if not isinstance(payload, dict):
     return []
@@ -420,6 +450,9 @@ def _middle_layout_blocks(payload: Any) -> list[dict[str, Any]]:
         'coordinateSpace': 'pdf-page',
         'source': 'mineru-local',
       })
+      image_path = _block_image_path(item) if kind == 'image' else ''
+      if image_path:
+        blocks[-1]['assetPath'] = _image_asset_path(image_path, artifact_parent)
   return blocks
 
 
@@ -432,6 +465,8 @@ def _archive_result(archive: bytes, target: Path) -> tuple[str, list[dict[str, A
   page_count = 0
   middle_payload: dict[str, Any] | None = None
   content_payload: list[Any] | None = None
+  middle_artifact_parent = ''
+  content_artifact_parent = ''
   with zipfile.ZipFile(io.BytesIO(archive)) as package:
     for info in package.infolist():
       name = Path(info.filename)
@@ -448,6 +483,7 @@ def _archive_result(archive: bytes, target: Path) -> tuple[str, list[dict[str, A
           parsed_middle = json.loads(package.read(info))
           if isinstance(parsed_middle, dict):
             middle_payload = parsed_middle
+            middle_artifact_parent = name.parent.as_posix()
             page_count = len(parsed_middle.get('pdf_info') or [])
         except Exception:  # noqa: BLE001
           pass
@@ -456,9 +492,10 @@ def _archive_result(archive: bytes, target: Path) -> tuple[str, list[dict[str, A
           parsed_content = json.loads(package.read(info))
           if isinstance(parsed_content, list):
             content_payload = parsed_content
+            content_artifact_parent = name.parent.as_posix()
         except Exception:  # noqa: BLE001
           pass
-  blocks = _middle_layout_blocks(middle_payload)
+  blocks = _middle_layout_blocks(middle_payload, middle_artifact_parent)
   if not blocks and content_payload:
     # Compatibility fallback for unusual MinerU archives without middle.json.
     for index, item in enumerate(content_payload):
@@ -476,7 +513,11 @@ def _archive_result(archive: bytes, target: Path) -> tuple[str, list[dict[str, A
         'image': '[图片区域：请结合页面图片内容引用]',
         'table': '[表格区域：未识别到可复制表格文本]',
       }.get(kind, label)
-      blocks.append({'id': f'page-{page_number}-block-{index + 1}', 'pageNumber': page_number, 'kind': kind, 'text': text, 'label': label, 'bbox': bbox, 'source': 'mineru-local'})
+      block = {'id': f'page-{page_number}-block-{index + 1}', 'pageNumber': page_number, 'kind': kind, 'text': text, 'label': label, 'bbox': bbox, 'source': 'mineru-local'}
+      image_path = _block_image_path(item) if kind == 'image' else ''
+      if image_path:
+        block['assetPath'] = _image_asset_path(image_path, content_artifact_parent)
+      blocks.append(block)
   if not markdown:
     raise HTTPException(status_code=502, detail='MinerU result package did not include Markdown.')
   # Downstream APIs use this stable path regardless of MinerU's output filename.
@@ -720,6 +761,53 @@ class QdrantVectorStore:
         delete_from_client(legacy_client)
       finally:
         legacy_client.close()
+
+  def delete_course(self, course_id: str) -> None:
+    """Remove an entire course partition, including legacy vectors for that course."""
+    normalized_course_id = str(course_id or '').strip()
+    if not normalized_course_id:
+      return
+
+    key = self._course_key(normalized_course_id)
+    course_path = self.courses_path / key
+    with self._lock:
+      client = self._clients.pop(key, None)
+    if client is not None:
+      self._release_client(client, course_path)
+
+    # A second store instance must not keep the embedded storage open while it
+    # is being removed. Failing loudly preserves deletion consistency.
+    with _QDRANT_CLIENT_LOCK:
+      if str(course_path.resolve()).casefold() in _QDRANT_SHARED_CLIENTS:
+        raise RuntimeError(f'Qdrant course partition is still in use: {course_path}')
+
+    if course_path.is_dir():
+      shutil.rmtree(course_path)
+
+    # The migration intentionally retains the old root store. Remove points
+    # there too so a deleted course cannot be returned by a legacy query.
+    legacy_collection_root = self.path / 'collection'
+    if not legacy_collection_root.is_dir():
+      return
+    legacy_client = QdrantClient(path=str(self.path))
+    try:
+      for collection in legacy_client.get_collections().collections:
+        legacy_client.delete(
+          collection_name=collection.name,
+          points_selector=models.FilterSelector(
+            filter=models.Filter(
+              must=[
+                models.FieldCondition(
+                  key='course_id',
+                  match=models.MatchValue(value=normalized_course_id),
+                )
+              ]
+            )
+          ),
+          wait=True,
+        )
+    finally:
+      legacy_client.close()
 
   def migrate_legacy_collections(self, collection_names: list[str]) -> dict[str, Any]:
     """Copy old root-level vectors into course partitions without re-embedding."""
@@ -1120,6 +1208,29 @@ class DocumentPipeline:
     directory = self._dir(document_id)
     if directory.is_dir():
       shutil.rmtree(directory)
+    with self._run_lock:
+      self._cancel_events.pop(document_id, None)
+      self._active_runs.pop(document_id, None)
+
+  def delete_course(self, course_id: str) -> None:
+    """Remove every persisted lecture job for a course, including orphaned jobs."""
+    normalized_course_id = str(course_id or '').strip()
+    if not normalized_course_id:
+      return
+    document_ids = []
+    if DOCUMENTS_ROOT.is_dir():
+      for directory in DOCUMENTS_ROOT.iterdir():
+        if not directory.is_dir():
+          continue
+        state = _read_json(directory / 'state.json', {})
+        if str(state.get('course_id') or '') == normalized_course_id:
+          document_ids.append(str(state.get('document_id') or directory.name))
+    for document_id in document_ids:
+      self.delete(document_id)
+
+    delete_course_vectors = getattr(self.vector_store, 'delete_course', None)
+    if callable(delete_course_vectors):
+      delete_course_vectors(normalized_course_id)
 
   def retrieve(self, query: str, course_id: str = '', document_type: str = '', top_n: int = 8) -> list[dict[str, Any]]:
     vector = self.embedding.embed([query])[0]

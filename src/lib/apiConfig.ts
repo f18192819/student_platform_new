@@ -217,6 +217,29 @@ export async function saveApiConfigToServer(config: ApiConfig): Promise<ApiConfi
   return saved
 }
 
+export async function fetchProviderModels(baseUrl: string, apiKey: string) {
+  const response = await fetch(resolveBackendApiUrl('/api/provider-models'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ base_url: baseUrl.trim(), api_key: apiKey.trim() }),
+  })
+  const payload = (await response.json().catch(() => ({}))) as {
+    models?: unknown
+    count?: number
+    detail?: string
+  }
+  if (!response.ok) {
+    throw new Error(payload.detail || `获取模型列表失败 (HTTP ${response.status})`)
+  }
+  const models = Array.isArray(payload.models)
+    ? payload.models.filter((model): model is string => typeof model === 'string' && Boolean(model.trim()))
+    : []
+  if (!models.length) {
+    throw new Error('模型服务没有返回可选择的模型。')
+  }
+  return Array.from(new Set(models.map((model) => model.trim())))
+}
+
 export function hasUsableApiConfig(config: ApiConfig) {
   return Boolean(
     config.baseUrl.trim() &&

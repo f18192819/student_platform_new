@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import PROJECT_ROOT
-from .document_pipeline import ApiEmbeddingProvider, DocumentParser, LocalMinerUParser, QdrantVectorStore, _archive_result, _write_json
+from .document_pipeline import ApiEmbeddingProvider, DocumentParser, LocalMinerUParser, QdrantVectorStore, _archive_result, _middle_layout_blocks, _write_json
 from .runtime_config import load_api_config
 
 QUESTION_PIPELINE_ROOT = PROJECT_ROOT / '.runtime' / 'question-pipeline'
@@ -23,6 +23,137 @@ QUESTION_COLLECTION = 'course_questions'
 QUESTION_EXTRACTION_VERSION = 3
 QUESTION_FILES_DIRECTORY = 'questions'
 QUESTION_EMBEDDING_CONTENT_CHARS = 3200
+QUESTION_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+
+def _question_document_directory(document_id: str) -> Path:
+  safe_id = re.sub(r'[^A-Za-z0-9._-]+', '-', document_id).strip('.-')
+  return QUESTION_DOCUMENTS_ROOT / (safe_id or 'invalid-document')
+
+
+def _layout_blocks_with_image_assets(document_id: str) -> list[dict[str, Any]]:
+  """Read layout blocks and upgrade pre-image-support MinerU results in place."""
+  directory = _question_document_directory(document_id)
+  layout_path = directory / 'layout-blocks.json'
+  try:
+    blocks = json.loads(layout_path.read_text(encoding='utf-8'))
+  except (OSError, json.JSONDecodeError):
+    return []
+  if not isinstance(blocks, list):
+    return []
+  image_blocks = [item for item in blocks if isinstance(item, dict) and item.get('kind') == 'image']
+  if not image_blocks or all(str(item.get('assetPath') or '').strip() for item in image_blocks):
+    return [item for item in blocks if isinstance(item, dict)]
+
+  artifacts_root = directory / 'mineru' / 'artifacts'
+  enriched_by_id: dict[str, dict[str, Any]] = {}
+  middle_paths = sorted(artifacts_root.rglob('*middle.json')) if artifacts_root.is_dir() else []
+  for middle_path in middle_paths:
+    try:
+      payload = json.loads(middle_path.read_text(encoding='utf-8'))
+      parent = middle_path.parent.relative_to(artifacts_root).as_posix()
+      enriched_by_id.update({
+        str(item.get('id') or ''): item
+        for item in _middle_layout_blocks(payload, parent)
+        if isinstance(item, dict) and item.get('kind') == 'image'
+      })
+    except (OSError, ValueError, json.JSONDecodeError):
+      continue
+
+  changed = False
+  for block in image_blocks:
+    enriched = enriched_by_id.get(str(block.get('id') or '')) or {}
+    asset_path = str(enriched.get('assetPath') or '').strip()
+    if asset_path and not block.get('assetPath'):
+      block['assetPath'] = asset_path
+      changed = True
+  if changed:
+    _write_json(layout_path, blocks)
+  return [item for item in blocks if isinstance(item, dict)]
+
+
+def question_image_attachments(
+  document_id: str,
+  question: dict[str, Any],
+  prompt: str,
+) -> list[dict[str, Any]]:
+  """Return only original MinerU images that belong to the question prompt."""
+  blocks = _layout_blocks_with_image_assets(document_id)
+  block_by_id = {str(item.get('id') or ''): item for item in blocks}
+  source_block_ids = list(dict.fromkeys(
+    str(value or '').strip() for value in question.get('source_block_ids') or [] if str(value or '').strip()
+  ))
+  if not source_block_ids:
+    return []
+
+  # MinerU can order a visual after answer text even when it is displayed beside
+  # the question, so an explicit figure reference also retains opening-page art.
+  segment_by_id = {
+    str(item.get('segment_id') or ''): item
+    for item in AIQuestionExtractor._source_segments('', blocks)
+  }
+  selected_segments = [
+    segment_by_id[str(segment_id)]
+    for segment_id in question.get('source_segment_ids') or []
+    if str(segment_id) in segment_by_id
+  ]
+  prompt_length = len(str(prompt or '').strip())
+  prompt_block_ids: set[str] = set()
+  prompt_pages: set[int] = set()
+  consumed = 0
+  for segment in selected_segments:
+    if consumed < prompt_length:
+      prompt_block_ids.add(str(segment.get('block_id') or ''))
+      prompt_pages.add(max(1, int(segment.get('page_number') or 1)))
+    consumed += len(str(segment.get('text') or '').strip()) + 1
+
+  opening_page = max(1, int(question.get('page_number') or 1))
+  prompt_pages.add(opening_page)
+  mentions_figure = bool(re.search(
+    r'如(?:下)?图|见图|图中|示意图|figure|diagram|shown\s+(?:below|above)',
+    prompt,
+    re.IGNORECASE,
+  ))
+  attachments = []
+  for block_id in source_block_ids:
+    block = block_by_id.get(block_id) or {}
+    if block.get('kind') != 'image':
+      continue
+    page_number = max(1, int(block.get('pageNumber') or opening_page))
+    if block_id not in prompt_block_ids and not (mentions_figure and page_number in prompt_pages):
+      continue
+    if not str(block.get('assetPath') or '').strip():
+      continue
+    attachments.append({
+      'id': block_id,
+      'page_number': page_number,
+      'alt': f'Question figure from source page {page_number}',
+      'url': f'/api/adaptive-tests/question-assets/{document_id}/{block_id}',
+    })
+  return attachments
+
+
+def resolve_question_image_asset(document_id: str, image_id: str) -> Path:
+  directory = _question_document_directory(document_id)
+  block = next(
+    (
+      item for item in _layout_blocks_with_image_assets(document_id)
+      if str(item.get('id') or '') == image_id and item.get('kind') == 'image'
+    ),
+    None,
+  )
+  if not block:
+    raise HTTPException(status_code=404, detail='Question image not found.')
+  asset_path = str(block.get('assetPath') or '').strip()
+  artifacts_root = (directory / 'mineru' / 'artifacts').resolve()
+  candidate = (artifacts_root / asset_path).resolve()
+  if (
+    artifacts_root not in candidate.parents
+    or candidate.suffix.lower() not in QUESTION_IMAGE_EXTENSIONS
+    or not candidate.is_file()
+  ):
+    raise HTTPException(status_code=404, detail='Question image file not found.')
+  return candidate
 
 
 def build_question_retrieval_text(question: dict[str, Any]) -> str:
@@ -1011,6 +1142,21 @@ class QuestionPipeline:
     directory = self._dir(document_id)
     if directory.is_dir():
       shutil.rmtree(directory)
+
+  def delete_course(self, course_id: str) -> None:
+    """Remove orphaned question jobs that belong to a deleted course."""
+    normalized_course_id = str(course_id or '').strip()
+    if not normalized_course_id or not QUESTION_DOCUMENTS_ROOT.is_dir():
+      return
+    document_ids = []
+    for directory in QUESTION_DOCUMENTS_ROOT.iterdir():
+      if not directory.is_dir():
+        continue
+      state = self._read(directory / 'state.json')
+      if str(state.get('course_id') or '') == normalized_course_id:
+        document_ids.append(str(state.get('document_id') or directory.name))
+    for document_id in document_ids:
+      self.delete(document_id)
 
   def resume_pending(self) -> None:
     if not QUESTION_DOCUMENTS_ROOT.is_dir():

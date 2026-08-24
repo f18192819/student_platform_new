@@ -10,6 +10,7 @@ export type PromptSourceSection = {
   id: string
   title: string
   content: string
+  bucket?: 'pinned' | 'retrieval' | 'auxiliary'
   priority?: number
   trimMode?: 'head' | 'head-tail'
 }
@@ -39,7 +40,6 @@ type BuildPromptContextPlanOptions = {
   imageCount?: number
 }
 
-const SOURCE_SHARE_WHEN_OVERFLOWING = 0.7
 const IMAGE_TOKEN_ESTIMATE = 4_096
 const MIN_TRUNCATED_SECTION_TOKENS = 96
 const TRUNCATION_MARKER = '\n\n[内容因模型上下文限制已截断]\n\n'
@@ -91,7 +91,7 @@ function fitHistory(
   let fittedSummary: ChatMessage | null = null
 
   if (summary) {
-    const summaryBudget = Math.min(remaining, Math.max(256, Math.floor(maxTokens * 0.25)))
+    const summaryBudget = Math.min(remaining, Math.max(256, Math.floor(maxTokens / 3)))
     const content = truncateTextToTokenBudget(summary.content, summaryBudget - 4, tokenizer, 'head-tail')
     if (content) {
       fittedSummary = { ...summary, content }
@@ -182,6 +182,37 @@ function estimateSources(
   )
 }
 
+type ContextBucket = 'history' | 'pinned' | 'retrieval' | 'auxiliary'
+
+function sourceBucket(section: PromptSourceSection): Exclude<ContextBucket, 'history'> {
+  return section.bucket ?? 'retrieval'
+}
+
+function allocateElasticBudgets(
+  rawTokens: Record<ContextBucket, number>,
+  baseBudgets: Record<ContextBucket, number>,
+  available: number,
+) {
+  const keys: ContextBucket[] = ['history', 'pinned', 'retrieval', 'auxiliary']
+  const baseTotal = keys.reduce((total, key) => total + baseBudgets[key], 0)
+  const scale = baseTotal > available && baseTotal > 0 ? available / baseTotal : 1
+  const budgets = Object.fromEntries(
+    keys.map((key) => [key, Math.min(rawTokens[key], Math.floor(baseBudgets[key] * scale))]),
+  ) as Record<ContextBucket, number>
+  let remaining = Math.max(0, available - keys.reduce((total, key) => total + budgets[key], 0))
+
+  // Unused capacity is offered to already-selected evidence first. This never
+  // fetches extra chunks merely to fill the target.
+  const elasticOrder: ContextBucket[] = ['retrieval', 'pinned', 'history', 'auxiliary']
+  for (const key of elasticOrder) {
+    if (!remaining) break
+    const additional = Math.min(remaining, Math.max(0, rawTokens[key] - budgets[key]))
+    budgets[key] += additional
+    remaining -= additional
+  }
+  return budgets
+}
+
 export function buildPromptContextPlan(options: BuildPromptContextPlanOptions): PromptContextPlan {
   const model = resolveModelContextBudget(options.config, options.modelId, options.task)
   const history = options.history.filter((message) =>
@@ -195,7 +226,7 @@ export function buildPromptContextPlan(options: BuildPromptContextPlanOptions): 
   const rawHistoryTokens = estimateChatMessageTokens(history, model.tokenizer)
   const rawSourceTokens = estimateSources(options.sourceSections, model.tokenizer)
   const rawInputTokens = fixedTokens + rawHistoryTokens + rawSourceTokens
-  const available = Math.max(0, model.inputBudgetTokens - fixedTokens)
+  const available = Math.max(0, model.softTargetTokens - fixedTokens)
 
   if (rawHistoryTokens + rawSourceTokens <= available) {
     const sourceText = options.sourceSections
@@ -219,37 +250,48 @@ export function buildPromptContextPlan(options: BuildPromptContextPlanOptions): 
     }
   }
 
-  let sourceBudget = Math.min(rawSourceTokens, Math.floor(available * SOURCE_SHARE_WHEN_OVERFLOWING))
-  let historyBudget = Math.min(rawHistoryTokens, Math.max(0, available - sourceBudget))
-  if (rawHistoryTokens < historyBudget) {
-    sourceBudget += historyBudget - rawHistoryTokens
-    historyBudget = rawHistoryTokens
+  const groupedSources = {
+    pinned: options.sourceSections.filter((section) => sourceBucket(section) === 'pinned'),
+    retrieval: options.sourceSections.filter((section) => sourceBucket(section) === 'retrieval'),
+    auxiliary: options.sourceSections.filter((section) => sourceBucket(section) === 'auxiliary'),
   }
-
-  let fittedHistory = fitHistory(history, historyBudget, model.tokenizer)
-  const fittedHistoryTokens = estimateChatMessageTokens(fittedHistory, model.tokenizer)
-  sourceBudget += Math.max(0, historyBudget - fittedHistoryTokens)
-  let fittedSources = fitSources(options.sourceSections, sourceBudget, model.tokenizer)
-  let fittedSourceTokens = estimateTextTokens(fittedSources.sourceText, model.tokenizer)
-
-  const unusedSourceBudget = Math.max(0, sourceBudget - fittedSourceTokens)
-  if (unusedSourceBudget && fittedHistory.length < history.length) {
-    fittedHistory = fitHistory(history, historyBudget + unusedSourceBudget, model.tokenizer)
+  const rawBucketTokens: Record<ContextBucket, number> = {
+    history: rawHistoryTokens,
+    pinned: estimateSources(groupedSources.pinned, model.tokenizer),
+    retrieval: estimateSources(groupedSources.retrieval, model.tokenizer),
+    auxiliary: estimateSources(groupedSources.auxiliary, model.tokenizer),
   }
-
+  const budgets = allocateElasticBudgets(
+    rawBucketTokens,
+    {
+      history: model.conversationBudgetTokens,
+      pinned: model.pinnedContextBudgetTokens,
+      retrieval: model.retrievalBudgetTokens,
+      auxiliary: model.auxiliaryBudgetTokens,
+    },
+    available,
+  )
+  const fittedHistory = fitHistory(history, budgets.history, model.tokenizer)
+  const fittedSourceGroups = [
+    fitSources(groupedSources.pinned, budgets.pinned, model.tokenizer),
+    fitSources(groupedSources.retrieval, budgets.retrieval, model.tokenizer),
+    fitSources(groupedSources.auxiliary, budgets.auxiliary, model.tokenizer),
+  ]
+  const fittedSourceText = fittedSourceGroups
+    .map((group) => group.sourceText)
+    .filter(Boolean)
+    .join('\n\n')
+  const includedSourceIds = fittedSourceGroups.flatMap((group) => group.includedSourceIds)
+  const omittedSourceIds = fittedSourceGroups.flatMap((group) => group.omittedSourceIds)
   const finalHistoryTokens = estimateChatMessageTokens(fittedHistory, model.tokenizer)
-  const finalAvailableSourceBudget = Math.max(0, available - finalHistoryTokens)
-  if (finalAvailableSourceBudget !== sourceBudget) {
-    fittedSources = fitSources(options.sourceSections, finalAvailableSourceBudget, model.tokenizer)
-    fittedSourceTokens = estimateTextTokens(fittedSources.sourceText, model.tokenizer)
-  }
+  const fittedSourceTokens = estimateTextTokens(fittedSourceText, model.tokenizer)
 
   return {
     model,
     history: fittedHistory,
-    sourceText: fittedSources.sourceText,
-    includedSourceIds: fittedSources.includedSourceIds,
-    omittedSourceIds: fittedSources.omittedSourceIds,
+    sourceText: fittedSourceText,
+    includedSourceIds,
+    omittedSourceIds,
     estimatedInputTokens: fixedTokens + finalHistoryTokens + fittedSourceTokens,
     rawInputTokens,
     historyTokens: finalHistoryTokens,
@@ -257,7 +299,7 @@ export function buildPromptContextPlan(options: BuildPromptContextPlanOptions): 
     droppedHistoryMessages: Math.max(0, history.length - fittedHistory.length),
     wasTruncated:
       fittedHistory.length < history.length ||
-      fittedSources.omittedSourceIds.length > 0 ||
+      omittedSourceIds.length > 0 ||
       fittedSourceTokens < rawSourceTokens,
   }
 }

@@ -133,7 +133,7 @@ export function createKnowledgeCourseRecord(
 ): KnowledgeCourse {
   const normalized = normalizeKnowledgeCourseInput(input)
   if (!normalized.name) {
-    throw new Error('璇剧▼鍚嶇О涓嶈兘涓虹┖')
+    throw new Error('课程名称不能为空')
   }
 
   return {
@@ -156,7 +156,7 @@ export function normalizeKnowledgeCourse(
   now = new Date().toISOString(),
 ): KnowledgeCourse {
   const normalized = normalizeKnowledgeCourseInput({
-    name: String(course.name || '').trim() || '鏈懡鍚嶈绋?',
+    name: String(course.name || '').trim() || '未命名课程',
     source: course.source,
     semesterId: course.semesterId,
     semesterName: course.semesterName,
@@ -166,7 +166,7 @@ export function normalizeKnowledgeCourse(
 
   return {
     id: course.id ?? crypto.randomUUID(),
-    name: buildKnowledgeCourseDisplayName(normalized) || '鏈懡鍚嶈绋?',
+    name: buildKnowledgeCourseDisplayName(normalized) || '未命名课程',
     displayName: String(course.displayName || '').trim() || buildKnowledgeCourseDisplayName(normalized),
     source: normalized.source,
     semesterId: normalized.source === 'tsinghua-sync' ? normalized.semesterId : null,

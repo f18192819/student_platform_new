@@ -234,17 +234,17 @@ function buildAnnotationMarkdown(annotations: StoredDoubtAnnotation[]) {
   }
 
   return [
-    '## 鐤戠偣璁板綍',
+    '## 疑点记录',
     '',
     ...annotations.flatMap((annotation, index) => {
       const lines = [
-        `### 鐤戠偣 ${index + 1}`,
-        `- 椤电爜锛?{annotation.pageNumber ?? '鏈寚瀹?}`,
-        `- 闂锛?{annotation.question}`,
+        `### 疑点 ${index + 1}`,
+        `- 页码：${annotation.pageNumber ?? '未指定'}`,
+        `- 问题：${annotation.question}`,
       ]
 
       if (annotation.imageName) {
-        lines.push(`- 鍥剧墖锛?{annotation.imageName}`)
+        lines.push(`- 图片：${annotation.imageName}`)
       }
 
       return [...lines, '']
@@ -262,7 +262,7 @@ function normalizeClassroomSegment(segment: Partial<ClassroomLectureSegment>): C
       typeof segment.recordingId === 'string' && segment.recordingId.trim()
         ? segment.recordingId.trim()
         : null,
-    title: String(segment.title || '璇惧爞璁茶В鐗囨').trim() || '璇惧爞璁茶В鐗囨',
+    title: String(segment.title || '课堂讲解片段').trim() || '课堂讲解片段',
     summary: String(segment.summary || '').trim(),
     polishedText: String(segment.polishedText || '').trim(),
     anchorText:
@@ -415,7 +415,7 @@ function normalizeStructuredDocumentBlocks(blocks: unknown): StructuredDocumentB
         label:
           typeof partial.label === 'string' && partial.label.trim()
             ? partial.label.trim()
-            : `绗?${pageNumber} 椤靛尯鍧?${index + 1}`,
+            : `第 ${pageNumber} 页区域 ${index + 1}`,
         text: typeof partial.text === 'string' ? partial.text.trim() : '',
         bbox: [bbox[0]!, bbox[1]!, bbox[2]!, bbox[3]!],
         ...(partial.coordinateSpace === 'pdf-page' ? { coordinateSpace: 'pdf-page' as const } : {}),
@@ -614,7 +614,7 @@ function normalizeLibraryFile(file: Partial<KnowledgeFile>): KnowledgeFile {
 
 function ensureWindow() {
   if (typeof window === 'undefined') {
-    throw new Error('褰撳墠鐜涓嶆敮鎸佺煡璇嗗簱瀛樺偍')
+    throw new Error('当前环境不支持知识库存储')
   }
 }
 
@@ -670,7 +670,7 @@ async function fetchKnowledgeLibraryFromServer() {
   ensureWindow()
   const response = await fetch(resolveBackendApiUrl('/api/knowledge/library'))
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `鏃犳硶鍔犺浇鐭ヨ瘑搴?(HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `无法加载知识库 (HTTP ${response.status})`))
   }
 
   const payload = (await response.json().catch(() => ({}))) as Partial<KnowledgeLibrary>
@@ -688,7 +688,7 @@ async function persistKnowledgeLibrary(library: KnowledgeLibrary) {
     }),
   })
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `鐭ヨ瘑搴撲繚瀛樺け璐?(HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `知识库保存失败 (HTTP ${response.status})`))
   }
 }
 
@@ -795,7 +795,7 @@ export async function ensureKnowledgeLibraryLoaded() {
 export function createKnowledgeCourse(name: KnowledgeCourseInput): KnowledgeCourse {
   const normalized = normalizeCourseInput(name)
   if (!normalized.name) {
-    throw new Error('璇剧▼鍚嶇О涓嶈兘涓虹┖')
+    throw new Error('课程名称不能为空')
   }
 
   const course = createKnowledgeCourseRecord(normalized)
@@ -1037,7 +1037,7 @@ export async function loadKnowledgePdfSource(fileId: string) {
     return null
   }
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `PDF 婧愭枃浠跺姞杞藉け璐?(HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `PDF 源文件加载失败 (HTTP ${response.status})`))
   }
   return await response.arrayBuffer()
 }
@@ -1052,7 +1052,7 @@ export async function saveKnowledgeAnnotationAsset(assetId: string, dataUrl: str
     },
   )
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `鐤戠偣鍥剧墖淇濆瓨澶辫触 (HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `疑点图片保存失败 (HTTP ${response.status})`))
   }
 }
 
@@ -1064,7 +1064,7 @@ export async function loadKnowledgeAnnotationAsset(assetId: string) {
     return null
   }
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `鐤戠偣鍥剧墖鍔犺浇澶辫触 (HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `疑点图片加载失败 (HTTP ${response.status})`))
   }
 
   const payload = (await response.json().catch(() => ({}))) as { dataUrl?: string }
@@ -1095,7 +1095,7 @@ export async function saveKnowledgeHomeworkAsset(assetId: string, payload: Array
         )
 
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `缁冧範璧勬簮淇濆瓨澶辫触 (HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `练习资源保存失败 (HTTP ${response.status})`))
   }
 }
 
@@ -1107,7 +1107,7 @@ export async function loadKnowledgeHomeworkAsset(assetId: string) {
     return null
   }
   if (!response.ok) {
-    throw new Error(await readResponseError(response, `缁冧範璧勬簮鍔犺浇澶辫触 (HTTP ${response.status})`))
+    throw new Error(await readResponseError(response, `练习资源加载失败 (HTTP ${response.status})`))
   }
 
   const contentType = (response.headers.get('content-type') || '').toLowerCase()

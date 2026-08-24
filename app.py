@@ -50,6 +50,7 @@ from backend.config import (
   PROJECT_ROOT,
 )
 from backend.runtime_config import load_api_config, save_api_config
+from backend.provider_models import fetch_provider_models
 from backend.audio_alignment import (
   AudioAlignmentService,
   LectureRecording,
@@ -58,6 +59,13 @@ from backend.audio_alignment import (
 from backend.document_pipeline import DocumentPipeline, QDRANT_COLLECTION, local_mineru_service
 from backend.question_pipeline import QUESTION_COLLECTION, QuestionPipeline
 from backend.question_relations import QuestionRelationPipeline
+from backend.chat_retrieval import ChatContextRetriever
+from backend.adaptive_testing import (
+  adaptive_testing_router,
+  configure_adaptive_testing,
+  delete_learning_course,
+  delete_learning_document,
+)
 # KNOWLEDGE_GRAPH_PAUSED: keep the graph modules on disk for a later opt-in restart.
 from backend.knowledge_storage import (
   delete_annotation_asset,
@@ -86,9 +94,11 @@ from backend.study_plan_storage import read_course_study_plan, write_course_stud
 
 backend_router = APIRouter()
 backend_router.include_router(tsinghua_router)
+backend_router.include_router(adaptive_testing_router)
 document_pipeline: DocumentPipeline | None = None
 question_pipeline: QuestionPipeline | None = None
 question_relation_pipeline: QuestionRelationPipeline | None = None
+chat_context_retriever: ChatContextRetriever | None = None
 pipeline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='document-pipeline')
 
 
@@ -109,6 +119,12 @@ def get_question_relation_pipeline() -> QuestionRelationPipeline:
   if question_relation_pipeline is None:
     raise RuntimeError('Question relation pipeline is not initialized.')
   return question_relation_pipeline
+
+
+def get_chat_context_retriever() -> ChatContextRetriever:
+  if chat_context_retriever is None:
+    raise RuntimeError('Chat context retriever is not initialized.')
+  return chat_context_retriever
 
 
 def run_document_pipeline_with_relations(document_id: str) -> dict[str, Any]:
@@ -185,6 +201,15 @@ def delete_question_pipeline_with_relations(document_id: str) -> None:
   get_question_pipeline().delete(document_id)
 
 
+def delete_course_pipeline_artifacts(course_id: str) -> None:
+  """Sweep orphaned jobs, then remove the course's physical Qdrant partition."""
+  normalized_course_id = str(course_id or '').strip()
+  if not normalized_course_id:
+    return
+  get_question_pipeline().delete_course(normalized_course_id)
+  get_document_pipeline().delete_course(normalized_course_id)
+
+
 async def run_pipeline_task(function, *args, **kwargs):
   loop = asyncio.get_running_loop()
   return await loop.run_in_executor(pipeline_executor, partial(function, *args, **kwargs))
@@ -192,7 +217,7 @@ async def run_pipeline_task(function, *args, **kwargs):
 
 @asynccontextmanager
 async def application_lifespan(_app):
-  global document_pipeline, question_pipeline, question_relation_pipeline
+  global document_pipeline, question_pipeline, question_relation_pipeline, chat_context_retriever
   resume_tasks = []
   try:
     document_pipeline = DocumentPipeline()
@@ -204,6 +229,12 @@ async def application_lifespan(_app):
     question_relation_pipeline = QuestionRelationPipeline(
       embedding=document_pipeline.embedding,
       vector_store=document_pipeline.vector_store,
+    )
+    configure_adaptive_testing(question_relation_pipeline)
+    chat_context_retriever = ChatContextRetriever(
+      embedding=document_pipeline.embedding,
+      vector_store=document_pipeline.vector_store,
+      reranker=question_relation_pipeline.reranker,
     )
     try:
       document_pipeline.vector_store.migrate_legacy_collections([QDRANT_COLLECTION, QUESTION_COLLECTION])
@@ -224,6 +255,8 @@ async def application_lifespan(_app):
       document_pipeline = None
     question_pipeline = None
     question_relation_pipeline = None
+    chat_context_retriever = None
+    configure_adaptive_testing(None)
     local_mineru_service.stop()
 
 
@@ -237,6 +270,15 @@ async def get_api_config() -> dict[str, Any]:
 async def update_api_config(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
   # KNOWLEDGE_GRAPH_PAUSED: config persistence remains backward-compatible, but no graph service is started.
   return {"configured": True, "config": save_api_config(payload)}
+
+
+@backend_router.post('/api/provider-models')
+async def list_provider_models(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+  return await asyncio.to_thread(
+    fetch_provider_models,
+    base_url=str(payload.get('base_url') or '').strip(),
+    api_key=str(payload.get('api_key') or '').strip(),
+  )
 
 
 @backend_router.post('/api/documents/process')
@@ -316,6 +358,20 @@ async def retrieve_document_chunks(payload: dict[str, Any] = Body(...)) -> dict[
       top_n=top_n,
     )
   }
+
+
+@backend_router.post('/api/chat/retrieve-context')
+async def retrieve_chat_context(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+  """Return only the reranked fragments needed for one chat turn."""
+  return await asyncio.to_thread(
+    get_chat_context_retriever().retrieve,
+    query=str(payload.get('query') or '').strip(),
+    course_id=str(payload.get('course_id') or '').strip(),
+    document_id=str(payload.get('document_id') or '').strip(),
+    document_type=str(payload.get('document_type') or '').strip(),
+    top_n=max(1, min(int(payload.get('top_n') or 20), 50)),
+    top_k=max(1, min(int(payload.get('top_k') or 6), 12)),
+  )
 
 
 @backend_router.get('/api/vector-store/storage')
@@ -449,12 +505,15 @@ async def delete_knowledge_homework_document_api(
   course_id: str,
   document_id: str,
 ) -> dict[str, Any]:
-  return await run_pipeline_task(
+  result = await run_pipeline_task(
     delete_knowledge_homework_document,
     course_id,
     document_id,
     delete_question_pipeline_with_relations,
   )
+  if result.get('deleted'):
+    await asyncio.to_thread(delete_learning_document, course_id, document_id)
+  return result
 
 
 @backend_router.get("/api/knowledge/library")
@@ -491,6 +550,11 @@ async def delete_knowledge_file(file_id: str) -> dict[str, Any]:
     delete_question_pipeline_with_relations,
   )
   if result.get('deleted'):
+    await asyncio.to_thread(
+      delete_learning_document,
+      str((deleted_file or {}).get('courseId') or ''),
+      file_id,
+    )
     await asyncio.to_thread(mark_deleted_synced_courseware, deleted_file)
   return result
 
@@ -518,8 +582,10 @@ async def delete_knowledge_course_api(course_id: str) -> dict[str, Any]:
     course_id,
     delete_document_pipeline_with_relations,
     delete_question_pipeline_with_relations,
+    delete_course_pipeline_artifacts,
   )
   if result.get('deleted'):
+    await asyncio.to_thread(delete_learning_course, course_id)
     for file_record in course_files:
       await asyncio.to_thread(mark_deleted_synced_courseware, file_record)
   return result

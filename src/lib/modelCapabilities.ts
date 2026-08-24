@@ -16,6 +16,11 @@ export type ModelContextBudget = ModelCapability & {
   outputReserveTokens: number
   safetyReserveTokens: number
   inputBudgetTokens: number
+  softTargetTokens: number
+  conversationBudgetTokens: number
+  pinnedContextBudgetTokens: number
+  retrievalBudgetTokens: number
+  auxiliaryBudgetTokens: number
   compactionThresholdTokens: number
 }
 
@@ -46,6 +51,14 @@ const REGISTRY_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 const DEFAULT_CONTEXT_WINDOW = 96_000
 const DEFAULT_MAX_OUTPUT = 16_384
 const DEFAULT_COMPACTION_THRESHOLD = 0.6
+const SOFT_TARGET_ANCHORS = [
+  [32_768, 16_384],
+  [65_536, 24_576],
+  [131_072, 40_960],
+  [262_144, 65_536],
+  [524_288, 81_920],
+  [1_048_576, 98_304],
+] as const
 
 // Keep a small offline registry for the models used by this project. The
 // runtime models.dev registry can enrich this list without making startup
@@ -215,6 +228,21 @@ function getPreferredOutputReserve(task: ContextTask) {
   return 16_384
 }
 
+export function resolveSoftTargetTokens(contextWindow: number) {
+  const normalizedWindow = Math.max(4_096, Math.floor(contextWindow))
+  if (normalizedWindow <= SOFT_TARGET_ANCHORS[0][0]) {
+    return Math.min(normalizedWindow, Math.floor(normalizedWindow * 0.5))
+  }
+  for (let index = 1; index < SOFT_TARGET_ANCHORS.length; index += 1) {
+    const [rightWindow, rightTarget] = SOFT_TARGET_ANCHORS[index]
+    if (normalizedWindow > rightWindow) continue
+    const [leftWindow, leftTarget] = SOFT_TARGET_ANCHORS[index - 1]
+    const progress = (normalizedWindow - leftWindow) / (rightWindow - leftWindow)
+    return Math.round(leftTarget + (rightTarget - leftTarget) * progress)
+  }
+  return SOFT_TARGET_ANCHORS[SOFT_TARGET_ANCHORS.length - 1][1]
+}
+
 export function resolveModelContextBudget(
   config: ApiConfig,
   modelId: string,
@@ -234,6 +262,11 @@ export function resolveModelContextBudget(
     1_024,
     capability.contextWindow - outputReserveTokens - safetyReserveTokens,
   )
+  const softTargetTokens = Math.min(inputBudgetTokens, resolveSoftTargetTokens(capability.contextWindow))
+  const conversationBudgetTokens = Math.floor(softTargetTokens * 0.15)
+  const pinnedContextBudgetTokens = Math.floor(softTargetTokens * 0.25)
+  const retrievalBudgetTokens = Math.floor(softTargetTokens * 0.5)
+  const auxiliaryBudgetTokens = Math.floor(softTargetTokens * 0.05)
   const threshold = Number.isFinite(config.contextCompactionThreshold)
     ? Math.min(0.9, Math.max(0.4, config.contextCompactionThreshold))
     : DEFAULT_COMPACTION_THRESHOLD
@@ -243,7 +276,15 @@ export function resolveModelContextBudget(
     outputReserveTokens,
     safetyReserveTokens,
     inputBudgetTokens,
-    compactionThresholdTokens: Math.floor(inputBudgetTokens * threshold),
+    softTargetTokens,
+    conversationBudgetTokens,
+    pinnedContextBudgetTokens,
+    retrievalBudgetTokens,
+    auxiliaryBudgetTokens,
+    compactionThresholdTokens: Math.min(
+      Math.floor(inputBudgetTokens * threshold),
+      conversationBudgetTokens,
+    ),
   }
 }
 

@@ -662,6 +662,7 @@ def delete_knowledge_course(
   course_id: str,
   delete_pipeline_document: Callable[[str], None],
   delete_question_document: Callable[[str], None] | None = None,
+  delete_course_artifacts: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
   """Cascade-delete a course, its lectures, and all remaining course exercises."""
   ensure_knowledge_storage_dirs()
@@ -699,6 +700,11 @@ def delete_knowledge_course(
     if delete_question_document is not None:
       for document in course_documents + legacy_documents:
         delete_question_document(str(document.get('id') or ''))
+    # The physical vector partition is removed before the authoritative
+    # library record is updated. A cleanup failure therefore remains visible
+    # and retryable instead of leaving hidden Qdrant data behind.
+    if delete_course_artifacts is not None:
+      delete_course_artifacts(course_id)
     _delete_assets(
       {str(lecture.get('id') or '') for lecture in course_files if str(lecture.get('id') or '')},
       homework_asset_ids,

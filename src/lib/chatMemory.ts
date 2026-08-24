@@ -7,7 +7,8 @@ import type {
 import { resolveModelContextBudget } from './modelCapabilities'
 import { estimateChatMessageTokens } from './tokenEstimator'
 
-export const CHAT_MEMORY_CONTEXT_MESSAGE_LIMIT = Number.MAX_SAFE_INTEGER
+// A summary carries long-term memory; only the recent turns need to be sent verbatim.
+export const CHAT_MEMORY_CONTEXT_MESSAGE_LIMIT = 10
 
 function isConversationMessage(message: ChatMessage) {
   return (

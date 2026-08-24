@@ -602,6 +602,74 @@ class QuestionRelationPipeline:
 
     return self._scan_lecture_page_relations(course_id, lecture_document_id, page_number)
 
+  def lecture_document_questions(
+    self,
+    course_id: str,
+    lecture_document_id: str,
+  ) -> dict[str, Any]:
+    """Return original questions related to any real page in one lecture."""
+    questions: dict[str, dict[str, Any]] = {}
+    if not self.relations_dir.is_dir():
+      return {
+        'course_id': course_id,
+        'lecture_document_id': lecture_document_id,
+        'questions': [],
+      }
+
+    for path in self.relations_dir.glob('*.json'):
+      record = _read_json(path, {})
+      if not isinstance(record, dict) or str(record.get('course_id') or '') != course_id:
+        continue
+      matching_relations = []
+      for relation in record.get('relations') if isinstance(record.get('relations'), list) else []:
+        if not isinstance(relation, dict) or relation.get('relation_type') != 'question_to_lecture_page':
+          continue
+        target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
+        if str(target.get('document_id') or '') != lecture_document_id:
+          continue
+        page_number = int(target.get('page_number') or 0)
+        if page_number <= 0:
+          continue
+        matching_relations.append(relation)
+      if not matching_relations:
+        continue
+
+      question_id = str(record.get('question_id') or '').strip()
+      source_document_id = str(record.get('question_document_id') or '').strip()
+      question = self._question_summary(source_document_id, question_id)
+      if not question:
+        continue
+      existing = questions.setdefault(question_id, {
+        **question,
+        'lecture_relations': [],
+      })
+      existing['lecture_relations'].extend(matching_relations)
+
+    result = []
+    for question in questions.values():
+      deduplicated: dict[tuple[str, int], dict[str, Any]] = {}
+      for relation in question['lecture_relations']:
+        target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
+        key = (str(target.get('document_id') or ''), int(target.get('page_number') or 0))
+        previous = deduplicated.get(key)
+        if previous is None or float(relation.get('rerank_score') or 0.0) > float(previous.get('rerank_score') or 0.0):
+          deduplicated[key] = relation
+      question['lecture_relations'] = sorted(
+        deduplicated.values(),
+        key=lambda item: int((item.get('target') or {}).get('page_number') or 0),
+      )
+      result.append(question)
+    result.sort(key=lambda item: (
+      str(item.get('document_name') or ''),
+      int(item.get('page_number') or 0),
+      str(item.get('question_id') or ''),
+    ))
+    return {
+      'course_id': course_id,
+      'lecture_document_id': lecture_document_id,
+      'questions': result,
+    }
+
   def _scan_lecture_page_relations(
     self,
     course_id: str,
@@ -875,6 +943,9 @@ class QuestionRelationPipeline:
       'title': question.get('title'),
       'content': question.get('content'),
       'analysis': question.get('analysis'),
+      'page_numbers': question.get('page_numbers') or [question.get('page_number')],
+      'source_block_ids': question.get('source_block_ids') or [],
+      'source_segment_ids': question.get('source_segment_ids') or [],
     }
 
   def _lecture_pages(self, document_id: str) -> list[dict[str, Any]]:

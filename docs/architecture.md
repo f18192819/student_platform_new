@@ -17,6 +17,10 @@ extend a feature boundary rather than adding business logic directly to
   analysis.
 - `backend/question_relations.py`: retrieval and persisted relations between
   questions and course material.
+- `backend/learning_state.py`: course-partitioned adaptive-test sessions,
+  append-only learning evidence, and recalculable concept mastery projections.
+- `backend/adaptive_testing.py`: real-question eligibility, grading adapters,
+  explainable next-question selection, and mastery-test result assembly.
 - `backend/knowledge_storage.py`: course-scoped durable files and SQLite data.
 - `backend/tsinghua_*.py`: external course synchronization only.
 
@@ -35,6 +39,19 @@ Implement learning state as a course-scoped persistence module. Store events
 and derived progress separately: events are append-only facts, while progress
 is a recalculable projection. References to a document page, chunk, question,
 or audio timestamp must use stable IDs rather than UI indexes.
+
+Adaptive mastery tests keep the source `question_id`; they do not copy or
+generate questions. Subjective grading may use the configured text provider,
+but the grader only returns evidence (`score`, `correct`, and confidence).
+Mastery and test sequencing remain deterministic application code. Lecture
+page recommendations must come from persisted `question_to_lecture_page`
+relations so a missing relation produces no page rather than an invented one.
+
+Learning-state SQLite files live below
+`.runtime/learning-state/courses/<course>/learning-state.sqlite3`. Each course
+has a separate physical database. `learning_events` is append-only during
+normal operation; deletion cascades may remove rows when their source course,
+lecture, or question document is explicitly deleted.
 
 ### Providers and Storage
 

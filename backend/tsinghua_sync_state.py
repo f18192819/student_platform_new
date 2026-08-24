@@ -116,40 +116,57 @@ class LearnSyncRegistry:
   def __init__(self, deps: LearnSyncRegistryDeps) -> None:
     self._deps = deps
     self._lock = Lock()
+    self._login_lock = Lock()
     self._sessions: dict[str, LearnSyncSession] = {}
 
-  def create(self) -> LearnSyncSession:
-    with self._lock:
-      existing_ids = list(self._sessions.keys())
-    for existing_id in existing_ids:
-      self.close(existing_id)
+  def _new_session_id(self) -> str:
+    return f'learn-sync-{time.time_ns()}'
 
+  def _create_from_persisted_cookies(self) -> LearnSyncSession | None:
     persisted_cookies = self._deps.load_persisted_cookies()
-    if persisted_cookies:
-      try:
-        course_entries = self._deps.fetch_course_entries_via_cookie_session_v2(persisted_cookies)
-      except HTTPException:
-        course_entries = []
-      if course_entries:
-        session_id = f'learn-sync-{int(time.time() * 1000)}'
-        runtime_dir = self._deps.sync_runtime_dir / session_id
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        created_at = self._deps.utc_now()
-        session = LearnSyncSession(
-          session_id=session_id,
-          runtime_dir=runtime_dir,
-          browser_binary=self._deps.find_browser_binary(),
-          created_at=created_at,
-          updated_at=created_at,
-          stage='ready',
-          current_url=self._deps.course_home_url,
-          title='网络学堂',
-          cookies=persisted_cookies,
-          course_entries=course_entries,
-        )
-        with self._lock:
-          self._sessions[session_id] = session
-        return session
+    if not persisted_cookies:
+      return None
+    try:
+      course_entries = self._deps.fetch_course_entries_via_cookie_session_v2(persisted_cookies)
+    except HTTPException:
+      return None
+    if not course_entries:
+      return None
+
+    session_id = self._new_session_id()
+    runtime_dir = self._deps.sync_runtime_dir / session_id
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    created_at = self._deps.utc_now()
+    session = LearnSyncSession(
+      session_id=session_id,
+      runtime_dir=runtime_dir,
+      browser_binary=self._deps.find_browser_binary(),
+      created_at=created_at,
+      updated_at=created_at,
+      stage='ready',
+      current_url=self._deps.course_home_url,
+      title='网络学堂',
+      cookies=persisted_cookies,
+      course_entries=course_entries,
+    )
+    with self._lock:
+      self._sessions[session_id] = session
+    return session
+
+  def create(self) -> LearnSyncSession:
+    cookie_session = self._create_from_persisted_cookies()
+    if cookie_session is not None:
+      return cookie_session
+
+    # Multiple tabs can start the automatic check at the same time. Only one
+    # request should submit credentials; waiting requests reuse the cookies it creates.
+    with self._login_lock:
+      cookie_session = self._create_from_persisted_cookies()
+      if cookie_session is not None:
+        return cookie_session
+      return self._create_with_login()
+
+  def _create_with_login(self) -> LearnSyncSession:
 
     auth_config = self._deps.load_auth_config()
     username = self._deps.normalize_text(str((auth_config or {}).get('username') or ''))
@@ -157,7 +174,7 @@ class LearnSyncRegistry:
     if not username or not password:
       raise HTTPException(status_code=422, detail='请先在 API 配置中填写网络学堂用户名和密码。')
 
-    session_id = f'learn-sync-{int(time.time() * 1000)}'
+    session_id = self._new_session_id()
     runtime_dir = self._deps.sync_runtime_dir / session_id
     runtime_dir.mkdir(parents=True, exist_ok=True)
     browser_binary = self._deps.find_browser_binary()

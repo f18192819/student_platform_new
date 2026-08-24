@@ -1,6 +1,5 @@
 ﻿import {
   startTransition,
-  type PointerEvent as ReactPointerEvent,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -11,7 +10,11 @@
 import { useSearchParams } from 'react-router-dom'
 import { PdfPreviewCanvas } from '../components/PdfPreviewCanvas'
 import { ChatPanel } from '../features/pdf-workspace/components/ChatPanel'
+import { PageLecturePlayer } from '../features/pdf-workspace/components/PageLecturePlayer'
 import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/RelatedMaterialsPanel'
+import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
+import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageLecturePlayback'
+import { useReaderPanelResize } from '../features/pdf-workspace/hooks/useReaderPanelResize'
 import type {
   ComposerAttachment,
   DraftDoubt,
@@ -25,7 +28,6 @@ import {
   buildHomeworkContextMarkdown,
   buildLectureConversation,
   buildStructuredPageContext,
-  clampPanelWidth,
   createDraftDoubt,
   createMessage,
   DEFAULT_DOCUMENT_NAME,
@@ -33,20 +35,12 @@ import {
   ensureActiveModel,
   groupHomeworkLinksByLecturePage,
   groupLectureSegmentsByPage,
-  LEFT_PANEL_MAX,
-  LEFT_PANEL_MIN,
-  LEFT_PANEL_WIDTH_KEY,
-  loadPanelWidth,
   readFileAsDataUrl,
-  RIGHT_PANEL_MAX,
-  RIGHT_PANEL_MIN,
-  RIGHT_PANEL_WIDTH_KEY,
   updateMessageContent,
 } from '../features/pdf-workspace/utils'
 import {
   loadApiConfig,
   loadApiConfigFromServer,
-  resolveBackendApiUrl,
   saveApiConfig,
 } from '../lib/apiConfig'
 import {
@@ -87,6 +81,7 @@ import {
   shouldCompactDoubtChatSession,
   updateDoubtChatMessage,
 } from '../lib/chatMemory'
+import { retrieveChatContext } from '../lib/chatRetrieval'
 import type { PromptSourceSection } from '../lib/contextBudget'
 import {
   buildFailedHomeworkDocument,
@@ -109,7 +104,6 @@ import {
 import type {
   ApiConfig,
   ChatMessage,
-  ClassroomLectureSegment,
   ClassroomSession,
   DoubtAnnotation,
   DoubtChatSession,
@@ -119,70 +113,6 @@ import type {
   StructuredDocumentBlock,
   StoredDoubtAnnotation,
 } from '../types'
-
-type PageLecturePlaybackRange = {
-  recordingId: string
-  startSeconds: number
-  endSeconds: number
-}
-
-type ActivePageLecturePlayer = PageLecturePlaybackRange & {
-  pageNumber: number
-}
-
-function formatPlaybackTime(seconds: number) {
-  const safeSeconds = Math.max(0, Math.floor(seconds))
-  const minutes = Math.floor(safeSeconds / 60)
-  const remainingSeconds = safeSeconds % 60
-  return `${minutes}:${String(remainingSeconds).padStart(2, '0')}`
-}
-
-function findLongestContinuousLectureRange(
-  segments: ClassroomLectureSegment[],
-): PageLecturePlaybackRange | null {
-  const candidates = segments
-    .flatMap((segment) => {
-      if (
-        !segment.recordingId ||
-        segment.startSeconds === null ||
-        segment.endSeconds === null ||
-        segment.endSeconds <= segment.startSeconds
-      ) {
-        return []
-      }
-      return [{
-        recordingId: segment.recordingId,
-        startSeconds: segment.startSeconds,
-        endSeconds: segment.endSeconds,
-      }]
-    })
-    .sort(
-      (left, right) =>
-        left.recordingId.localeCompare(right.recordingId) || left.startSeconds - right.startSeconds,
-    )
-
-  const ranges: PageLecturePlaybackRange[] = []
-  for (const candidate of candidates) {
-    const previous = ranges.at(-1)
-    if (
-      previous &&
-      previous.recordingId === candidate.recordingId &&
-      candidate.startSeconds <= previous.endSeconds + 1
-    ) {
-      previous.endSeconds = Math.max(previous.endSeconds, candidate.endSeconds)
-      continue
-    }
-    ranges.push({ ...candidate })
-  }
-
-  return ranges.reduce<PageLecturePlaybackRange | null>(
-    (longest, range) =>
-      !longest || range.endSeconds - range.startSeconds > longest.endSeconds - longest.startSeconds
-        ? range
-        : longest,
-    null,
-  )
-}
 
 function mapQuestionRelationCards(relations: QuestionRelation[]): RelatedMaterialCard[] {
   return relations
@@ -251,12 +181,7 @@ export function PdfWorkspacePage() {
   const currentFolderType =
     searchParams.get('folder') === 'past-exam' ? 'past-exam' : ('homework' as KnowledgeHomeworkFolderType)
   const [questionInput, setQuestionInput] = useState('')
-  const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
-    clampPanelWidth(loadPanelWidth(LEFT_PANEL_WIDTH_KEY, 320), LEFT_PANEL_MIN, LEFT_PANEL_MAX),
-  )
-  const [rightPanelWidth, setRightPanelWidth] = useState(() =>
-    clampPanelWidth(loadPanelWidth(RIGHT_PANEL_WIDTH_KEY, 420), RIGHT_PANEL_MIN, RIGHT_PANEL_MAX),
-  )
+  const { readerGridRef, leftPanelWidth, rightPanelWidth, beginResize } = useReaderPanelResize()
   const [documentText, setDocumentText] = useState('')
   const [documentName, setDocumentName] = useState(DEFAULT_DOCUMENT_NAME)
   const [pdfPageCount, setPdfPageCount] = useState<number | null>(null)
@@ -280,6 +205,8 @@ export function PdfWorkspacePage() {
   const [currentPage, setCurrentPage] = useState(1)
   const [zoom, setZoom] = useState(1)
   const [apiConfig, setApiConfig] = useState<ApiConfig>(loadApiConfig())
+  const pageLecturePlayback = usePageLecturePlayback()
+  const stopPageLecturePlayback = pageLecturePlayback.stop
   const [isAsking, setIsAsking] = useState(false)
   const [_isRestoringFile, setIsRestoringFile] = useState(false)
   const [isSavingDoubt, setIsSavingDoubt] = useState(false)
@@ -294,15 +221,6 @@ export function PdfWorkspacePage() {
   const [isLessonRecording, setIsLessonRecording] = useState(false)
   const [pageFilter, setPageFilter] = useState<number | null>(null)
   const [pageLectureFilter, setPageLectureFilter] = useState<number | null>(null)
-  const [playingLecturePage, setPlayingLecturePage] = useState<number | null>(null)
-  const [activeLecturePlayer, setActiveLecturePlayer] = useState<ActivePageLecturePlayer | null>(null)
-  const [lecturePlaybackSeconds, setLecturePlaybackSeconds] = useState<number | null>(null)
-  const [lecturePlaybackRate, setLecturePlaybackRate] = useState(1)
-  const [isLecturePlayerMinimized, setIsLecturePlayerMinimized] = useState(false)
-  const [lecturePlayerPosition, setLecturePlayerPosition] = useState<{
-    left: number
-    top: number
-  } | null>(null)
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
   const [isCaptureMode, setIsCaptureMode] = useState(false)
   const [classroomSessions, setClassroomSessions] = useState<ClassroomSession[]>([])
@@ -317,14 +235,6 @@ export function PdfWorkspacePage() {
   const streamTimerRef = useRef<number | null>(null)
   const saveChatTimerRef = useRef<number | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const pageLectureAudioRef = useRef<HTMLAudioElement | null>(null)
-  const lecturePlayerDragRef = useRef<{
-    pointerId: number
-    offsetX: number
-    offsetY: number
-    width: number
-    height: number
-  } | null>(null)
   const lessonChunksRef = useRef<Blob[]>([])
   const lessonStreamRef = useRef<MediaStream | null>(null)
   const pdfInputRef = useRef<HTMLInputElement | null>(null)
@@ -334,18 +244,6 @@ export function PdfWorkspacePage() {
   const lessonTranscriptUploadInputRef = useRef<HTMLInputElement | null>(null)
   const lectureMineruInFlightRef = useRef<Set<string>>(new Set())
   const lectureMineruFailedRef = useRef<Set<string>>(new Set())
-
-  useEffect(() => {
-    return () => {
-      const audio = pageLectureAudioRef.current
-      if (!audio) {
-        return
-      }
-      audio.pause()
-      audio.removeAttribute('src')
-      audio.load()
-    }
-  }, [])
 
   const homeworkPreviewCacheRef = useRef<
     Map<
@@ -388,14 +286,6 @@ export function PdfWorkspacePage() {
     }
     homeworkPreviewCacheRef.current.clear()
   }, [])
-  const readerGridRef = useRef<HTMLElement | null>(null)
-  const resizeFrameRef = useRef<number | null>(null)
-  const latestPointerXRef = useRef<number | null>(null)
-  const activeResizeRef = useRef<{
-    side: 'left' | 'right'
-    startX: number
-    startWidth: number
-  } | null>(null)
   const deferredChatMessages = useDeferredValue(chatMessages)
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([])
 
@@ -578,12 +468,8 @@ export function PdfWorkspacePage() {
       return
     }
 
-    const audio = pageLectureAudioRef.current
-    audio?.pause()
-    setPlayingLecturePage(null)
-    setActiveLecturePlayer(null)
-    setLecturePlaybackSeconds(null)
-  }, [isLectureViewer])
+    stopPageLecturePlayback()
+  }, [isLectureViewer, stopPageLecturePlayback])
   const referencedBlockIds = useMemo(() => {
     const next = new Set<string>()
     for (const attachment of composerAttachments) {
@@ -813,90 +699,6 @@ export function PdfWorkspacePage() {
   }, [chatMessages, isAsking])
 
   useEffect(() => () => clearStreamTimer(), [])
-
-  useEffect(() => {
-    window.localStorage.setItem(LEFT_PANEL_WIDTH_KEY, String(leftPanelWidth))
-  }, [leftPanelWidth])
-
-  useEffect(() => {
-    window.localStorage.setItem(RIGHT_PANEL_WIDTH_KEY, String(rightPanelWidth))
-  }, [rightPanelWidth])
-
-  useEffect(() => {
-    const handlePointerMove = (event: PointerEvent) => {
-      latestPointerXRef.current = event.clientX
-      if (resizeFrameRef.current !== null) {
-        return
-      }
-
-      resizeFrameRef.current = window.requestAnimationFrame(() => {
-        resizeFrameRef.current = null
-
-        const activeResize = activeResizeRef.current
-        const readerGrid = readerGridRef.current
-        const pointerX = latestPointerXRef.current
-
-        if (!activeResize || !readerGrid || pointerX === null) {
-          return
-        }
-
-        const gridRect = readerGrid.getBoundingClientRect()
-        const gapWidth = 36
-        const minCenterWidth = 520
-
-        if (activeResize.side === 'left') {
-          const delta = pointerX - activeResize.startX
-          const maxWidth = Math.min(
-            LEFT_PANEL_MAX,
-            gridRect.width - rightPanelWidth - minCenterWidth - gapWidth,
-          )
-          setLeftPanelWidth(
-            clampPanelWidth(
-              activeResize.startWidth + delta,
-              LEFT_PANEL_MIN,
-              Math.max(LEFT_PANEL_MIN, maxWidth),
-            ),
-          )
-          return
-        }
-
-        const delta = activeResize.startX - pointerX
-        const maxWidth = Math.min(
-          RIGHT_PANEL_MAX,
-          gridRect.width - leftPanelWidth - minCenterWidth - gapWidth,
-        )
-        setRightPanelWidth(
-          clampPanelWidth(
-            activeResize.startWidth + delta,
-            RIGHT_PANEL_MIN,
-            Math.max(RIGHT_PANEL_MIN, maxWidth),
-          ),
-        )
-      })
-    }
-
-    const handlePointerUp = () => {
-      activeResizeRef.current = null
-      latestPointerXRef.current = null
-      if (resizeFrameRef.current !== null) {
-        window.cancelAnimationFrame(resizeFrameRef.current)
-        resizeFrameRef.current = null
-      }
-      document.body.classList.remove('is-resizing-panels')
-    }
-
-    window.addEventListener('pointermove', handlePointerMove)
-    window.addEventListener('pointerup', handlePointerUp)
-
-    return () => {
-      if (resizeFrameRef.current !== null) {
-        window.cancelAnimationFrame(resizeFrameRef.current)
-        resizeFrameRef.current = null
-      }
-      window.removeEventListener('pointermove', handlePointerMove)
-      window.removeEventListener('pointerup', handlePointerUp)
-    }
-  }, [leftPanelWidth, rightPanelWidth])
 
   useEffect(() => {
     if (!initialFileId) {
@@ -1565,167 +1367,11 @@ export function PdfWorkspacePage() {
   }
 
   const handlePlayPageLectureSegments = (pageNumber: number) => {
-    const playbackRange = findLongestContinuousLectureRange(
+    pageLecturePlayback.playPageSegments(
+      pageNumber,
       lectureSegmentsByPage.get(pageNumber) ?? [],
+      activeKnowledgeCourseId,
     )
-    if (!playbackRange || !activeKnowledgeCourseId) {
-      return
-    }
-
-    const audio = pageLectureAudioRef.current ?? new Audio()
-    pageLectureAudioRef.current = audio
-    audio.pause()
-    audio.playbackRate = lecturePlaybackRate
-    setActiveLecturePlayer({ pageNumber, ...playbackRange })
-    setLecturePlaybackSeconds(playbackRange.startSeconds)
-    setIsLecturePlayerMinimized(false)
-    audio.onplay = () => setPlayingLecturePage(pageNumber)
-    audio.onpause = () => setPlayingLecturePage((current) => (current === pageNumber ? null : current))
-    audio.onended = () => setPlayingLecturePage(null)
-    audio.onerror = () => {
-      setPlayingLecturePage(null)
-      setActiveLecturePlayer(null)
-      setLecturePlaybackSeconds(null)
-    }
-    audio.ontimeupdate = () => {
-      setLecturePlaybackSeconds(audio.currentTime)
-      if (audio.currentTime >= playbackRange.endSeconds) {
-        audio.currentTime = playbackRange.endSeconds
-        audio.pause()
-      }
-    }
-    audio.onloadedmetadata = () => {
-      const duration = Number.isFinite(audio.duration) ? audio.duration : playbackRange.endSeconds
-      audio.currentTime = Math.min(playbackRange.startSeconds, Math.max(0, duration - 0.05))
-      void audio.play().then(
-        () => setPlayingLecturePage(pageNumber),
-        () => setPlayingLecturePage(null),
-      )
-    }
-    audio.src = resolveBackendApiUrl(
-      `/api/audio/recordings/${encodeURIComponent(playbackRange.recordingId)}/media?course_id=${encodeURIComponent(activeKnowledgeCourseId)}`,
-    )
-    audio.load()
-  }
-
-  const handleToggleLecturePlayback = () => {
-    const audio = pageLectureAudioRef.current
-    const player = activeLecturePlayer
-    if (!audio || !player) {
-      return
-    }
-
-    if (audio.paused) {
-      if (audio.currentTime < player.startSeconds || audio.currentTime >= player.endSeconds) {
-        audio.currentTime = player.startSeconds
-        setLecturePlaybackSeconds(player.startSeconds)
-      }
-      audio.playbackRate = lecturePlaybackRate
-      void audio.play().catch(() => setPlayingLecturePage(null))
-      return
-    }
-
-    audio.pause()
-  }
-
-  const handleSeekLecturePlayback = (targetSeconds: number) => {
-    const audio = pageLectureAudioRef.current
-    const player = activeLecturePlayer
-    if (!audio || !player) {
-      return
-    }
-
-    const nextSeconds = Math.min(
-      player.endSeconds,
-      Math.max(player.startSeconds, targetSeconds),
-    )
-    audio.currentTime = nextSeconds
-    setLecturePlaybackSeconds(nextSeconds)
-    if (nextSeconds >= player.endSeconds) {
-      audio.pause()
-    }
-  }
-
-  const handleSkipLecturePlayback = (seconds: number) => {
-    const player = activeLecturePlayer
-    if (!player) {
-      return
-    }
-
-    handleSeekLecturePlayback((lecturePlaybackSeconds ?? player.startSeconds) + seconds)
-  }
-
-  const handleStopLecturePlayback = () => {
-    const audio = pageLectureAudioRef.current
-    if (audio) {
-      audio.pause()
-      audio.removeAttribute('src')
-      audio.load()
-    }
-    setPlayingLecturePage(null)
-    setActiveLecturePlayer(null)
-    setLecturePlaybackSeconds(null)
-    setIsLecturePlayerMinimized(false)
-  }
-
-  const handleLecturePlaybackRateChange = (rate: number) => {
-    setLecturePlaybackRate(rate)
-    if (pageLectureAudioRef.current) {
-      pageLectureAudioRef.current.playbackRate = rate
-    }
-  }
-
-  const handleLecturePlayerDragStart = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0) {
-      return
-    }
-
-    const player = event.currentTarget.closest<HTMLElement>('.lecture-player')
-    if (!player) {
-      return
-    }
-
-    const bounds = player.getBoundingClientRect()
-    lecturePlayerDragRef.current = {
-      pointerId: event.pointerId,
-      offsetX: event.clientX - bounds.left,
-      offsetY: event.clientY - bounds.top,
-      width: bounds.width,
-      height: bounds.height,
-    }
-    event.currentTarget.setPointerCapture(event.pointerId)
-    event.preventDefault()
-  }
-
-  const handleLecturePlayerDragMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const drag = lecturePlayerDragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) {
-      return
-    }
-
-    const margin = 12
-    setLecturePlayerPosition({
-      left: Math.min(
-        window.innerWidth - drag.width - margin,
-        Math.max(margin, event.clientX - drag.offsetX),
-      ),
-      top: Math.min(
-        window.innerHeight - drag.height - margin,
-        Math.max(margin, event.clientY - drag.offsetY),
-      ),
-    })
-  }
-
-  const handleLecturePlayerDragEnd = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const drag = lecturePlayerDragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) {
-      return
-    }
-
-    lecturePlayerDragRef.current = null
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId)
-    }
   }
 
   const stopLessonRecording = useCallback(async () => {
@@ -2647,21 +2293,52 @@ export function PdfWorkspacePage() {
       activeAnnotationPage,
       currentViewerName,
     )
-    const completeDocumentContext = viewerSource.kind === 'homework'
-      ? selectedHomework?.extractedMarkdown ?? ''
-      : documentText
+    const retrievalDocumentId = viewerSource.kind === 'homework'
+      ? selectedHomework?.id ?? null
+      : knowledgeFileId
+    const retrievalDocumentType = viewerSource.kind === 'homework'
+      ? currentFolderType
+      : 'lecture'
+    let retrievedSections: PromptSourceSection[] = []
+    if (activeKnowledgeCourseId && retrievalDocumentId) {
+      try {
+        const retrieval = await retrieveChatContext({
+          query: normalizedQuestion,
+          courseId: activeKnowledgeCourseId,
+          documentId: retrievalDocumentId,
+          documentType: retrievalDocumentType,
+          topN: 20,
+          topK: 6,
+        })
+        retrievedSections = retrieval.results.map((fragment, index) => {
+          const pageLabel = fragment.page_number ? `第 ${fragment.page_number} 页` : '页码未知'
+          const location = [fragment.chapter, fragment.section, fragment.title]
+            .filter(Boolean)
+            .join(' / ')
+          return {
+            id: `retrieved-${fragment.chunk_id || fragment.question_id || index}`,
+            title: [fragment.document_name || currentViewerName, pageLabel, location]
+              .filter(Boolean)
+              .join(' · '),
+            content: fragment.content,
+            bucket: 'retrieval',
+            priority: 80 - index,
+            trimMode: 'head-tail',
+          }
+        })
+        if (retrieval.rerank_source !== 'reranker') {
+          console.warn('chat context reranker fallback:', retrieval.rerank_source, retrieval.rerank_error)
+        }
+      } catch (error) {
+        console.warn('chat context retrieval failed; using the current page only:', error)
+      }
+    }
     const questionSourceContext: PromptSourceSection[] = [
-      {
-        id: 'current-page',
-        title: `当前查看的第 ${activeAnnotationPage} 页`,
-        content: currentPageContext,
-        priority: 100,
-        trimMode: 'head-tail',
-      },
       {
         id: 'explicit-references',
         title: '用户显式选择的引用',
         content: explicitReferenceContext,
+        bucket: 'pinned',
         priority: 95,
         trimMode: 'head-tail',
       },
@@ -2669,6 +2346,7 @@ export function PdfWorkspacePage() {
         id: 'current-homework-question',
         title: '当前练习题',
         content: activeHomeworkContextMarkdown,
+        bucket: 'pinned',
         priority: 90,
         trimMode: 'head-tail',
       },
@@ -2676,16 +2354,21 @@ export function PdfWorkspacePage() {
         id: 'uploaded-attachments',
         title: '本次提问附件',
         content: documentAttachmentContext,
+        bucket: 'pinned',
         priority: 85,
         trimMode: 'head-tail',
       },
-      {
-        id: 'complete-document',
-        title: '完整文档补充上下文',
-        content: completeDocumentContext,
-        priority: currentPageContext ? 10 : 60,
-        trimMode: 'head-tail',
-      },
+      ...retrievedSections,
+      ...(retrievedSections.length
+        ? []
+        : [{
+            id: 'current-page-fallback',
+            title: `当前查看的第 ${activeAnnotationPage} 页（检索不可用时回退）`,
+            content: currentPageContext,
+            bucket: 'pinned' as const,
+            priority: 70,
+            trimMode: 'head-tail' as const,
+          }]),
     ]
     const imageAttachments = composerAttachments
       .filter((attachment) => attachment.kind === 'image' && attachment.dataUrl)
@@ -2881,17 +2564,18 @@ export function PdfWorkspacePage() {
           type="button"
           className="panel-resizer panel-resizer--left"
           aria-label="调整关联资料宽度"
-          onPointerDown={(event) => {
-            activeResizeRef.current = {
-              side: 'left',
-              startX: event.clientX,
-              startWidth: leftPanelWidth,
-            }
-            document.body.classList.add('is-resizing-panels')
-          }}
+          onPointerDown={(event) => beginResize('left', event.clientX)}
         />
 
         <div className="pdf-workspace__viewer">
+          {isLectureViewer && activeKnowledgeCourseId && currentKnowledgeFileId ? (
+            <LectureMasteryTest
+              courseId={activeKnowledgeCourseId}
+              lectureDocumentId={currentKnowledgeFileId}
+              lectureName={currentViewerName}
+              onOpenPage={handleVisiblePageChange}
+            />
+          ) : null}
           <PdfPreviewCanvas
             fileName={currentViewerName}
             pdfController={currentViewerController}
@@ -2912,7 +2596,7 @@ export function PdfWorkspacePage() {
             onInspectPageDoubts={handleInspectPageDoubts}
             onInspectPageLectureSegments={handleInspectPageLectureSegments}
             onPlayPageLectureSegments={handlePlayPageLectureSegments}
-            playingLecturePage={playingLecturePage}
+            playingLecturePage={pageLecturePlayback.playingPage}
             showLectureControls={isLectureViewer}
             onInspectPageQuestions={isLectureViewer ? handleInspectPageQuestions : () => {}}
             isCaptureMode={isCaptureMode}
@@ -2937,14 +2621,7 @@ export function PdfWorkspacePage() {
           type="button"
           className="panel-resizer panel-resizer--right"
           aria-label="调整 AI 对话宽度"
-          onPointerDown={(event) => {
-            activeResizeRef.current = {
-              side: 'right',
-              startX: event.clientX,
-              startWidth: rightPanelWidth,
-            }
-            document.body.classList.add('is-resizing-panels')
-          }}
+          onPointerDown={(event) => beginResize('right', event.clientX)}
         />
 
         <ChatPanel
@@ -2985,180 +2662,18 @@ export function PdfWorkspacePage() {
           canSend={!(isAsking || isSavingDoubt || !questionInput.trim() || !documentText.trim())}
         />
       </section>
-      {isLectureViewer && activeLecturePlayer ? (
-        <section
-          className={`lecture-player ${isLecturePlayerMinimized ? 'is-minimized' : ''}`}
-          aria-label={`第 ${activeLecturePlayer.pageNumber} 页课堂讲解播放器`}
-          style={
-            lecturePlayerPosition
-              ? {
-                  left: `${lecturePlayerPosition.left}px`,
-                  top: `${lecturePlayerPosition.top}px`,
-                  right: 'auto',
-                  bottom: 'auto',
-                }
-              : undefined
-          }
-        >
-          {isLecturePlayerMinimized ? (
-            <div className="lecture-player__compact-shell">
-              <button
-                type="button"
-                className="lecture-player__drag-handle"
-                onPointerDown={handleLecturePlayerDragStart}
-                onPointerMove={handleLecturePlayerDragMove}
-                onPointerUp={handleLecturePlayerDragEnd}
-                onPointerCancel={handleLecturePlayerDragEnd}
-                aria-label="拖动课堂讲解播放器"
-                title="拖动播放器"
-              >
-                ⠿
-              </button>
-              <button
-                type="button"
-                className="lecture-player__compact"
-                onClick={() => setIsLecturePlayerMinimized(false)}
-                title="展开课堂讲解播放器"
-              >
-                <span className={`lecture-player__pulse ${playingLecturePage ? 'is-playing' : ''}`} />
-                <span>第 {activeLecturePlayer.pageNumber} 页</span>
-                <strong>
-                  {formatPlaybackTime(
-                    Math.max(
-                      0,
-                      (lecturePlaybackSeconds ?? activeLecturePlayer.startSeconds) -
-                        activeLecturePlayer.startSeconds,
-                    ),
-                  )}
-                </strong>
-              </button>
-            </div>
-          ) : (
-            <>
-              <div className="lecture-player__header">
-                <button
-                  type="button"
-                  className="lecture-player__drag-handle"
-                  onPointerDown={handleLecturePlayerDragStart}
-                  onPointerMove={handleLecturePlayerDragMove}
-                  onPointerUp={handleLecturePlayerDragEnd}
-                  onPointerCancel={handleLecturePlayerDragEnd}
-                  aria-label="拖动课堂讲解播放器"
-                  title="拖动播放器"
-                >
-                  ⠿
-                </button>
-                <div>
-                  <span>课堂讲解</span>
-                  <strong>第 {activeLecturePlayer.pageNumber} 页</strong>
-                </div>
-                <button
-                  type="button"
-                  className="lecture-player__minimize"
-                  onClick={() => setIsLecturePlayerMinimized(true)}
-                  aria-label="最小化课堂讲解播放器"
-                  title="最小化"
-                >
-                  −
-                </button>
-              </div>
-              <div className="lecture-player__progress">
-                <span
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.max(
-                        0,
-                        ((lecturePlaybackSeconds ?? activeLecturePlayer.startSeconds) -
-                          activeLecturePlayer.startSeconds) /
-                          (activeLecturePlayer.endSeconds - activeLecturePlayer.startSeconds) *
-                          100,
-                      ),
-                    )}%`,
-                  }}
-                />
-                <input
-                  className="lecture-player__seek"
-                  type="range"
-                  min={activeLecturePlayer.startSeconds}
-                  max={activeLecturePlayer.endSeconds}
-                  step="0.1"
-                  value={Math.min(
-                    activeLecturePlayer.endSeconds,
-                    Math.max(
-                      activeLecturePlayer.startSeconds,
-                      lecturePlaybackSeconds ?? activeLecturePlayer.startSeconds,
-                    ),
-                  )}
-                  onChange={(event) => handleSeekLecturePlayback(Number(event.currentTarget.value))}
-                  aria-label="课堂讲解播放进度"
-                />
-              </div>
-              <div className="lecture-player__time">
-                <span>
-                  {formatPlaybackTime(
-                    Math.max(
-                      0,
-                      (lecturePlaybackSeconds ?? activeLecturePlayer.startSeconds) -
-                        activeLecturePlayer.startSeconds,
-                    ),
-                  )}
-                </span>
-                <span>
-                  {formatPlaybackTime(activeLecturePlayer.endSeconds - activeLecturePlayer.startSeconds)}
-                </span>
-              </div>
-              <div className="lecture-player__controls">
-                <button
-                  type="button"
-                  className="lecture-player__stop"
-                  onClick={handleStopLecturePlayback}
-                  aria-label="停止课堂讲解"
-                  title="停止并关闭播放器"
-                >
-                  <span />
-                </button>
-                <button
-                  type="button"
-                  className="lecture-player__skip"
-                  onClick={() => handleSkipLecturePlayback(-10)}
-                  aria-label="后退 10 秒"
-                  title="后退 10 秒"
-                >
-                  -10s
-                </button>
-                <button
-                  type="button"
-                  className="lecture-player__play"
-                  onClick={handleToggleLecturePlayback}
-                >
-                  {playingLecturePage === activeLecturePlayer.pageNumber ? '暂停' : '继续播放'}
-                </button>
-                <button
-                  type="button"
-                  className="lecture-player__skip"
-                  onClick={() => handleSkipLecturePlayback(10)}
-                  aria-label="快进 10 秒"
-                  title="快进 10 秒"
-                >
-                  +10s
-                </button>
-                <div className="lecture-player__rates" aria-label="播放速度">
-                  {[1, 1.25, 1.5, 2].map((rate) => (
-                    <button
-                      key={rate}
-                      type="button"
-                      className={lecturePlaybackRate === rate ? 'is-active' : ''}
-                      onClick={() => handleLecturePlaybackRateChange(rate)}
-                    >
-                      {rate}x
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
-        </section>
+      {isLectureViewer ? (
+        <PageLecturePlayer
+          player={pageLecturePlayback.activePlayer}
+          playingPage={pageLecturePlayback.playingPage}
+          playbackSeconds={pageLecturePlayback.playbackSeconds}
+          playbackRate={pageLecturePlayback.playbackRate}
+          onToggle={pageLecturePlayback.toggle}
+          onSeek={pageLecturePlayback.seek}
+          onSkip={pageLecturePlayback.skip}
+          onStop={pageLecturePlayback.stop}
+          onChangeRate={pageLecturePlayback.changeRate}
+        />
       ) : null}
     </main>
   )
