@@ -7,6 +7,35 @@ export type AdaptiveTestQuestionImage = {
   url: string
 }
 
+export type AssessmentOption = {
+  id: string
+  content: string
+}
+
+export type AssessmentPart = {
+  id: string
+  type: 'choice' | 'numeric' | 'text'
+  prompt: string
+  weight: number
+  required: boolean
+  options: AssessmentOption[]
+}
+
+export type AssessmentResponse = {
+  part_id: string
+  value: string
+}
+
+export type PartGradingResult = {
+  part_id: string
+  type: 'choice' | 'numeric' | 'text' | string
+  score: number
+  correct: boolean
+  confidence: number
+  feedback: string
+  method: string
+}
+
 export type AdaptiveTestQuestion = {
   question_id: string
   source_type: string
@@ -18,6 +47,10 @@ export type AdaptiveTestQuestion = {
   difficulty: number
   knowledge_points: string[]
   images: AdaptiveTestQuestionImage[]
+  assessment_spec?: {
+    question_id: string
+    parts: AssessmentPart[]
+  }
   reference_answer?: string
 }
 
@@ -39,6 +72,8 @@ export type AdaptiveTestAnswer = {
   event_id: string
   question_id: string
   response_text: string
+  responses: AssessmentResponse[]
+  part_grading_results: PartGradingResult[]
   score: number
   correct: boolean
   confidence: number
@@ -76,6 +111,8 @@ export type WrongQuestion = {
   page_number: number | null
   score: number
   answer: string
+  structured_responses: AssessmentResponse[]
+  part_grading_results: PartGradingResult[]
   feedback: string
   reference_answer: string
   images: AdaptiveTestQuestionImage[]
@@ -109,6 +146,7 @@ export type AdaptiveTestPayload = {
     confidence: number
     feedback: string
     method: string
+    parts: PartGradingResult[]
   }
   answered_question?: AdaptiveTestQuestion
   saved_answer?: AdaptiveTestAnswer
@@ -171,15 +209,18 @@ export async function getActiveAdaptiveTest(
 export async function submitAdaptiveAnswer(
   sessionId: string,
   questionId: string,
-  answer: string,
+  responses: AssessmentResponse[],
   responseTimeMs: number,
+  legacyAnswer?: string,
 ) {
   return readPayload(await fetch(
     resolveBackendApiUrl(`/api/adaptive-tests/${encodeURIComponent(sessionId)}/answers`),
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question_id: questionId, answer, response_time_ms: responseTimeMs }),
+      body: JSON.stringify(legacyAnswer === undefined
+        ? { question_id: questionId, responses, response_time_ms: responseTimeMs }
+        : { question_id: questionId, answer: legacyAnswer, response_time_ms: responseTimeMs }),
     },
   ))
 }

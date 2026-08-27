@@ -21,6 +21,9 @@ extend a feature boundary rather than adding business logic directly to
   append-only learning evidence, and recalculable concept mastery projections.
 - `backend/adaptive_testing.py`: real-question eligibility, grading adapters,
   explainable next-question selection, and mastery-test result assembly.
+- `backend/assessment_planner.py`: persisted per-question answer contracts for
+  choice, numeric, and short-text assessment parts. Private answer keys never
+  cross the backend boundary.
 - `backend/knowledge_storage.py`: course-scoped durable files and SQLite data.
 - `backend/tsinghua_*.py`: external course synchronization only.
 
@@ -56,6 +59,11 @@ Answer edits append a new `LearningEvent` revision that points to the event it
 supersedes. Adaptive selection and mastery projections use only the latest
 revision for each session/question pair, while the full answer history remains
 available for audit and future learning-state recalculation.
+Assessment specs and shuffled choice options are generated once per source
+question fingerprint and stored in the same course SQLite database. Choice and
+numeric parts are graded deterministically; only short-text parts may call the
+configured text model. A mixed-part submission still produces one learning
+event so it contributes one unit of evidence to mastery projection.
 
 ### Providers and Storage
 

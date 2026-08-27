@@ -9,14 +9,56 @@ import {
   getActiveAdaptiveTest,
   startAdaptiveTest,
   submitAdaptiveAnswer,
+  type AdaptiveTestAnswer,
+  type AdaptiveTestQuestion,
   type AdaptiveTestQuestionImage,
   type AdaptiveTestPayload,
+  type AssessmentPart,
+  type AssessmentResponse,
 } from '../../lib/adaptiveTesting'
 import { resolveBackendApiUrl } from '../../lib/apiConfig'
 import { prepareMineruMarkdownMath } from '../../lib/latexMarkdown'
 
 function percentage(value: number) {
   return `${Math.round(value * 100)}%`
+}
+
+type DraftResponses = Record<string, Record<string, string>>
+
+const LEGACY_ASSESSMENT_PART: AssessmentPart = {
+  id: 'legacy-answer',
+  type: 'text',
+  prompt: '简要说明你的结论或思路。',
+  weight: 1,
+  required: true,
+  options: [],
+}
+
+function assessmentParts(question: AdaptiveTestQuestion | null | undefined): AssessmentPart[] {
+  return question?.assessment_spec?.parts?.length
+    ? question.assessment_spec.parts
+    : [LEGACY_ASSESSMENT_PART]
+}
+
+function savedResponseMap(
+  answer: AdaptiveTestAnswer | undefined,
+  parts: AssessmentPart[],
+): Record<string, string> {
+  if (!answer) return {}
+  if (answer.responses?.length) {
+    return Object.fromEntries(answer.responses.map((response) => [response.part_id, response.value]))
+  }
+  return parts.length === 1 && answer.response_text
+    ? { [parts[0].id]: answer.response_text }
+    : {}
+}
+
+function responseSignature(responses: Record<string, string>) {
+  return JSON.stringify(
+    Object.entries(responses)
+      .map(([partId, value]) => [partId, value.trim()])
+      .sort(([left], [right]) => left.localeCompare(right)),
+  )
 }
 
 function SourceText({ children }: { children: string }) {
@@ -62,7 +104,7 @@ export function LectureMasteryTest({
   const [isOpen, setIsOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [selectedQuestionId, setSelectedQuestionId] = useState('')
-  const [draftAnswers, setDraftAnswers] = useState<Record<string, string>>({})
+  const [draftAnswers, setDraftAnswers] = useState<DraftResponses>({})
   const [error, setError] = useState('')
   const [showResults, setShowResults] = useState(false)
   const questionStartedAt = useRef(Date.now())
@@ -93,9 +135,18 @@ export function LectureMasteryTest({
     const sessionId = payload?.session.id
     if (!sessionId) return
     const storageKey = `adaptive-test-drafts:${sessionId}`
-    let stored: Record<string, string> = {}
+    let stored: DraftResponses = {}
     try {
-      stored = JSON.parse(localStorage.getItem(storageKey) || '{}') as Record<string, string>
+      const parsed = JSON.parse(localStorage.getItem(storageKey) || '{}') as Record<string, unknown>
+      stored = Object.fromEntries(
+        Object.entries(parsed).flatMap(([questionId, value]) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+          const responses = Object.fromEntries(
+            Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+          )
+          return [[questionId, responses]]
+        }),
+      )
     } catch {
       stored = {}
     }
@@ -104,13 +155,14 @@ export function LectureMasteryTest({
         ...(payload.questions ?? []).map((question) => question.question_id),
         ...(payload.current_question ? [payload.current_question.question_id] : []),
       ])
-      const next: Record<string, string> = {}
+      const next: DraftResponses = {}
       for (const [questionId, value] of Object.entries({ ...stored, ...current })) {
         if (unlockedIds.has(questionId)) next[questionId] = value
       }
       for (const saved of payload.answers ?? []) {
         if (next[saved.question_id] === undefined) {
-          next[saved.question_id] = saved.response_text
+          const question = payload.questions.find((item) => item.question_id === saved.question_id)
+          next[saved.question_id] = savedResponseMap(saved, assessmentParts(question))
         }
       }
       return next
@@ -158,8 +210,18 @@ export function LectureMasteryTest({
     const selectedQuestion = payload?.questions?.find(
       (question) => question.question_id === selectedQuestionId,
     ) ?? payload?.current_question
-    const answer = selectedQuestion ? draftAnswers[selectedQuestion.question_id] ?? '' : ''
-    if (!selectedQuestion || !answer.trim() || isLoading || !payload) {
+    const selectedParts = assessmentParts(selectedQuestion)
+    const hasStructuredAssessment = Boolean(selectedQuestion?.assessment_spec?.parts?.length)
+    const partValues = selectedQuestion ? draftAnswers[selectedQuestion.question_id] ?? {} : {}
+    const responses: AssessmentResponse[] = selectedQuestion
+      ? selectedParts
+          .map((part) => ({ part_id: part.id, value: partValues[part.id]?.trim() ?? '' }))
+          .filter((response) => response.value)
+      : []
+    const requiredComplete = selectedParts
+      .filter((part) => part.required)
+      .every((part) => Boolean(partValues[part.id]?.trim())) ?? false
+    if (!selectedQuestion || !requiredComplete || isLoading || !payload) {
       return
     }
     setError('')
@@ -168,13 +230,16 @@ export function LectureMasteryTest({
       const next = await submitAdaptiveAnswer(
         payload.session.id,
         selectedQuestion.question_id,
-        answer.trim(),
+        responses,
         Math.max(0, Date.now() - questionStartedAt.current),
+        hasStructuredAssessment ? undefined : partValues[LEGACY_ASSESSMENT_PART.id]?.trim(),
       )
       setPayload(next)
       setDraftAnswers((current) => ({
         ...current,
-        [selectedQuestion.question_id]: next.saved_answer?.response_text ?? answer.trim(),
+        [selectedQuestion.question_id]: next.saved_answer
+          ? savedResponseMap(next.saved_answer, selectedParts)
+          : partValues,
       }))
       setSelectedQuestionId(selectedQuestion.question_id)
       setShowResults(false)
@@ -199,8 +264,15 @@ export function LectureMasteryTest({
   const savedAnswer = payload?.answers?.find(
     (item) => item.question_id === currentQuestion?.question_id,
   )
-  const answer = currentQuestion ? draftAnswers[currentQuestion.question_id] ?? savedAnswer?.response_text ?? '' : ''
-  const answerIsDirty = Boolean(savedAnswer && answer.trim() !== savedAnswer.response_text.trim())
+  const currentAssessmentParts = assessmentParts(currentQuestion)
+  const savedResponses = savedResponseMap(savedAnswer, currentAssessmentParts)
+  const answer = currentQuestion ? draftAnswers[currentQuestion.question_id] ?? savedResponses : {}
+  const answerIsDirty = Boolean(
+    savedAnswer && responseSignature(answer) !== responseSignature(savedResponses),
+  )
+  const requiredPartsComplete = currentAssessmentParts
+    .filter((part) => part.required)
+    .every((part) => Boolean(answer[part.id]?.trim()))
   const result = payload?.result
   const isContinuable = payload?.session.status === 'active'
 
@@ -388,7 +460,9 @@ export function LectureMasteryTest({
                   <span>已完成 {payload.progress.answered} 题</span>
                 </div>
                 <div className="mastery-question__meta">
-                  <span>{currentQuestion.source_type === 'lecture_example' ? '课堂例题' : '关联作业原题'}</span>
+                  <span>{currentQuestion.source_type === 'lecture_example'
+                    ? '课堂例题'
+                    : currentQuestion.source_type === 'past-exam' ? '关联往年题原题' : '关联作业原题'}</span>
                   <span>难度 {currentQuestion.difficulty}/5</span>
                   {currentQuestion.source_page_number ? <span>原文 P.{currentQuestion.source_page_number}</span> : null}
                 </div>
@@ -398,26 +472,91 @@ export function LectureMasteryTest({
                 <div className="mastery-question__concepts">
                   {currentQuestion.knowledge_points.map((concept) => <span key={concept}>{concept}</span>)}
                 </div>
-                <label className="mastery-question__answer">
-                  <span>你的答案</span>
-                  <textarea
-                    value={answer}
-                    onChange={(event) => setDraftAnswers((current) => ({
+                <section className="mastery-assessment-parts" aria-label="本题作答部分">
+                  {currentAssessmentParts.map((part, index) => {
+                    const partResult = savedAnswer?.part_grading_results?.find(
+                      (item) => item.part_id === part.id,
+                    )
+                    const updatePart = (value: string) => setDraftAnswers((current) => ({
                       ...current,
-                      [currentQuestion.question_id]: event.target.value,
-                    }))}
-                    placeholder="写下结论、关键公式或推导思路。系统会接受与参考解答等价的表达。"
-                    rows={7}
-                    disabled={isLoading}
-                  />
-                </label>
+                      [currentQuestion.question_id]: {
+                        ...(current[currentQuestion.question_id] ?? savedResponses),
+                        [part.id]: value,
+                      },
+                    }))
+                    return (
+                      <article className="mastery-assessment-part" key={part.id}>
+                        <header>
+                          <strong>Part {index + 1}</strong>
+                          <span>{Math.round(part.weight * 100)}%</span>
+                        </header>
+                        <SourceText>{part.prompt}</SourceText>
+                        {part.type === 'choice' ? (
+                          <div className="mastery-choice-grid" role="radiogroup" aria-label={`Part ${index + 1} 选项`}>
+                            {part.options.map((option) => (
+                              <label
+                                key={option.id}
+                                className={answer[part.id] === option.id ? 'is-selected' : ''}
+                              >
+                                <input
+                                  type="radio"
+                                  name={`${currentQuestion.question_id}:${part.id}`}
+                                  value={option.id}
+                                  checked={answer[part.id] === option.id}
+                                  onChange={() => updatePart(option.id)}
+                                  disabled={isLoading}
+                                />
+                                <b>{option.id}</b>
+                                <SourceText>{option.content}</SourceText>
+                              </label>
+                            ))}
+                          </div>
+                        ) : part.type === 'numeric' ? (
+                          <label className="mastery-numeric-answer">
+                            <span>答案</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={answer[part.id] ?? ''}
+                              onChange={(event) => updatePart(event.currentTarget.value)}
+                              placeholder="支持小数、科学计数法或简单分数"
+                              disabled={isLoading}
+                            />
+                          </label>
+                        ) : (
+                          <label className="mastery-text-answer">
+                            <span>简要说明你的思路即可</span>
+                            <textarea
+                              value={answer[part.id] ?? ''}
+                              onChange={(event) => updatePart(event.currentTarget.value)}
+                              placeholder="写下关键结论和理由，不必输入完整复杂公式。"
+                              rows={4}
+                              disabled={isLoading}
+                            />
+                          </label>
+                        )}
+                        {partResult ? (
+                          <div className={`mastery-part-feedback ${partResult.correct ? 'is-correct' : 'is-wrong'}`}>
+                            <strong>
+                              {part.type === 'text'
+                                ? `AI 评分 ${percentage(partResult.score)}`
+                                : partResult.correct ? `Part ${index + 1} 正确` : `Part ${index + 1} 错误`}
+                            </strong>
+                            {partResult.feedback ? <span>{partResult.feedback}</span> : null}
+                          </div>
+                        ) : null}
+                      </article>
+                    )
+                  })}
+                </section>
                 {savedAnswer ? (
                   <section className={`mastery-saved-answer ${savedAnswer.correct ? 'is-correct' : 'is-wrong'}`}>
                     <div>
-                      <span>{savedAnswer.correct ? '当前答案正确' : '当前答案还需巩固'}</span>
+                      <span>{savedAnswer.correct ? '当前答案达到掌握标准' : '当前答案还需巩固'}</span>
                       <strong>{percentage(savedAnswer.score)}</strong>
                       <small>第 {savedAnswer.revision} 版</small>
                     </div>
+                    <h4>本题得分：{percentage(savedAnswer.score)}</h4>
                     <p>{savedAnswer.feedback}</p>
                     {answerIsDirty ? <em>上方修改尚未保存</em> : null}
                     <details>
@@ -451,7 +590,7 @@ export function LectureMasteryTest({
                   <button
                     type="button"
                     className="primary-button mastery-question__submit"
-                    disabled={!answer.trim() || isLoading || Boolean(savedAnswer && !answerIsDirty)}
+                    disabled={!requiredPartsComplete || isLoading || Boolean(savedAnswer && !answerIsDirty)}
                     onClick={() => void submitAnswer()}
                   >
                     {isLoading
