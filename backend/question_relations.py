@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal
 
 import requests
@@ -23,23 +27,31 @@ from .question_pipeline import (
   QUESTION_DOCUMENTS_ROOT,
   build_question_retrieval_text,
 )
+from .knowledge_storage import read_knowledge_library
 from .runtime_config import load_api_config
 
 QUESTION_RELATIONS_ROOT = PROJECT_ROOT / '.runtime' / 'question-relations'
 RELATION_CONFIG_PATH = QUESTION_RELATIONS_ROOT / 'config.json'
 RELATIONS_DIR = QUESTION_RELATIONS_ROOT / 'relations'
 DOCUMENT_INDEX_DIR = QUESTION_RELATIONS_ROOT / 'documents'
+JSON_WRITE_RETRY_COUNT = 6
+JSON_WRITE_RETRY_SECONDS = 0.1
+_JSON_WRITE_LOCKS: dict[Path, Lock] = {}
+_JSON_WRITE_LOCKS_GUARD = Lock()
+_RELATION_RUN_LOCKS: dict[str, Lock] = {}
+_RELATION_RUN_LOCKS_GUARD = Lock()
 
 DEFAULT_RELATION_CONFIG: dict[str, Any] = {
-  'retrieval_top_n': 50,
-  'rerank_top_k': 50,
+  'retrieval_top_n': 20,
+  'rerank_top_k': 20,
   'rerank_batch_size': 10,
   'rerank_max_text_chars': 4000,
   'min_rerank_score': 0.5,
   'include_same_document_questions': False,
   'ai_verification_enabled': True,
   'ai_verification_min_confidence': 0.45,
-  'ai_verification_max_candidates': 50,
+  'ai_verification_max_candidates': 20,
+  'ai_verification_concurrency': 4,
   'ai_verification_max_page_chars': 7000,
 }
 
@@ -71,9 +83,37 @@ def _truncate_for_rerank(value: Any, max_chars: int) -> str:
 
 def _write_json(path: Path, value: Any) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
-  temporary = path.with_suffix('.tmp')
-  temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-  temporary.replace(path)
+  target = path.resolve()
+  serialized = json.dumps(value, ensure_ascii=False, indent=2)
+  with _json_write_lock(target):
+    last_error: PermissionError | None = None
+    for attempt in range(JSON_WRITE_RETRY_COUNT):
+      temporary = target.with_name(f'.{target.name}.{uuid.uuid4().hex}.tmp')
+      try:
+        temporary.write_text(serialized, encoding='utf-8')
+        os.replace(temporary, target)
+        return
+      except PermissionError as exc:
+        last_error = exc
+        if attempt + 1 < JSON_WRITE_RETRY_COUNT:
+          time.sleep(JSON_WRITE_RETRY_SECONDS * (attempt + 1))
+      finally:
+        try:
+          temporary.unlink(missing_ok=True)
+        except OSError:
+          pass
+    if last_error is not None:
+      raise last_error
+
+
+def _json_write_lock(path: Path) -> Lock:
+  with _JSON_WRITE_LOCKS_GUARD:
+    return _JSON_WRITE_LOCKS.setdefault(path, Lock())
+
+
+def _relation_run_lock(question_id: str) -> Lock:
+  with _RELATION_RUN_LOCKS_GUARD:
+    return _RELATION_RUN_LOCKS.setdefault(question_id, Lock())
 
 
 def _read_json(path: Path, fallback: Any) -> Any:
@@ -133,6 +173,12 @@ def normalize_relation_config(payload: dict[str, Any] | None) -> dict[str, Any]:
       DEFAULT_RELATION_CONFIG['ai_verification_max_candidates'],
       1,
       top_n,
+    ),
+    'ai_verification_concurrency': _clamp_int(
+      payload.get('ai_verification_concurrency'),
+      DEFAULT_RELATION_CONFIG['ai_verification_concurrency'],
+      1,
+      8,
     ),
     'ai_verification_max_page_chars': _clamp_int(
       payload.get('ai_verification_max_page_chars'),
@@ -436,6 +482,7 @@ class QuestionRelationPipeline:
     self.relations_dir = root / 'relations'
     self.document_index_dir = root / 'documents'
     self.lecture_page_index_dir = root / 'lecture-pages'
+    self.question_reverse_index_dir = root / 'question-targets'
     self.question_documents_root = question_documents_root
     self.lecture_documents_root = lecture_documents_root
 
@@ -451,6 +498,11 @@ class QuestionRelationPipeline:
     return build_question_retrieval_text(question)
 
   def link_question(self, question: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
+    question_id = str(question.get('question_id') or '').strip()
+    with _relation_run_lock(question_id or 'unknown'):
+      return self._link_question_unlocked(question, document)
+
+  def _link_question_unlocked(self, question: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(question.get('analysis'), dict):
       raise HTTPException(status_code=422, detail='Question analysis is required before creating relations.')
     question_id = str(question.get('question_id') or '').strip()
@@ -470,7 +522,36 @@ class QuestionRelationPipeline:
       if source_document_type in {'homework', 'exercise-set'}
       else _TARGETS
     )
+    # Question-to-question links are inexpensive and should become visible
+    # before the slower per-page lecture verification finishes.
+    targets = tuple(sorted(targets, key=lambda target: target[0] == 'lecture'))
+    record_path = self.relations_dir / f'{_safe_name(question_id)}.json'
+    previous_record = _read_json(record_path, {})
+    record = {
+      'version': 2,
+      'generated_at': time.time(),
+      'question_id': question_id,
+      'question_document_id': document_id,
+      'question_document_name': str(document.get('document_name') or ''),
+      'course_id': course_id,
+      'question_page_number': int(question.get('page_number') or 0),
+      'retrieval_query': query,
+      'settings': config,
+      'status': 'processing',
+      'current_target': None,
+      'relations': relations,
+      'runs': target_runs,
+    }
+    _write_json(record_path, record)
+    # A retry replaces the authoritative relation set immediately. Remove the
+    # previous reverse-page entries now so an interrupted retry cannot leave
+    # stale lecture cards behind.
+    self._sync_lecture_page_indexes(previous_record, record)
+    self._sync_question_reverse_indexes(previous_record, record)
     for target_name, collection, document_types, relation_type in targets:
+      record['current_target'] = target_name
+      record['generated_at'] = time.time()
+      _write_json(record_path, record)
       candidates: list[dict[str, Any]] = []
       retrieval_errors: list[str] = []
       for document_type in document_types:
@@ -526,39 +607,71 @@ class QuestionRelationPipeline:
         )
         for item in accepted
       )
-
-    record = {
-      'version': 2,
-      'generated_at': time.time(),
-      'question_id': question_id,
-      'question_document_id': document_id,
-      'question_document_name': str(document.get('document_name') or ''),
-      'course_id': course_id,
-      'question_page_number': int(question.get('page_number') or 0),
-      'retrieval_query': query,
-      'settings': config,
-      'relations': relations,
-      'runs': target_runs,
-    }
-    record_path = self.relations_dir / f'{_safe_name(question_id)}.json'
-    previous_record = _read_json(record_path, {})
+      record['generated_at'] = time.time()
+      _write_json(record_path, record)
+      self._sync_question_reverse_indexes(previous_record, record)
+    record.update({'generated_at': time.time(), 'status': 'completed', 'current_target': None})
     _write_json(record_path, record)
     self._sync_lecture_page_indexes(previous_record, record)
+    self._sync_question_reverse_indexes(previous_record, record)
     return record
 
   def link_document(self, document_id: str) -> dict[str, Any]:
     document, questions = self._load_question_document(document_id)
-    records = [self.link_question(question, document) for question in questions if isinstance(question.get('analysis'), dict)]
+    index_path = self.document_index_dir / f'{_safe_name(document_id)}.json'
     index = {
       'generated_at': time.time(),
       'document_id': document_id,
       'course_id': document['course_id'],
       'question_count': len(questions),
-      'linked_question_count': len(records),
-      'question_ids': [record['question_id'] for record in records],
+      'linked_question_count': 0,
+      'question_ids': [],
+      'status': 'processing',
+      'error': None,
     }
-    _write_json(self.document_index_dir / f'{_safe_name(document_id)}.json', index)
+    _write_json(index_path, index)
+    try:
+      records = [self.link_question(question, document) for question in questions if isinstance(question.get('analysis'), dict)]
+      index.update({
+        'generated_at': time.time(),
+        'linked_question_count': len(records),
+        'question_ids': [record['question_id'] for record in records],
+        'status': 'completed',
+        'error': None,
+      })
+    except Exception as exc:
+      index.update({
+        'generated_at': time.time(),
+        'status': 'failed',
+        'error': str(getattr(exc, 'detail', None) or exc),
+      })
+      _write_json(index_path, index)
+      raise
+    _write_json(index_path, index)
     return index
+
+  def missing_document_ids(self) -> list[str]:
+    """Return completed question documents whose relation projection is absent or incomplete."""
+    missing: list[str] = []
+    if not self.question_documents_root.is_dir():
+      return missing
+    for directory in self.question_documents_root.iterdir():
+      if not directory.is_dir():
+        continue
+      state = _read_json(directory / 'state.json', {})
+      if not isinstance(state, dict) or state.get('status') != 'completed':
+        continue
+      document_id = str(state.get('document_id') or directory.name)
+      index = _read_json(self.document_index_dir / f'{_safe_name(document_id)}.json', {})
+      legacy_completed = (
+        isinstance(index, dict)
+        and not index.get('status')
+        and str(index.get('document_id') or '') == document_id
+        and bool(index.get('generated_at'))
+      )
+      if not isinstance(index, dict) or (index.get('status') != 'completed' and not legacy_completed):
+        missing.append(document_id)
+    return missing
 
   def link_document_question(self, document_id: str, question_id: str) -> dict[str, Any]:
     document, questions = self._load_question_document(document_id)
@@ -584,9 +697,38 @@ class QuestionRelationPipeline:
 
   def result(self, question_id: str) -> dict[str, Any]:
     record = _read_json(self.relations_dir / f'{_safe_name(question_id)}.json', None)
-    if not isinstance(record, dict):
+    reverse = _read_json(self.question_reverse_index_dir / f'{_safe_name(question_id)}.json', None)
+    if not isinstance(record, dict) and not isinstance(reverse, dict):
       raise HTTPException(status_code=404, detail='Question relation record not found.')
-    return record
+    result = dict(record) if isinstance(record, dict) else {
+      'version': 2,
+      'question_id': question_id,
+      'status': 'completed',
+      'relations': [],
+      'runs': [],
+    }
+    relations = list(result.get('relations') or [])
+    if isinstance(reverse, dict):
+      relations.extend(reverse.get('relations') or [])
+    unique: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for relation in relations:
+      if not isinstance(relation, dict):
+        continue
+      target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
+      key = (
+        str(target.get('question_id') or target.get('document_id') or ''),
+        str(relation.get('relation_type') or ''),
+        int(target.get('page_number') or 0),
+      )
+      previous = unique.get(key)
+      if previous is None or float(relation.get('rerank_score') or 0.0) > float(previous.get('rerank_score') or 0.0):
+        unique[key] = relation
+    result['relations'] = sorted(
+      unique.values(),
+      key=lambda item: float(item.get('rerank_score') or 0.0),
+      reverse=True,
+    )
+    return result
 
   def lecture_page_relations(
     self,
@@ -718,9 +860,12 @@ class QuestionRelationPipeline:
     }
 
   def rebuild_lecture_page_indexes(self) -> dict[str, Any]:
-    """Rebuild persisted lecture-page-to-question indexes without rerunning retrieval."""
+    """Rebuild all reverse indexes without rerunning retrieval or AI review."""
     if self.lecture_page_index_dir.is_dir():
       for path in self.lecture_page_index_dir.rglob('*.json'):
+        path.unlink()
+    if self.question_reverse_index_dir.is_dir():
+      for path in self.question_reverse_index_dir.rglob('*.json'):
         path.unlink()
     indexed_records = 0
     for path in self.relations_dir.glob('*.json') if self.relations_dir.is_dir() else []:
@@ -728,13 +873,23 @@ class QuestionRelationPipeline:
       if not isinstance(record, dict):
         continue
       self._sync_lecture_page_indexes({}, record)
+      self._sync_question_reverse_indexes({}, record)
       indexed_records += 1
     page_files = (
       sum(1 for _ in self.lecture_page_index_dir.rglob('*.json'))
       if self.lecture_page_index_dir.is_dir()
       else 0
     )
-    return {'question_records': indexed_records, 'lecture_pages': page_files}
+    question_target_files = (
+      sum(1 for _ in self.question_reverse_index_dir.glob('*.json'))
+      if self.question_reverse_index_dir.is_dir()
+      else 0
+    )
+    return {
+      'question_records': indexed_records,
+      'lecture_pages': page_files,
+      'question_targets': question_target_files,
+    }
 
   def delete_question_document(self, document_id: str) -> None:
     """Delete source-question relation records before its question document is removed."""
@@ -761,8 +916,14 @@ class QuestionRelationPipeline:
 
     for path in relation_paths:
       if path.is_file():
-        self._sync_lecture_page_indexes(_read_json(path, {}), {})
+        previous_record = _read_json(path, {})
+        self._sync_lecture_page_indexes(previous_record, {})
+        self._sync_question_reverse_indexes(previous_record, {})
         path.unlink()
+    for question_id in question_ids:
+      reverse_path = self.question_reverse_index_dir / f'{_safe_name(str(question_id))}.json'
+      if reverse_path.is_file():
+        reverse_path.unlink()
     index_path = self.document_index_dir / f'{_safe_name(document_id)}.json'
     if index_path.is_file():
       index_path.unlink()
@@ -800,6 +961,7 @@ class QuestionRelationPipeline:
           record['updated_at'] = time.time()
           _write_json(path, record)
           self._sync_lecture_page_indexes(previous_record, record)
+          self._sync_question_reverse_indexes(previous_record, record)
 
     reverse_index_directory = self.lecture_page_index_dir / _safe_name(document_id)
     if reverse_index_directory.is_dir():
@@ -896,6 +1058,91 @@ class QuestionRelationPipeline:
         'updated_at': time.time(),
       })
 
+  @staticmethod
+  def _question_target_ids(record: dict[str, Any]) -> set[str]:
+    target_ids: set[str] = set()
+    relations = record.get('relations') if isinstance(record.get('relations'), list) else []
+    for relation in relations:
+      if not isinstance(relation, dict) or relation.get('relation_type') == 'question_to_lecture_page':
+        continue
+      target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
+      question_id = str(target.get('question_id') or '').strip()
+      if question_id:
+        target_ids.add(question_id)
+    return target_ids
+
+  def _sync_question_reverse_indexes(
+    self,
+    previous_record: dict[str, Any],
+    current_record: dict[str, Any],
+  ) -> None:
+    """Persist incoming question links so either question can load the other."""
+    affected_ids = self._question_target_ids(previous_record) | self._question_target_ids(current_record)
+    source_ids = {
+      str(record.get('question_id') or '')
+      for record in (previous_record, current_record)
+      if isinstance(record, dict) and record.get('question_id')
+    }
+    source_question = (
+      self._question_summary(
+        str(current_record.get('question_document_id') or ''),
+        str(current_record.get('question_id') or ''),
+      )
+      if current_record
+      else {}
+    )
+    current_relations = (
+      current_record.get('relations')
+      if isinstance(current_record.get('relations'), list)
+      else []
+    )
+
+    for target_question_id in affected_ids:
+      path = self.question_reverse_index_dir / f'{_safe_name(target_question_id)}.json'
+      existing = _read_json(path, {})
+      relations = [
+        relation
+        for relation in existing.get('relations', [])
+        if (
+          isinstance(relation, dict)
+          and str(relation.get('reverse_source_question_id') or '') not in source_ids
+        )
+      ] if isinstance(existing, dict) else []
+
+      for relation in current_relations:
+        if not isinstance(relation, dict) or relation.get('relation_type') == 'question_to_lecture_page':
+          continue
+        target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
+        if str(target.get('question_id') or '') != target_question_id:
+          continue
+        relations.append({
+          **relation,
+          'relation_id': f"{relation.get('relation_id')}:reverse",
+          'reverse_relation_type': 'question_to_question',
+          'reverse_source_question_id': str(current_record.get('question_id') or ''),
+          'target': source_question,
+        })
+
+      unique = {
+        str(relation.get('relation_id') or ''): relation
+        for relation in relations
+        if isinstance(relation, dict) and relation.get('relation_id')
+      }
+      relations = sorted(
+        unique.values(),
+        key=lambda item: float(item.get('rerank_score') or 0.0),
+        reverse=True,
+      )
+      if not relations:
+        if path.is_file():
+          path.unlink()
+        continue
+      _write_json(path, {
+        'question_id': target_question_id,
+        'relations': relations,
+        'updated_at': time.time(),
+      })
+
   def _load_question_document(self, document_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     directory = self.question_documents_root / _safe_name(document_id)
     state = _read_json(directory / 'state.json', {})
@@ -983,6 +1230,29 @@ class QuestionRelationPipeline:
     expansion_context: dict[str, Any],
   ) -> tuple[dict[str, Any], bool]:
     payload = candidate.get('payload') if isinstance(candidate.get('payload'), dict) else {}
+    excluded_reason = self._excluded_lecture_page_reason(payload)
+    if excluded_reason:
+      decision = {
+        'related': False,
+        'confidence': 1.0,
+        'page_role': 'summary',
+        'reason': excluded_reason,
+        'concrete_evidence': [],
+      }
+      return ({
+        'document_id': payload.get('document_id'),
+        'document_name': payload.get('document_name'),
+        'page_number': payload.get('page_number'),
+        'stage': expansion_context.get('kind'),
+        'seed_page_number': expansion_context.get('seed_page_number'),
+        'direction': expansion_context.get('direction'),
+        'distance': expansion_context.get('distance'),
+        'vector_score': float(candidate.get('vector_score') or 0.0),
+        'rerank_score': float(candidate.get('rerank_score') or 0.0),
+        'accepted': False,
+        'decision': decision,
+        'error': None,
+      }, False)
     try:
       decision = self.verifier.verify(
         question,
@@ -1030,6 +1300,29 @@ class QuestionRelationPipeline:
     }
     return audit, accepted
 
+  @staticmethod
+  def _excluded_lecture_page_reason(payload: dict[str, Any]) -> str | None:
+    """Reject navigation/review pages before an expensive AI verification call."""
+    title = re.sub(r'\s+', ' ', str(payload.get('title') or '')).strip().lower()
+    if not title:
+      return None
+    excluded_prefixes = (
+      '\u5c01\u9762',       # cover
+      '\u76ee\u5f55',       # table of contents
+      '\u56de\u987e',       # review
+      '\u603b\u7ed3',       # summary
+      '\u5c0f\u7ed3',       # section summary
+      'cover',
+      'contents',
+      'table of contents',
+      'review',
+      'summary',
+      'overview',
+    )
+    if title.startswith(excluded_prefixes):
+      return 'The page title identifies it as a cover, contents, review, or summary page.'
+    return None
+
   def _verify_lecture_candidates(
     self,
     *,
@@ -1041,10 +1334,9 @@ class QuestionRelationPipeline:
     accepted_by_page: dict[str, dict[str, Any]] = {}
     audits: list[dict[str, Any]] = []
 
-    for raw_candidate in candidates:
+    def verify(raw_candidate: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
       candidate = self._hydrate_lecture_candidate(raw_candidate)
       payload = candidate.get('payload') if isinstance(candidate.get('payload'), dict) else {}
-      page_key = f"{payload.get('document_id')}:{payload.get('page_number')}"
       audit, accepted = self._verify_lecture_page(
         question=question,
         query=query,
@@ -1052,6 +1344,14 @@ class QuestionRelationPipeline:
         config=config,
         expansion_context={'kind': 'seed', 'seed_page_number': payload.get('page_number')},
       )
+      return candidate, payload, audit, accepted
+
+    concurrency = min(config['ai_verification_concurrency'], max(1, len(candidates)))
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix='relation-verifier') as executor:
+      verified_candidates = executor.map(verify, candidates)
+
+    for candidate, payload, audit, accepted in verified_candidates:
+      page_key = f"{payload.get('document_id')}:{payload.get('page_number')}"
       audits.append(audit)
       if not accepted:
         continue
@@ -1095,10 +1395,17 @@ class QuestionRelationPipeline:
         response = self.vector_store.search(vector, config['retrieval_top_n'], {'course_id': course_id, 'document_type': document_type})
     except Exception as exc:  # A missing collection is a valid empty target at this stage.
       return [], str(exc)
+    valid_lecture_ids = (
+      self._active_lecture_document_ids(course_id)
+      if collection == QDRANT_COLLECTION and document_type == 'lecture'
+      else None
+    )
     candidates = []
     for result in response:
       payload = result.get('payload') if isinstance(result, dict) else None
       if not isinstance(payload, dict):
+        continue
+      if valid_lecture_ids is not None and str(payload.get('document_id') or '') not in valid_lecture_ids:
         continue
       if payload.get('question_id') == question_id:
         continue
@@ -1114,6 +1421,20 @@ class QuestionRelationPipeline:
         continue
       candidates.append({'payload': payload, 'content': content, 'vector_score': float(result.get('score') or 0.0)})
     return candidates, None
+
+  @staticmethod
+  def _active_lecture_document_ids(course_id: str) -> set[str]:
+    """Use the course library as the authority for lecture ownership."""
+    library = read_knowledge_library()
+    return {
+      str(item.get('id') or '')
+      for item in library.get('files') or []
+      if (
+        isinstance(item, dict)
+        and str(item.get('courseId') or '') == course_id
+        and str(item.get('id') or '')
+      )
+    }
 
   @staticmethod
   def _deduplicate_targets(candidates: list[dict[str, Any]], target_name: str) -> list[dict[str, Any]]:

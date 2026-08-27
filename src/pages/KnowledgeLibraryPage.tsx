@@ -12,15 +12,21 @@ import {
   updateKnowledgeCourseSettings,
   upsertKnowledgeFile,
 } from '../lib/knowledgeBase'
-import { extractPdfPreview } from '../lib/pdf'
+import { convertImageUploadToPdf, extractPdfPreview } from '../lib/pdf'
 import {
-  buildFailedHomeworkDocument,
   buildPendingHomeworkDocument,
+  getMineruUploadError,
+  getMineruUploadKind,
+  getHomeworkDocumentProcessingStatus,
   getLectureDocumentProcessingStatus,
+  MINERU_UPLOAD_ACCEPT,
   processHomeworkDocumentWithPipeline,
+  readHomeworkAssetPayload,
+  retryHomeworkDocumentProcessing,
   retryLectureDocumentProcessing,
   submitLectureDocumentForProcessing,
   type DocumentPipelineStatus,
+  type QuestionPipelineResult,
 } from '../lib/mineru'
 import { getKnowledgeCourseDisplayName } from '../lib/knowledgeBaseCourses'
 import { parseTsinghuaCourseDisplayName } from '../lib/tsinghuaCourseLabels'
@@ -45,7 +51,7 @@ import {
   importCoursewareFiles,
 } from '../features/knowledge-library/coursewareImport'
 import { useKnowledgeLibraryState } from '../features/knowledge-library/useKnowledgeLibraryState'
-import type { KnowledgeFile, KnowledgeLibraryFolderType, StructuredDocumentBlock } from '../types'
+import type { HomeworkDocument, KnowledgeFile, KnowledgeLibraryFolderType, StructuredDocumentBlock } from '../types'
 
 type LibraryFolderType = KnowledgeLibraryFolderType | 'homework' | 'past-exam'
 type CoursewarePickerItem = TsinghuaCoursewareFile & { wasDeleted: boolean }
@@ -82,6 +88,67 @@ function formatCoursewareKind(file: TsinghuaCoursewareFile) {
 
 function isPipelineFailure(status: string | null | undefined) {
   return Boolean(status && status.endsWith('_failed'))
+}
+
+function applyQuestionPipelineResult(
+  document: HomeworkDocument,
+  result: QuestionPipelineResult,
+): HomeworkDocument {
+  const failed = result.status.endsWith('_failed')
+  return {
+    ...document,
+    pageCount: result.pageCount ?? document.pageCount,
+    status: result.status === 'completed' ? 'ready' : failed ? 'error' : 'processing',
+    pipelineStatus: result.status,
+    parserStatus: result.parserStatus || document.parserStatus || null,
+    extractionStatus: result.extractionStatus || document.extractionStatus || null,
+    analysisStatus: result.analysisStatus || document.analysisStatus || null,
+    embeddingStatus: result.embeddingStatus || document.embeddingStatus || null,
+    vectorStatus: result.vectorStatus || document.vectorStatus || null,
+    embeddingCompletedQuestions: result.embeddingCompletedQuestions,
+    vectorCompletedQuestions: result.vectorCompletedQuestions,
+    extractedMarkdown: result.markdown || document.extractedMarkdown,
+    layoutBlocks: result.layoutBlocks.length ? result.layoutBlocks : document.layoutBlocks,
+    questions: result.questions.length ? result.questions : document.questions,
+    errorMessage: result.error,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+function formatQuestionPipelineStatus(document: HomeworkDocument) {
+  switch (document.pipelineStatus) {
+    case 'queued': return '等待 MinerU 解析'
+    case 'parsing': return '正在用 MinerU 解析'
+    case 'extracting_questions': return '正在切分题目'
+    case 'analyzing': return '正在分析题目'
+    case 'embedding': return '正在生成 Embedding'
+    case 'vector': return '正在写入 Qdrant'
+    case 'completed': return '已完成题目索引'
+    case 'parser_failed': return 'MinerU 解析失败'
+    case 'extraction_failed': return '题目切分失败'
+    case 'analysis_failed': return '题目分析失败'
+    case 'embedding_failed': return 'Embedding 失败'
+    case 'vector_failed': return 'Qdrant 写入失败'
+    default: return document.status === 'error' ? '题目处理失败' : '正在处理题目'
+  }
+}
+
+function QuestionPipelineProgress({ document }: { document: HomeworkDocument }) {
+  if (document.status !== 'processing') return null
+  const completed = document.embeddingStatus === 'completed'
+    ? (document.vectorCompletedQuestions ?? 0)
+    : (document.embeddingCompletedQuestions ?? 0)
+  const total = document.questions.length
+  return (
+    <div className="octopus-pipeline-progress" aria-label="题目处理进度">
+      <span className="octopus-pipeline-progress__stage is-active">
+        {formatQuestionPipelineStatus(document)}
+      </span>
+      {total > 0 && completed > 0 ? (
+        <span className="octopus-pipeline-progress__count">{completed}/{total} 题</span>
+      ) : null}
+    </div>
+  )
 }
 
 function formatPipelineStatus(status: string | null | undefined) {
@@ -224,6 +291,11 @@ export function KnowledgeLibraryPage() {
     activeCourse && isHomeworkFolder && activeFolderType
       ? getKnowledgeHomeworkDocumentsByCourseFolder(activeCourse.id, activeFolderType)
       : []
+  const activeCourseId = activeCourse?.id ?? ''
+  const pendingQuestionDocumentIds = activeFolderDocuments
+    .filter((document) => document.status === 'processing')
+    .map((document) => document.id)
+    .join('|')
 
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
@@ -235,6 +307,7 @@ export function KnowledgeLibraryPage() {
   const [uploadError, setUploadError] = useState('')
   const [isDraggingPdf, setIsDraggingPdf] = useState(false)
   const [expandedErrorId, setExpandedErrorId] = useState<string | null>(null)
+  const [retryingQuestionIds, setRetryingQuestionIds] = useState<Set<string>>(() => new Set())
   const [isCourseSettingsOpen, setIsCourseSettingsOpen] = useState(false)
   const [courseSettingsBusy, setCourseSettingsBusy] = useState(false)
   const [courseSettingsError, setCourseSettingsError] = useState('')
@@ -283,6 +356,40 @@ export function KnowledgeLibraryPage() {
     return () => { cancelled = true; window.clearInterval(timer) }
   }, [knowledgeLibrary, activeCourse?.id])
 
+  useEffect(() => {
+    if (!activeCourseId || !isHomeworkFolder || !pendingQuestionDocumentIds) return
+    const documentIds = pendingQuestionDocumentIds.split('|').filter(Boolean)
+    let cancelled = false
+    const poll = async () => {
+      for (const documentId of documentIds) {
+        try {
+          const result = await getHomeworkDocumentProcessingStatus(documentId)
+          if (cancelled) return
+          const current = getKnowledgeHomeworkDocumentsByCourseFolder(
+            activeCourseId,
+            activeFolderType === 'past-exam' ? 'past-exam' : 'homework',
+          )
+          const latest = current.find((item) => item.id === documentId)
+          if (!latest) continue
+          const updated = applyQuestionPipelineResult(latest, result)
+          saveKnowledgeHomeworkDocuments(
+            activeCourseId,
+            activeFolderType === 'past-exam' ? 'past-exam' : 'homework',
+            [updated, ...current.filter((item) => item.id !== documentId)],
+          )
+        } catch (error) {
+          if (!cancelled) console.warn('question pipeline status request failed:', error)
+        }
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [activeCourseId, activeFolderType, isHomeworkFolder, pendingQuestionDocumentIds])
+
   useEffect(() => () => {
     const sessionId = syncSessionRef.current
     syncSessionRef.current = null
@@ -300,28 +407,24 @@ export function KnowledgeLibraryPage() {
     document: ReturnType<typeof buildPendingHomeworkDocument>,
   ) => {
     try {
-      const extraction = await processHomeworkDocumentWithPipeline(file, courseId, folderType, document.id)
-      const completedDocument = {
-        ...document,
-        pageCount: extraction.pageCount,
-        status: 'ready' as const,
-        extractedMarkdown: extraction.markdown,
-        layoutBlocks: extraction.layoutBlocks,
-        questions: extraction.questions,
-        errorMessage: null,
-        updatedAt: new Date().toISOString(),
-      }
+      const result = await processHomeworkDocumentWithPipeline(file, courseId, folderType, document.id)
+      const latest = getKnowledgeHomeworkDocumentsByCourseFolder(courseId, folderType)
+        .find((item) => item.id === document.id) ?? document
+      const completedDocument = applyQuestionPipelineResult(latest, result)
       const current = getKnowledgeHomeworkDocumentsByCourseFolder(courseId, folderType)
       saveKnowledgeHomeworkDocuments(courseId, folderType, [
         completedDocument,
         ...current.filter((item) => item.id !== completedDocument.id),
       ])
     } catch (error) {
-      const failedDocument = buildFailedHomeworkDocument(
-        document,
-        error instanceof Error ? error.message : '题目解析失败。',
-      )
       const current = getKnowledgeHomeworkDocumentsByCourseFolder(courseId, folderType)
+      const latest = current.find((item) => item.id === document.id) ?? document
+      const failedDocument: HomeworkDocument = {
+        ...latest,
+        status: 'error',
+        errorMessage: error instanceof Error ? error.message : '题目解析失败。',
+        updatedAt: new Date().toISOString(),
+      }
       saveKnowledgeHomeworkDocuments(courseId, folderType, [
         failedDocument,
         ...current.filter((item) => item.id !== failedDocument.id),
@@ -329,10 +432,61 @@ export function KnowledgeLibraryPage() {
     }
   }
 
-  const uploadPdf = async (file: File) => {
+  const retryHomeworkDocument = async (
+    document: HomeworkDocument,
+    folderType: 'homework' | 'past-exam',
+  ) => {
+    if (!activeCourse || retryingQuestionIds.has(document.id)) return
+    setUploadError('')
+    setExpandedErrorId(null)
+    setRetryingQuestionIds((current) => new Set(current).add(document.id))
+    const markProcessing: HomeworkDocument = {
+      ...document,
+      status: 'processing',
+      errorMessage: null,
+      updatedAt: new Date().toISOString(),
+    }
+    const beforeRetry = getKnowledgeHomeworkDocumentsByCourseFolder(activeCourse.id, folderType)
+    saveKnowledgeHomeworkDocuments(activeCourse.id, folderType, [
+      markProcessing,
+      ...beforeRetry.filter((item) => item.id !== document.id),
+    ])
+    try {
+      const result = await retryHomeworkDocumentProcessing(document.id)
+      const current = getKnowledgeHomeworkDocumentsByCourseFolder(activeCourse.id, folderType)
+      const latest = current.find((item) => item.id === document.id) ?? markProcessing
+      const updated = applyQuestionPipelineResult(latest, result)
+      saveKnowledgeHomeworkDocuments(activeCourse.id, folderType, [
+        updated,
+        ...current.filter((item) => item.id !== document.id),
+      ])
+    } catch (error) {
+      const current = getKnowledgeHomeworkDocumentsByCourseFolder(activeCourse.id, folderType)
+      const latest = current.find((item) => item.id === document.id) ?? markProcessing
+      const failed: HomeworkDocument = {
+        ...latest,
+        status: 'error',
+        errorMessage: error instanceof Error ? error.message : '题目任务重试失败。',
+        updatedAt: new Date().toISOString(),
+      }
+      saveKnowledgeHomeworkDocuments(activeCourse.id, folderType, [
+        failed,
+        ...current.filter((item) => item.id !== document.id),
+      ])
+    } finally {
+      setRetryingQuestionIds((current) => {
+        const next = new Set(current)
+        next.delete(document.id)
+        return next
+      })
+    }
+  }
+
+  const uploadFile = async (file: File) => {
     if (!activeCourse) return
-    if (!file.name.toLowerCase().endsWith('.pdf')) {
-      setUploadError('请选择 PDF 文件。')
+    const uploadKind = getMineruUploadKind(file)
+    if (!uploadKind) {
+      setUploadError(getMineruUploadError(file))
       return
     }
     setUploadError('')
@@ -343,7 +497,7 @@ export function KnowledgeLibraryPage() {
           activeCourse.id,
           activeFolderType,
           pendingDocument,
-          await file.arrayBuffer(),
+          await readHomeworkAssetPayload(file),
         )
         void finishHomeworkUpload(file, activeCourse.id, activeFolderType, pendingDocument)
         navigate(
@@ -352,7 +506,8 @@ export function KnowledgeLibraryPage() {
         return
       }
 
-      const preview = await extractPdfPreview(file)
+      const previewFile = uploadKind === 'image' ? await convertImageUploadToPdf(file) : file
+      const preview = await extractPdfPreview(previewFile)
       const storedFile = await upsertKnowledgeFile({
         fileName: file.name,
         pageCount: preview.pageCount,
@@ -373,12 +528,12 @@ export function KnowledgeLibraryPage() {
           }),
       })
       if (activeFolderType !== 'other') {
-        const status = await submitLectureDocumentForProcessing(file, activeCourse.id, storedFile.id)
+        const status = await submitLectureDocumentForProcessing(previewFile, activeCourse.id, storedFile.id)
         await syncPipelineResult(storedFile.id, status)
       }
       navigate(`/pdf?file=${storedFile.id}&course=${activeCourse.id}`)
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : 'PDF 上传失败。')
+      setUploadError(error instanceof Error ? error.message : '文件上传失败。')
     }
   }
 
@@ -394,8 +549,16 @@ export function KnowledgeLibraryPage() {
   const handleDrop = (event: DragEvent<HTMLElement>) => {
     event.preventDefault()
     setIsDraggingPdf(false)
+    if (event.dataTransfer.files.length > 1) {
+      setUploadError('当前一次处理一个文件，请分别拖入，避免多份文档同时占用 MinerU。')
+      return
+    }
     const file = event.dataTransfer.files.item(0)
-    if (file) void uploadPdf(file)
+    if (file) {
+      void uploadFile(file)
+    } else {
+      setUploadError('没有检测到可上传的本地文件。')
+    }
   }
 
   const handleDeleteFile = async (fileId: string, fileName: string) => {
@@ -773,12 +936,50 @@ export function KnowledgeLibraryPage() {
                   {document.questions.length} 题 · {document.pageCount ?? '?'} 页
                 </p>
                 {document.status === 'processing' ? (
-                  <div className="octopus-pipeline-status"><span>正在解析题目</span></div>
+                  <div className="octopus-pipeline-status">
+                    <span>{formatQuestionPipelineStatus(document)}</span>
+                  </div>
                 ) : null}
                 {document.status === 'error' ? (
                   <div className="octopus-pipeline-status octopus-pipeline-status--failed">
-                    <span>题目解析失败</span>
+                    <span>{formatQuestionPipelineStatus(document)}</span>
+                    <button
+                      type="button"
+                      className={`octopus-pipeline-status__retry-icon${retryingQuestionIds.has(document.id) ? ' is-spinning' : ''}`}
+                      aria-label="从失败步骤重新处理"
+                      title="从失败步骤重试"
+                      disabled={retryingQuestionIds.has(document.id)}
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        void retryHomeworkDocument(
+                          document,
+                          activeFolderType === 'past-exam' ? 'past-exam' : 'homework',
+                        )
+                      }}
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M20 7v5h-5M4 17v-5h5M6.1 8.2A7 7 0 0 1 18.7 7M17.9 15.8A7 7 0 0 1 5.3 17" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className="octopus-pipeline-status__error"
+                      aria-label="查看失败原因"
+                      aria-expanded={expandedErrorId === document.id}
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        setExpandedErrorId((current) => current === document.id ? null : document.id)
+                      }}
+                    >!</button>
                   </div>
+                ) : null}
+                <QuestionPipelineProgress document={document} />
+                {document.status === 'error' && expandedErrorId === document.id ? (
+                  <p className="octopus-pipeline-error-detail">
+                    {document.errorMessage || '未返回具体错误，请检查 API 配置后重试。'}
+                  </p>
                 ) : null}
               </div>
               <div className="octopus-file-card__meta">
@@ -790,7 +991,7 @@ export function KnowledgeLibraryPage() {
         ) : (
           <div className="octopus-empty-card">
             <strong>{getLibraryFolderName(activeFolderType)} 里还没有题目</strong>
-            <p>你可以直接在 PDF 工作区上传题目，系统会自动调用 MinerU 切分。</p>
+            <p>拖入 PDF 或题目照片，系统会自动调用 MinerU 识别并切分。</p>
           </div>
         )}
       </section>
@@ -861,12 +1062,15 @@ export function KnowledgeLibraryPage() {
                 <p className="octopus-pipeline-error-detail">{file.pipelineError || '未返回具体错误，请重试或检查 API 配置。'}</p>
               ) : null}
             </div>
-            <div className="octopus-file-card__meta"><span>PDF</span><span>{formatFileDate(file.updatedAt)}</span></div>
+            <div className="octopus-file-card__meta">
+              <span>{/\.(png|jpe?g|webp)$/i.test(file.fileName) ? '图片课件' : 'PDF'}</span>
+              <span>{formatFileDate(file.updatedAt)}</span>
+            </div>
           </Link>
         )) : (
           <div className="octopus-empty-card">
             <strong>{getLibraryFolderName(activeFolderType)} 里还没有文件</strong>
-            <p>可以直接上传 PDF，文件会保存到当前文件夹。</p>
+            <p>可以直接拖入 PDF 或图片，文件会保存到当前文件夹。</p>
           </div>
         )}
       </section>
@@ -1106,12 +1310,12 @@ export function KnowledgeLibraryPage() {
           <input
             ref={uploadInputRef}
             type="file"
-            accept="application/pdf,.pdf"
+            accept={MINERU_UPLOAD_ACCEPT}
             hidden
             onChange={(event) => {
               const file = event.target.files?.[0]
               event.target.value = ''
-              if (file) void uploadPdf(file)
+              if (file) void uploadFile(file)
             }}
           />
           <button
@@ -1120,10 +1324,36 @@ export function KnowledgeLibraryPage() {
             disabled={!activeCourse}
             onClick={() => uploadInputRef.current?.click()}
           >
-            上传 PDF
+            {isHomeworkFolder ? '上传题目' : activeFolderType === 'other' ? '上传文件' : '上传课件'}
           </button>
         </div>
       </section>
+
+      {activeCourse && (
+        activeFolderType === 'courseware' ||
+        activeFolderType === 'homework' ||
+        activeFolderType === 'past-exam'
+      ) ? (
+        <button
+          type="button"
+          className={`octopus-upload-dropzone${isDraggingPdf ? ' is-dragging' : ''}`}
+          aria-label={`上传${getLibraryFolderName(activeFolderType)}`}
+          onClick={() => uploadInputRef.current?.click()}
+        >
+          <span className="octopus-upload-dropzone__glyph" aria-hidden="true">
+            <i />
+          </span>
+          <span className="octopus-upload-dropzone__copy">
+            <strong>拖拽 PDF 或图片到这里</strong>
+            <small>
+              {isHomeworkFolder
+                ? '图片将保留原图并自动识别、切分题目'
+                : '图片会转换为单页课件并自动建立索引'}
+            </small>
+          </span>
+          <span className="octopus-upload-dropzone__formats">PDF · PNG · JPG · WebP</span>
+        </button>
+      ) : null}
 
       {activeCourse && !activeFolderType ? (
         <button

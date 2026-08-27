@@ -18,6 +18,7 @@ from typing import Any, Protocol
 
 import requests
 from fastapi import HTTPException
+from PIL import Image, ImageOps
 from qdrant_client import QdrantClient, models
 
 from .config import PROJECT_ROOT
@@ -54,7 +55,7 @@ class DocumentProcessingCancelled(Exception):
 
 
 class DocumentParser(Protocol):
-  def parse(self, source_pdf: Path, cancel_event: Event | None = None) -> dict[str, Any]: ...
+  def parse(self, source_path: Path, cancel_event: Event | None = None) -> dict[str, Any]: ...
 
 
 class EmbeddingProvider(Protocol):
@@ -211,6 +212,23 @@ class LocalMinerUParser:
     self.service.start(environment)
 
   @staticmethod
+  def _prepare_local_source(source_path: Path, local_source: Path) -> None:
+    """Compress the temporary MinerU upload while preserving original pixels and coordinates."""
+    suffix = local_source.suffix.lower()
+    if suffix not in {'.jpg', '.jpeg', '.webp'}:
+      shutil.copyfile(source_path, local_source)
+      return
+    try:
+      with Image.open(source_path) as opened:
+        image = ImageOps.exif_transpose(opened).convert('RGB')
+        if suffix in {'.jpg', '.jpeg'}:
+          image.save(local_source, format='JPEG', quality=90, optimize=True, subsampling=0)
+        else:
+          image.save(local_source, format='WEBP', quality=90, method=4)
+    except (OSError, ValueError):
+      shutil.copyfile(source_path, local_source)
+
+  @staticmethod
   def _is_transient_failure(detail: str) -> bool:
     normalized = detail.casefold()
     return any(marker in normalized for marker in (
@@ -247,19 +265,22 @@ class LocalMinerUParser:
 
   def parse(
     self,
-    source_pdf: Path,
+    source_path: Path,
     cancel_event: Event | None = None,
     _attempt: int = 1,
   ) -> dict[str, Any]:
     if cancel_event and cancel_event.is_set():
       raise DocumentProcessingCancelled()
-    output_dir = source_pdf.parent / 'mineru-local-output'
+    output_dir = source_path.parent / 'mineru-local-output'
     if output_dir.exists():
       shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     # MinerU's Windows HTTP client cannot reliably submit non-ASCII filenames.
-    local_source = source_pdf.parent / 'mineru-source.pdf'
-    shutil.copyfile(source_pdf, local_source)
+    source_suffix = source_path.suffix.lower()
+    if source_suffix not in {'.pdf', '.png', '.jpg', '.jpeg', '.webp'}:
+      source_suffix = '.pdf'
+    local_source = source_path.parent / f'mineru-source{source_suffix}'
+    self._prepare_local_source(source_path, local_source)
     environment = os.environ.copy()
     environment['MINERU_DEVICE_MODE'] = environment.get('MINERU_DEVICE_MODE', 'cuda') or 'cuda'
     self._ensure_api_ready(environment)
@@ -316,7 +337,7 @@ class LocalMinerUParser:
           restart(environment)
         else:
           self._ensure_api_ready(environment)
-        return self.parse(source_pdf, cancel_event=cancel_event, _attempt=_attempt + 1)
+        return self.parse(source_path, cancel_event=cancel_event, _attempt=_attempt + 1)
       attempt_suffix = f' after {_attempt} attempts' if _attempt > 1 else ''
       raise HTTPException(
         status_code=502,

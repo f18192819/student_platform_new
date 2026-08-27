@@ -61,9 +61,10 @@ export function LectureMasteryTest({
   const [payload, setPayload] = useState<AdaptiveTestPayload | null>(null)
   const [isOpen, setIsOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
-  const [answer, setAnswer] = useState('')
+  const [selectedQuestionId, setSelectedQuestionId] = useState('')
+  const [draftAnswers, setDraftAnswers] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
-  const [showAnswerReview, setShowAnswerReview] = useState(false)
+  const [showResults, setShowResults] = useState(false)
   const questionStartedAt = useRef(Date.now())
 
   useEffect(() => {
@@ -71,7 +72,15 @@ export function LectureMasteryTest({
     setPayload(null)
     setError('')
     void getActiveAdaptiveTest(courseId, lectureDocumentId, controller.signal)
-      .then((active) => setPayload(active))
+      .then((active) => {
+        setPayload(active)
+        if (active) {
+          setSelectedQuestionId(
+            active.current_question?.question_id || active.questions?.[0]?.question_id || '',
+          )
+          setShowResults(active.session.status === 'completed')
+        }
+      })
       .catch((reason) => {
         if (!controller.signal.aborted) {
           console.warn('adaptive test restore failed:', reason)
@@ -81,21 +90,63 @@ export function LectureMasteryTest({
   }, [courseId, lectureDocumentId])
 
   useEffect(() => {
+    const sessionId = payload?.session.id
+    if (!sessionId) return
+    const storageKey = `adaptive-test-drafts:${sessionId}`
+    let stored: Record<string, string> = {}
+    try {
+      stored = JSON.parse(localStorage.getItem(storageKey) || '{}') as Record<string, string>
+    } catch {
+      stored = {}
+    }
+    setDraftAnswers((current) => {
+      const unlockedIds = new Set([
+        ...(payload.questions ?? []).map((question) => question.question_id),
+        ...(payload.current_question ? [payload.current_question.question_id] : []),
+      ])
+      const next: Record<string, string> = {}
+      for (const [questionId, value] of Object.entries({ ...stored, ...current })) {
+        if (unlockedIds.has(questionId)) next[questionId] = value
+      }
+      for (const saved of payload.answers ?? []) {
+        if (next[saved.question_id] === undefined) {
+          next[saved.question_id] = saved.response_text
+        }
+      }
+      return next
+    })
+  }, [payload?.session.id, payload?.answers, payload?.questions, payload?.current_question])
+
+  useEffect(() => {
+    const sessionId = payload?.session.id
+    if (!sessionId) return
+    localStorage.setItem(`adaptive-test-drafts:${sessionId}`, JSON.stringify(draftAnswers))
+  }, [draftAnswers, payload?.session.id])
+
+  const selectQuestion = (questionId: string) => {
+    setSelectedQuestionId(questionId)
+    setShowResults(false)
+    setError('')
     questionStartedAt.current = Date.now()
-    setAnswer('')
-  }, [payload?.current_question?.question_id])
+  }
 
   const openTest = async () => {
     setError('')
     setIsOpen(true)
     if (payload?.session.status === 'active') {
+      selectQuestion(payload.current_question?.question_id || payload.questions?.[0]?.question_id || '')
+      return
+    }
+    if (payload?.session.status === 'completed') {
+      setShowResults(true)
       return
     }
     setIsLoading(true)
     try {
       const next = await startAdaptiveTest(courseId, lectureDocumentId)
       setPayload(next)
-      setShowAnswerReview(false)
+      setSelectedQuestionId(next.current_question?.question_id || next.questions?.[0]?.question_id || '')
+      setShowResults(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '暂时无法开始测试。')
     } finally {
@@ -104,7 +155,11 @@ export function LectureMasteryTest({
   }
 
   const submitAnswer = async () => {
-    if (!payload?.current_question || !answer.trim() || isLoading) {
+    const selectedQuestion = payload?.questions?.find(
+      (question) => question.question_id === selectedQuestionId,
+    ) ?? payload?.current_question
+    const answer = selectedQuestion ? draftAnswers[selectedQuestion.question_id] ?? '' : ''
+    if (!selectedQuestion || !answer.trim() || isLoading || !payload) {
       return
     }
     setError('')
@@ -112,11 +167,17 @@ export function LectureMasteryTest({
     try {
       const next = await submitAdaptiveAnswer(
         payload.session.id,
+        selectedQuestion.question_id,
         answer.trim(),
         Math.max(0, Date.now() - questionStartedAt.current),
       )
       setPayload(next)
-      setShowAnswerReview(true)
+      setDraftAnswers((current) => ({
+        ...current,
+        [selectedQuestion.question_id]: next.saved_answer?.response_text ?? answer.trim(),
+      }))
+      setSelectedQuestionId(selectedQuestion.question_id)
+      setShowResults(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '答案评分失败，请稍后重试。')
     } finally {
@@ -127,10 +188,19 @@ export function LectureMasteryTest({
   const close = () => {
     setIsOpen(false)
     setError('')
-    setShowAnswerReview(false)
   }
 
-  const currentQuestion = payload?.current_question
+  const questions = payload?.questions?.length
+    ? payload.questions
+    : payload?.current_question ? [payload.current_question] : []
+  const currentQuestion = questions.find(
+    (question) => question.question_id === selectedQuestionId,
+  ) ?? payload?.current_question ?? questions[0]
+  const savedAnswer = payload?.answers?.find(
+    (item) => item.question_id === currentQuestion?.question_id,
+  )
+  const answer = currentQuestion ? draftAnswers[currentQuestion.question_id] ?? savedAnswer?.response_text ?? '' : ''
+  const answerIsDirty = Boolean(savedAnswer && answer.trim() !== savedAnswer.response_text.trim())
   const result = payload?.result
   const isContinuable = payload?.session.status === 'active'
 
@@ -163,6 +233,42 @@ export function LectureMasteryTest({
               <button type="button" aria-label="关闭测试" onClick={close}>×</button>
             </header>
 
+            {payload && questions.length ? (
+              <nav className="mastery-question-nav" aria-label="切换测试题目">
+                <div>
+                  {questions.map((question, index) => {
+                    const saved = payload.answers?.find((item) => item.question_id === question.question_id)
+                    const isCurrent = payload.current_question?.question_id === question.question_id
+                    const isSelected = currentQuestion?.question_id === question.question_id && !showResults
+                    return (
+                      <button
+                        type="button"
+                        key={question.question_id}
+                        className={`${isSelected ? 'is-selected' : ''} ${saved ? 'is-answered' : ''}`}
+                        onClick={() => selectQuestion(question.question_id)}
+                        disabled={isLoading}
+                        aria-current={isSelected ? 'step' : undefined}
+                      >
+                        <strong>{index + 1}</strong>
+                        <span>{saved ? '已作答' : isCurrent ? '待作答' : '已解锁'}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+                {result ? (
+                  <button
+                    type="button"
+                    className={showResults ? 'is-selected mastery-question-nav__result' : 'mastery-question-nav__result'}
+                    onClick={() => setShowResults(true)}
+                  >
+                    查看结果
+                  </button>
+                ) : (
+                  <small>答完当前题后会按掌握情况解锁下一题</small>
+                )}
+              </nav>
+            ) : null}
+
             {isLoading && !payload ? (
               <div className="mastery-test__state">正在整理这份课件的可用原题…</div>
             ) : error && !payload ? (
@@ -173,7 +279,7 @@ export function LectureMasteryTest({
                   重试
                 </button>
               </div>
-            ) : result && !showAnswerReview ? (
+            ) : result && showResults ? (
               <div className="mastery-result">
                 <section className="mastery-result__hero">
                   <div className="mastery-result__score" style={{ '--score': result.overall_mastery } as CSSProperties}>
@@ -184,6 +290,13 @@ export function LectureMasteryTest({
                     <span>本次完成</span>
                     <strong>{result.questions_answered} 题，答对 {result.questions_correct} 题</strong>
                     <p>结论置信度 {percentage(result.confidence)}，掌握度综合了题目难度与知识点覆盖。</p>
+                    <button
+                      type="button"
+                      className="mastery-result__edit-answers"
+                      onClick={() => selectQuestion(questions[0]?.question_id || '')}
+                    >
+                      返回检查或修改答案
+                    </button>
                   </div>
                 </section>
 
@@ -267,31 +380,12 @@ export function LectureMasteryTest({
                   )) : <p className="mastery-result__empty">本次没有错题。</p>}
                 </section>
               </div>
-            ) : showAnswerReview && payload?.grading && payload.answered_question ? (
-              <div className="mastery-answer-review">
-                <div className={payload.grading.correct ? 'is-correct' : 'is-wrong'}>
-                  <span>{payload.grading.correct ? '回答正确' : '还需巩固'}</span>
-                  <strong>{percentage(payload.grading.score)}</strong>
-                </div>
-                <p>{payload.grading.feedback}</p>
-                <details>
-                  <summary>查看参考解答</summary>
-                  <SourceText>{payload.answered_question.reference_answer || ''}</SourceText>
-                </details>
-                <button
-                  type="button"
-                  className="primary-button primary-button--full"
-                  onClick={() => setShowAnswerReview(false)}
-                >
-                  {payload.session.status === 'completed' ? '查看掌握度结果' : '下一题'}
-                </button>
-              </div>
             ) : currentQuestion && payload ? (
               <div className="mastery-question">
                 <div className="mastery-question__progress">
-                  <span>第 {payload.progress.answered + 1} / {payload.progress.target} 题</span>
+                  <span>第 {Math.max(1, questions.findIndex((item) => item.question_id === currentQuestion.question_id) + 1)} / {payload.progress.target} 题</span>
                   <i><b style={{ width: percentage(payload.progress.answered / payload.progress.target) }} /></i>
-                  <span>已答对 {payload.progress.correct} 题</span>
+                  <span>已完成 {payload.progress.answered} 题</span>
                 </div>
                 <div className="mastery-question__meta">
                   <span>{currentQuestion.source_type === 'lecture_example' ? '课堂例题' : '关联作业原题'}</span>
@@ -308,21 +402,65 @@ export function LectureMasteryTest({
                   <span>你的答案</span>
                   <textarea
                     value={answer}
-                    onChange={(event) => setAnswer(event.target.value)}
+                    onChange={(event) => setDraftAnswers((current) => ({
+                      ...current,
+                      [currentQuestion.question_id]: event.target.value,
+                    }))}
                     placeholder="写下结论、关键公式或推导思路。系统会接受与参考解答等价的表达。"
                     rows={7}
                     disabled={isLoading}
                   />
                 </label>
+                {savedAnswer ? (
+                  <section className={`mastery-saved-answer ${savedAnswer.correct ? 'is-correct' : 'is-wrong'}`}>
+                    <div>
+                      <span>{savedAnswer.correct ? '当前答案正确' : '当前答案还需巩固'}</span>
+                      <strong>{percentage(savedAnswer.score)}</strong>
+                      <small>第 {savedAnswer.revision} 版</small>
+                    </div>
+                    <p>{savedAnswer.feedback}</p>
+                    {answerIsDirty ? <em>上方修改尚未保存</em> : null}
+                    <details>
+                      <summary>查看参考解答</summary>
+                      <SourceText>{savedAnswer.reference_answer}</SourceText>
+                    </details>
+                  </section>
+                ) : null}
                 {error ? <p className="mastery-test__inline-error">{error}</p> : null}
-                <button
-                  type="button"
-                  className="primary-button primary-button--full"
-                  disabled={!answer.trim() || isLoading}
-                  onClick={() => void submitAnswer()}
-                >
-                  {isLoading ? '正在评分…' : '提交答案'}
-                </button>
+                <div className="mastery-question__actions">
+                  {payload.current_question && payload.current_question.question_id !== currentQuestion.question_id ? (
+                    <button
+                      type="button"
+                      className="mastery-question__next"
+                      onClick={() => selectQuestion(payload.current_question?.question_id || '')}
+                      disabled={isLoading}
+                    >
+                      前往待答题
+                    </button>
+                  ) : null}
+                  {result ? (
+                    <button
+                      type="button"
+                      className="mastery-question__next"
+                      onClick={() => setShowResults(true)}
+                      disabled={isLoading}
+                    >
+                      查看掌握度结果
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="primary-button mastery-question__submit"
+                    disabled={!answer.trim() || isLoading || Boolean(savedAnswer && !answerIsDirty)}
+                    onClick={() => void submitAnswer()}
+                  >
+                    {isLoading
+                      ? '正在评分…'
+                      : savedAnswer
+                        ? answerIsDirty ? '保存修改并重新评分' : '答案已保存'
+                        : '提交答案并解锁下一题'}
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="mastery-test__state">正在恢复测试状态…</div>

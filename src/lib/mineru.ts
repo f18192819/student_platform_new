@@ -1,9 +1,46 @@
 import type { HomeworkDocument, StructuredDocumentBlock } from '../types'
 
+export const MINERU_UPLOAD_ACCEPT = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
+const MINERU_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+}
+
+function uploadExtension(file: File) {
+  const match = file.name.trim().toLowerCase().match(/\.[^.]+$/)
+  return match?.[0] ?? ''
+}
+
+export function getMineruUploadKind(file: File): 'pdf' | 'image' | null {
+  const extension = uploadExtension(file)
+  if (extension === '.pdf') return 'pdf'
+  return extension in MINERU_IMAGE_MIME_BY_EXTENSION ? 'image' : null
+}
+
+export function getMineruUploadError(file: File) {
+  return `不支持“${file.name}”的文件格式。当前支持 PDF、PNG、JPG、JPEG 和 WebP。`
+}
+
 type MineruExtractionResult = {
   markdown: string
   pageCount: number | null
   layoutBlocks: StructuredDocumentBlock[]
+}
+
+export type QuestionPipelineResult = MineruExtractionResult & {
+  documentId: string
+  status: string
+  parserStatus: string
+  extractionStatus: string
+  analysisStatus: string
+  embeddingStatus: string
+  vectorStatus: string
+  embeddingCompletedQuestions: number
+  vectorCompletedQuestions: number
+  error: string | null
+  questions: HomeworkDocument['questions']
 }
 
 function normalizeBlockKind(rawKind: unknown): StructuredDocumentBlock['kind'] {
@@ -104,6 +141,14 @@ function resolveDocumentPipelineApiUrl() {
 
 function resolveQuestionPipelineApiUrl() {
   return resolveDocumentPipelineApiUrl().replace('/api/documents/process', '/api/questions/process')
+}
+
+function resolveQuestionRetryApiUrl(documentId: string) {
+  return `${resolveQuestionPipelineApiUrl().replace('/process', '')}/${encodeURIComponent(documentId)}/retry`
+}
+
+function resolveQuestionStatusApiUrl(documentId: string) {
+  return `${resolveQuestionPipelineApiUrl().replace('/process', '')}/${encodeURIComponent(documentId)}/status`
 }
 
 function resolveDocumentStatusApiUrl(documentId: string) {
@@ -294,7 +339,7 @@ export async function processHomeworkDocumentWithPipeline(
   courseId: string,
   folderType: 'homework' | 'past-exam',
   documentId: string,
-): Promise<MineruExtractionResult & { questions: HomeworkDocument['questions']; status: string }> {
+): Promise<QuestionPipelineResult> {
   const formData = new FormData()
   formData.append('file', file)
   formData.append('course_id', courseId)
@@ -311,9 +356,43 @@ export async function processHomeworkDocumentWithPipeline(
   if (!response.ok) {
     throw new Error(String(payload.detail || rawText || `Question pipeline failed (HTTP ${response.status})`))
   }
-  if (payload.status !== 'completed') {
-    throw new Error(String(payload.error || 'Question pipeline did not complete.'))
+  return normalizeQuestionPipelineResult(payload, documentId)
+}
+
+export async function retryHomeworkDocumentProcessing(documentId: string): Promise<QuestionPipelineResult> {
+  const response = await fetch(resolveQuestionRetryApiUrl(documentId), { method: 'POST' })
+  const rawText = await response.text()
+  let payload: Record<string, unknown> = {}
+  try {
+    payload = (JSON.parse(rawText) as Record<string, unknown>) ?? {}
+  } catch {
+    payload = {}
   }
+  if (!response.ok) {
+    throw new Error(String(payload.detail || rawText || `Question retry failed (HTTP ${response.status})`))
+  }
+  return normalizeQuestionPipelineResult(payload, documentId)
+}
+
+export async function getHomeworkDocumentProcessingStatus(documentId: string): Promise<QuestionPipelineResult> {
+  const response = await fetch(resolveQuestionStatusApiUrl(documentId))
+  const rawText = await response.text()
+  let payload: Record<string, unknown> = {}
+  try {
+    payload = (JSON.parse(rawText) as Record<string, unknown>) ?? {}
+  } catch {
+    payload = {}
+  }
+  if (!response.ok) {
+    throw new Error(String(payload.detail || rawText || `Question status failed (HTTP ${response.status})`))
+  }
+  return normalizeQuestionPipelineResult(payload, documentId)
+}
+
+function normalizeQuestionPipelineResult(
+  payload: Record<string, unknown>,
+  documentId: string,
+): QuestionPipelineResult {
   const questions = Array.isArray(payload.questions)
     ? payload.questions.map((item, index) => {
         const question = item as Record<string, unknown>
@@ -330,21 +409,34 @@ export async function processHomeworkDocumentWithPipeline(
       }).filter((question) => question.content.trim())
     : []
   return {
+    documentId: String(payload.document_id || documentId),
     markdown: String(payload.markdown || '').trim(),
     pageCount: Number(payload.page_count || 0) || null,
     layoutBlocks: extractLayoutBlocksFromPayload(payload),
     questions,
     status: String(payload.status || ''),
+    parserStatus: String(payload.parser_status || ''),
+    extractionStatus: String(payload.extraction_status || ''),
+    analysisStatus: String(payload.analysis_status || ''),
+    embeddingStatus: String(payload.embedding_status || ''),
+    vectorStatus: String(payload.vector_status || ''),
+    embeddingCompletedQuestions: Math.max(0, Number(payload.embedding_completed_questions || 0)),
+    vectorCompletedQuestions: Math.max(0, Number(payload.vector_completed_questions || 0)),
+    error: String(payload.error || '') || null,
   }
 }
 
 export async function readHomeworkAssetPayload(file: File) {
-  if (file.type.startsWith('image/')) {
+  if (getMineruUploadKind(file) === 'image') {
     return await new Promise<string>((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(String(reader.result ?? ''))
       reader.onerror = () => reject(reader.error ?? new Error('Failed to read image file.'))
-      reader.readAsDataURL(file)
+      const extension = uploadExtension(file)
+      const imageSource = file.type.startsWith('image/')
+        ? file
+        : new Blob([file], { type: MINERU_IMAGE_MIME_BY_EXTENSION[extension] })
+      reader.readAsDataURL(imageSource)
     })
   }
 
@@ -358,11 +450,19 @@ export function buildPendingHomeworkDocument(file: File): HomeworkDocument {
     lectureDocumentId: null,
     assetId: crypto.randomUUID(),
     fileName: file.name,
-    sourceType: file.type.startsWith('image/') ? 'image' : 'pdf',
+    sourceType: getMineruUploadKind(file) === 'image' ? 'image' : 'pdf',
     mimeType: file.type,
     byteSize: file.size,
     pageCount: null,
     status: 'processing',
+    pipelineStatus: 'queued',
+    parserStatus: 'pending',
+    extractionStatus: 'pending',
+    analysisStatus: 'pending',
+    embeddingStatus: 'pending',
+    vectorStatus: 'pending',
+    embeddingCompletedQuestions: 0,
+    vectorCompletedQuestions: 0,
     extractor: 'mineru',
     extractedMarkdown: '',
     layoutBlocks: [],

@@ -123,6 +123,14 @@ export type HomeworkDocument = {
   byteSize: number
   pageCount: number | null
   status: 'processing' | 'ready' | 'error'
+  pipelineStatus?: string | null
+  parserStatus?: string | null
+  extractionStatus?: string | null
+  analysisStatus?: string | null
+  embeddingStatus?: string | null
+  vectorStatus?: string | null
+  embeddingCompletedQuestions?: number
+  vectorCompletedQuestions?: number
   extractor: 'mineru'
   extractedMarkdown: string
   layoutBlocks: StructuredDocumentBlock[]

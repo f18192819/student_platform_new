@@ -22,12 +22,14 @@ export type QuestionRelation = {
 
 export type QuestionRelationRecord = {
   relations: QuestionRelation[]
+  status: 'missing' | 'processing' | 'completed' | 'failed'
+  current_target?: string | null
 }
 
 async function readRelations(url: string, signal?: AbortSignal): Promise<QuestionRelationRecord> {
   const response = await fetch(url, { signal })
   if (response.status === 404) {
-    return { relations: [] }
+    return { relations: [], status: 'missing' }
   }
   if (!response.ok) {
     throw new Error(`关联数据读取失败 (HTTP ${response.status})`)
@@ -35,6 +37,11 @@ async function readRelations(url: string, signal?: AbortSignal): Promise<Questio
   const payload = (await response.json()) as Partial<QuestionRelationRecord>
   return {
     relations: Array.isArray(payload.relations) ? payload.relations : [],
+    status:
+      payload.status === 'processing' || payload.status === 'failed'
+        ? payload.status
+        : 'completed',
+    current_target: typeof payload.current_target === 'string' ? payload.current_target : null,
   }
 }
 

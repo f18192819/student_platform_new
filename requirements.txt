@@ -3,3 +3,4 @@ uvicorn
 requests
 qdrant-client
 pydantic
+Pillow

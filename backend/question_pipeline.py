@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -22,8 +23,17 @@ QUESTION_DOCUMENTS_ROOT = QUESTION_PIPELINE_ROOT / 'documents'
 QUESTION_COLLECTION = 'course_questions'
 QUESTION_EXTRACTION_VERSION = 3
 QUESTION_FILES_DIRECTORY = 'questions'
+QUESTION_EMBEDDINGS_FILE = 'embeddings.json'
+QUESTION_CHECKPOINT_BATCH_SIZE = max(1, int(os.environ.get('QUESTION_CHECKPOINT_BATCH_SIZE', '1')))
+QUESTION_RESUME_MAX_AGE_SECONDS = max(300, int(os.environ.get('QUESTION_RESUME_MAX_AGE_SECONDS', '21600')))
 QUESTION_EMBEDDING_CONTENT_CHARS = 3200
 QUESTION_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+QUESTION_UPLOAD_EXTENSIONS = {'.pdf', '.jpg', '.jpeg', '.png', '.webp'}
+
+
+def _question_source_file_name(file_name: str) -> str:
+  suffix = Path(str(file_name or '')).suffix.lower()
+  return f'source{suffix if suffix in QUESTION_UPLOAD_EXTENSIONS else ".pdf"}'
 
 
 def _question_document_directory(document_id: str) -> Path:
@@ -980,13 +990,18 @@ class QuestionPipeline:
     document_id = document_id or uuid.uuid4().hex
     directory = self._dir(document_id)
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / 'source.pdf').write_bytes(source)
+    source_file = _question_source_file_name(file_name)
+    (directory / source_file).write_bytes(source)
     state = {
       'document_id': document_id, 'document_name': file_name, 'course_id': course_id,
       'document_type': document_type, 'status': 'queued', 'parser_status': 'pending',
+      'source_file': source_file,
+      'source_type': 'image' if Path(source_file).suffix != '.pdf' else 'pdf',
       'extraction_status': 'pending',
       'analysis_status': 'pending', 'embedding_status': 'pending', 'vector_status': 'pending',
-      'question_count': 0, 'updated_at': time.time(), 'error': '',
+      'question_count': 0, 'embedding_completed_questions': 0,
+      'vector_completed_questions': 0, 'vector_completed_question_ids': [],
+      'updated_at': time.time(), 'error': '',
     }
     self._write(directory / 'state.json', state)
     return self.run(document_id)
@@ -998,11 +1013,15 @@ class QuestionPipeline:
       raise HTTPException(status_code=404, detail='Question pipeline job not found.')
     try:
       if state.get('parser_status') != 'completed':
-        parsed = self.parser.parse(directory / 'source.pdf')
+        state.update({'parser_status': 'processing', 'status': 'parsing', 'error': '', 'updated_at': time.time()})
+        self._write(directory / 'state.json', state)
+        source_file = Path(str(state.get('source_file') or 'source.pdf')).name
+        parsed = self.parser.parse(directory / source_file)
         markdown, blocks, page_count = _archive_result(parsed['archive'], directory)
         self._write(directory / 'document.json', {
           'document_id': document_id, 'document_name': state['document_name'], 'course_id': state['course_id'],
-          'document_type': state['document_type'], 'page_count': page_count, 'mineru_batch_id': parsed.get('batch_id'),
+          'document_type': state['document_type'], 'source_type': state.get('source_type', 'pdf'),
+          'page_count': page_count, 'mineru_batch_id': parsed.get('batch_id'),
         })
         self._write(directory / 'layout-blocks.json', blocks)
         state.update({
@@ -1029,6 +1048,9 @@ class QuestionPipeline:
         if not questions:
           raise HTTPException(status_code=422, detail='AI QuestionExtractor found no questions.')
         self.vector_store.delete_document(document_id, collection_name=QUESTION_COLLECTION)
+        embeddings_path = directory / QUESTION_EMBEDDINGS_FILE
+        if embeddings_path.is_file():
+          embeddings_path.unlink()
         self._save_questions(directory, questions)
         state.update({
           'extraction_status': 'completed',
@@ -1039,6 +1061,9 @@ class QuestionPipeline:
           'vector_status': 'pending',
           'status': 'analyzing',
           'question_count': len(questions),
+          'embedding_completed_questions': 0,
+          'vector_completed_questions': 0,
+          'vector_completed_question_ids': [],
           'updated_at': time.time(),
           'error': '',
         })
@@ -1046,38 +1071,88 @@ class QuestionPipeline:
 
       questions = json.loads((directory / 'questions.json').read_text(encoding='utf-8'))
       if state.get('analysis_status') != 'completed':
+        state.update({'analysis_status': 'processing', 'status': 'analyzing', 'error': '', 'updated_at': time.time()})
+        self._write(directory / 'state.json', state)
         for question in questions:
           if 'analysis' not in question:
             question['analysis'] = self.analyzer.analyze(question).model_dump()
             self._write(directory / 'questions.json', questions)
             self._write_question_file(directory, question)
-        state.update({'analysis_status': 'completed', 'status': 'embedding'})
+        state.update({
+          'analysis_status': 'completed',
+          'embedding_status': 'pending',
+          'vector_status': 'pending',
+          'status': 'embedding',
+          'error': '',
+          'updated_at': time.time(),
+        })
+        self._write(directory / 'state.json', state)
+
+      embeddings_path = directory / QUESTION_EMBEDDINGS_FILE
+      vectors_by_question = self._read_embeddings(embeddings_path)
+      question_ids = [str(question['question_id']) for question in questions]
+      missing_embeddings = [
+        question for question in questions
+        if str(question['question_id']) not in vectors_by_question
+      ]
+      if state.get('embedding_status') != 'completed' or missing_embeddings:
+        state.update({
+          'embedding_status': 'processing',
+          'vector_status': 'pending',
+          'status': 'embedding',
+          'embedding_completed_questions': len(questions) - len(missing_embeddings),
+          'error': '',
+          'updated_at': time.time(),
+        })
+        self._write(directory / 'state.json', state)
+        for start in range(0, len(missing_embeddings), QUESTION_CHECKPOINT_BATCH_SIZE):
+          batch = missing_embeddings[start:start + QUESTION_CHECKPOINT_BATCH_SIZE]
+          vectors = self.embedding.embed([self._embedding_text(question) for question in batch])
+          if len(vectors) != len(batch):
+            raise HTTPException(status_code=502, detail='Embedding API returned incomplete question vectors.')
+          for question, vector in zip(batch, vectors, strict=True):
+            vectors_by_question[str(question['question_id'])] = vector
+          self._write(embeddings_path, vectors_by_question)
+          state.update({
+            'embedding_completed_questions': len(vectors_by_question),
+            'updated_at': time.time(),
+          })
+          self._write(directory / 'state.json', state)
+        state.update({
+          'embedding_status': 'completed',
+          'vector_status': 'pending',
+          'status': 'vector',
+          'embedding_completed_questions': len(question_ids),
+          'updated_at': time.time(),
+        })
         self._write(directory / 'state.json', state)
 
       if state.get('vector_status') != 'completed':
-        vectors = self.embedding.embed([self._embedding_text(question) for question in questions])
-        points = [
-          {
-            'id': question['question_id'], 'vector': vector,
-            'payload': {
-              'question_id': question['question_id'], 'course_id': state['course_id'],
-              'document_id': document_id, 'document_name': state['document_name'],
-              'document_type': state['document_type'], 'question_index': question['index'],
-              'page_number': question['page_number'], 'title': question['title'], 'content': question['content'],
-              'end_page_number': question.get('end_page_number', question['page_number']),
-              'page_numbers': question.get('page_numbers') or [question['page_number']],
-              'anchor_text': question.get('anchor_text'),
-              'anchor_block_id': question.get('anchor_block_id'),
-              'source_segment_ids': question.get('source_segment_ids') or [],
-              'source_block_ids': question.get('source_block_ids') or [],
-              'extraction': question.get('extraction') or {},
-              'analysis': question['analysis'],
-            },
-          }
-          for question, vector in zip(questions, vectors, strict=True)
+        completed_ids = {
+          str(value) for value in state.get('vector_completed_question_ids') or [] if str(value)
+        }
+        pending_questions = [
+          question for question in questions if str(question['question_id']) not in completed_ids
         ]
-        state['embedding_status'] = 'completed'
-        self.vector_store.upsert(points, collection_name=QUESTION_COLLECTION)
+        state.update({
+          'vector_status': 'processing',
+          'status': 'vector',
+          'vector_completed_questions': len(completed_ids),
+          'error': '',
+          'updated_at': time.time(),
+        })
+        self._write(directory / 'state.json', state)
+        for start in range(0, len(pending_questions), QUESTION_CHECKPOINT_BATCH_SIZE):
+          batch = pending_questions[start:start + QUESTION_CHECKPOINT_BATCH_SIZE]
+          points = [self._vector_point(question, vectors_by_question[str(question['question_id'])], state) for question in batch]
+          self.vector_store.upsert(points, collection_name=QUESTION_COLLECTION)
+          completed_ids.update(str(question['question_id']) for question in batch)
+          state.update({
+            'vector_completed_question_ids': sorted(completed_ids),
+            'vector_completed_questions': len(completed_ids),
+            'updated_at': time.time(),
+          })
+          self._write(directory / 'state.json', state)
         state.update({'vector_status': 'completed', 'status': 'completed', 'updated_at': time.time(), 'error': ''})
     except Exception as exc:  # noqa: BLE001
       if state.get('parser_status') != 'completed':
@@ -1086,9 +1161,16 @@ class QuestionPipeline:
         stage = 'extraction'
       elif state.get('analysis_status') != 'completed':
         stage = 'analysis'
+      elif state.get('embedding_status') != 'completed':
+        stage = 'embedding'
       else:
         stage = 'vector'
-      state.update({'status': f'{stage}_failed', 'error': str(getattr(exc, 'detail', exc)), 'updated_at': time.time()})
+      state.update({
+        'status': f'{stage}_failed',
+        f'{stage}_status': 'failed',
+        'error': str(getattr(exc, 'detail', exc)),
+        'updated_at': time.time(),
+      })
     self._write(directory / 'state.json', state)
     return state
 
@@ -1108,6 +1190,12 @@ class QuestionPipeline:
       'layout_blocks': json.loads((directory / 'layout-blocks.json').read_text(encoding='utf-8')) if (directory / 'layout-blocks.json').is_file() else [],
     }
 
+  def status(self, document_id: str) -> dict[str, Any]:
+    state = self._read(self._dir(document_id) / 'state.json')
+    if not state:
+      raise HTTPException(status_code=404, detail='Question pipeline job not found.')
+    return state
+
   def prepare_reextract(self, document_id: str) -> dict[str, Any]:
     """Keep MinerU artifacts and rerun only AI segmentation and downstream stages."""
     directory = self._dir(document_id)
@@ -1123,6 +1211,9 @@ class QuestionPipeline:
     question_files = directory / QUESTION_FILES_DIRECTORY
     if question_files.is_dir():
       shutil.rmtree(question_files)
+    embeddings_path = directory / QUESTION_EMBEDDINGS_FILE
+    if embeddings_path.is_file():
+      embeddings_path.unlink()
     state.update({
       'status': 'extracting_questions',
       'extraction_status': 'pending',
@@ -1131,6 +1222,9 @@ class QuestionPipeline:
       'embedding_status': 'pending',
       'vector_status': 'pending',
       'question_count': 0,
+      'embedding_completed_questions': 0,
+      'vector_completed_questions': 0,
+      'vector_completed_question_ids': [],
       'updated_at': time.time(),
       'error': '',
     })
@@ -1167,14 +1261,37 @@ class QuestionPipeline:
       state = self._read(directory / 'state.json')
       if state.get('status') not in {
         'queued',
+        'parsing',
         'extracting_questions',
-        'extraction_failed',
         'analyzing',
         'embedding',
-        'vector_failed',
+        'vector',
       }:
         continue
+      updated_at = float(state.get('updated_at') or 0)
+      if updated_at and time.time() - updated_at > QUESTION_RESUME_MAX_AGE_SECONDS:
+        stage = self._active_stage(state)
+        state.update({
+          'status': f'{stage}_failed',
+          f'{stage}_status': 'failed',
+          'error': 'The interrupted question task was stale and was not resumed automatically. Click retry to continue from this stage.',
+          'updated_at': time.time(),
+        })
+        self._write(directory / 'state.json', state)
+        continue
       self.run(str(state.get('document_id') or directory.name))
+
+  @staticmethod
+  def _active_stage(state: dict[str, Any]) -> str:
+    if state.get('parser_status') != 'completed':
+      return 'parser'
+    if state.get('extraction_status') != 'completed':
+      return 'extraction'
+    if state.get('analysis_status') != 'completed':
+      return 'analysis'
+    if state.get('embedding_status') != 'completed':
+      return 'embedding'
+    return 'vector'
 
   def _save_questions(self, directory: Path, questions: list[dict[str, Any]]) -> None:
     question_files = directory / QUESTION_FILES_DIRECTORY
@@ -1192,6 +1309,43 @@ class QuestionPipeline:
     index = max(1, int(question.get('index') or 1))
     path = directory / QUESTION_FILES_DIRECTORY / f'{index:04d}-{question_id}.json'
     self._write(path, question)
+
+  @staticmethod
+  def _read_embeddings(path: Path) -> dict[str, list[float]]:
+    if not path.is_file():
+      return {}
+    try:
+      payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+      return {}
+    if not isinstance(payload, dict):
+      return {}
+    return {
+      str(question_id): vector
+      for question_id, vector in payload.items()
+      if isinstance(vector, list) and vector
+    }
+
+  @staticmethod
+  def _vector_point(question: dict[str, Any], vector: list[float], state: dict[str, Any]) -> dict[str, Any]:
+    return {
+      'id': question['question_id'],
+      'vector': vector,
+      'payload': {
+        'question_id': question['question_id'], 'course_id': state['course_id'],
+        'document_id': state['document_id'], 'document_name': state['document_name'],
+        'document_type': state['document_type'], 'question_index': question['index'],
+        'page_number': question['page_number'], 'title': question['title'], 'content': question['content'],
+        'end_page_number': question.get('end_page_number', question['page_number']),
+        'page_numbers': question.get('page_numbers') or [question['page_number']],
+        'anchor_text': question.get('anchor_text'),
+        'anchor_block_id': question.get('anchor_block_id'),
+        'source_segment_ids': question.get('source_segment_ids') or [],
+        'source_block_ids': question.get('source_block_ids') or [],
+        'extraction': question.get('extraction') or {},
+        'analysis': question['analysis'],
+      },
+    }
 
   @staticmethod
   def _legacy_embedding_text(question: dict[str, Any]) -> str:

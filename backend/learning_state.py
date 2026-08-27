@@ -44,6 +44,8 @@ class LearningEvent(BaseModel):
   grading_method: str
   grading_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
   grading_feedback: str = ''
+  revision: int = Field(default=1, ge=1)
+  supersedes_event_id: str | None = None
   created_at: str = Field(default_factory=_now)
 
 
@@ -255,12 +257,18 @@ class LearningStateStore:
       (session_id,),
     )
 
+  def effective_session_events(self, course_id: str, session_id: str) -> list[LearningEvent]:
+    return self._latest_revisions(self.session_events(course_id, session_id))
+
   def lecture_events(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]:
     return self._events(
       course_id,
       'lecture_document_id = ?',
       (lecture_document_id,),
     )
+
+  def effective_lecture_events(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]:
+    return self._latest_revisions(self.lecture_events(course_id, lecture_document_id))
 
   def delete_document(self, course_id: str, document_id: str) -> None:
     with self._connect(course_id) as connection:
@@ -298,6 +306,20 @@ class LearningStateStore:
         values,
       ).fetchall()
     return [self._row_to_event(row) for row in rows]
+
+  @staticmethod
+  def _latest_revisions(events: list[LearningEvent]) -> list[LearningEvent]:
+    latest: dict[tuple[str, str], LearningEvent] = {}
+    for event in events:
+      key = (event.test_session_id, event.question_id)
+      previous = latest.get(key)
+      if previous is None or (event.revision, event.created_at, event.id) > (
+        previous.revision,
+        previous.created_at,
+        previous.id,
+      ):
+        latest[key] = event
+    return sorted(latest.values(), key=lambda item: (item.created_at, item.id))
 
   @contextmanager
   def _connect(self, course_id: str) -> Iterator[sqlite3.Connection]:
@@ -343,7 +365,25 @@ class LearningStateStore:
       );
       CREATE INDEX IF NOT EXISTS idx_test_sessions_lecture
         ON adaptive_test_sessions(course_id, lecture_document_id, status);
+      '''
+    )
 
+    event_columns = {
+      str(row['name'])
+      for row in connection.execute('PRAGMA table_info(learning_events)').fetchall()
+    }
+    needs_revision_migration = bool(event_columns) and 'revision' not in event_columns
+    if needs_revision_migration:
+      connection.executescript(
+        '''
+        DROP INDEX IF EXISTS idx_learning_events_lecture;
+        DROP INDEX IF EXISTS idx_learning_events_session;
+        ALTER TABLE learning_events RENAME TO learning_events_before_revisions;
+        '''
+      )
+
+    connection.executescript(
+      '''
       CREATE TABLE IF NOT EXISTS learning_events (
         id TEXT PRIMARY KEY,
         course_id TEXT NOT NULL,
@@ -361,13 +401,42 @@ class LearningStateStore:
         grading_method TEXT NOT NULL,
         grading_confidence REAL NOT NULL,
         grading_feedback TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        supersedes_event_id TEXT,
         created_at TEXT NOT NULL,
-        UNIQUE(test_session_id, question_id)
+        UNIQUE(test_session_id, question_id, revision)
       );
+      '''
+    )
+
+    if needs_revision_migration:
+      connection.execute(
+        '''
+        INSERT INTO learning_events (
+          id, course_id, lecture_document_id, test_session_id, question_id,
+          source_type, source_document_id, knowledge_points, difficulty, correct,
+          score, response_time_ms, response_text, grading_method,
+          grading_confidence, grading_feedback, revision, supersedes_event_id,
+          created_at
+        )
+        SELECT
+          id, course_id, lecture_document_id, test_session_id, question_id,
+          source_type, source_document_id, knowledge_points, difficulty, correct,
+          score, response_time_ms, response_text, grading_method,
+          grading_confidence, grading_feedback, 1, NULL, created_at
+        FROM learning_events_before_revisions
+        '''
+      )
+      connection.execute('DROP TABLE learning_events_before_revisions')
+
+    connection.executescript(
+      '''
       CREATE INDEX IF NOT EXISTS idx_learning_events_lecture
         ON learning_events(course_id, lecture_document_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_learning_events_session
         ON learning_events(test_session_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_learning_events_latest
+        ON learning_events(test_session_id, question_id, revision DESC);
       '''
     )
 
@@ -395,8 +464,9 @@ class LearningStateStore:
         id, course_id, lecture_document_id, test_session_id, question_id,
         source_type, source_document_id, knowledge_points, difficulty, correct,
         score, response_time_ms, response_text, grading_method,
-        grading_confidence, grading_feedback, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        grading_confidence, grading_feedback, revision, supersedes_event_id,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ''',
       (
         event.id,
@@ -415,6 +485,8 @@ class LearningStateStore:
         event.grading_method,
         event.grading_confidence,
         event.grading_feedback,
+        event.revision,
+        event.supersedes_event_id,
         event.created_at,
       ),
     )
@@ -454,5 +526,7 @@ class LearningStateStore:
       grading_method=row['grading_method'],
       grading_confidence=row['grading_confidence'],
       grading_feedback=row['grading_feedback'],
+      revision=row['revision'],
+      supersedes_event_id=row['supersedes_event_id'],
       created_at=row['created_at'],
     )

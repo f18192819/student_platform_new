@@ -86,6 +86,8 @@ import type { PromptSourceSection } from '../lib/contextBudget'
 import {
   buildFailedHomeworkDocument,
   buildPendingHomeworkDocument,
+  getMineruUploadError,
+  getMineruUploadKind,
   getLectureDocumentProcessingStatus,
   processHomeworkDocumentWithPipeline,
   readHomeworkAssetPayload,
@@ -352,22 +354,40 @@ export function PdfWorkspacePage() {
     setIsLoadingRelatedMaterials(true)
     void (async () => {
       try {
-        const record = sourceQuestionId
-          ? await getQuestionRelations(sourceQuestionId, controller.signal)
-          : await getLecturePageRelations(
-              activeKnowledgeCourseId,
-              lectureDocumentId!,
-              currentPage,
-              controller.signal,
+        // A newly parsed question can become visible before its slower relation
+        // projection is ready. Poll only while that projection is pending.
+        for (let attempt = 0; attempt < 120 && !controller.signal.aborted; attempt += 1) {
+          const record = sourceQuestionId
+            ? await getQuestionRelations(sourceQuestionId, controller.signal)
+            : await getLecturePageRelations(
+                activeKnowledgeCourseId,
+                lectureDocumentId!,
+                currentPage,
+                controller.signal,
+              )
+          if (controller.signal.aborted) {
+            return
+          }
+          setRelatedMaterialCards(
+            sourceQuestionId
+              ? mapQuestionRelationCards(record.relations)
+              : mapLecturePageRelationCards(record.relations, lectureDocumentId!, currentPage),
+          )
+          if (!sourceQuestionId || !['missing', 'processing'].includes(record.status)) {
+            break
+          }
+          await new Promise<void>((resolve) => {
+            const timeoutId = window.setTimeout(resolve, 5_000)
+            controller.signal.addEventListener(
+              'abort',
+              () => {
+                window.clearTimeout(timeoutId)
+                resolve()
+              },
+              { once: true },
             )
-        if (controller.signal.aborted) {
-          return
+          })
         }
-        setRelatedMaterialCards(
-          sourceQuestionId
-            ? mapQuestionRelationCards(record.relations)
-            : mapLecturePageRelationCards(record.relations, lectureDocumentId!, currentPage),
-        )
       } catch (error) {
         if (!controller.signal.aborted) {
           console.warn('Unable to load related materials:', error)
@@ -1665,12 +1685,10 @@ export function PdfWorkspacePage() {
       return
     }
 
-    const lowerName = file.name.toLowerCase()
-    const isPdf = file.type === 'application/pdf' || lowerName.endsWith('.pdf')
-    if (!isPdf) {
+    if (!getMineruUploadKind(file)) {
       setChatMessages((current) => [
         ...current,
-        createMessage('system', `练习文件格式不支持：${file.name}`),
+        createMessage('system', getMineruUploadError(file)),
       ])
       event.target.value = ''
       return
@@ -2082,6 +2100,13 @@ export function PdfWorkspacePage() {
     }
 
     if (card.kind === 'lecture') {
+      if (!getKnowledgeFile(card.documentId)) {
+        console.warn('Related lecture no longer exists in the course library:', card.documentId)
+        setRelatedMaterialCards((current) =>
+          current.filter((candidate) => candidate.id !== card.id),
+        )
+        return
+      }
       setSearchParams(
         {
           file: card.documentId,
@@ -2093,10 +2118,23 @@ export function PdfWorkspacePage() {
       return
     }
 
+
+    const targetFolder = card.documentType === 'past-exam' ? 'past-exam' : 'homework'
+    const targetExists = getKnowledgeHomeworkDocumentsByCourseFolder(courseId, targetFolder).some(
+      (document) => document.id === card.documentId,
+    )
+    if (!targetExists) {
+      console.warn('Related question document no longer exists in the course library:', card.documentId)
+      setRelatedMaterialCards((current) =>
+        current.filter((candidate) => candidate.id !== card.id),
+      )
+      return
+    }
+
     setSearchParams(
       {
         course: courseId,
-        folder: card.documentType === 'past-exam' ? 'past-exam' : 'homework',
+        folder: targetFolder,
         homework: card.documentId,
         ...(card.questionId ? { question: card.questionId } : {}),
         page: String(card.pageNumber ?? 1),
@@ -2299,6 +2337,17 @@ export function PdfWorkspacePage() {
     const retrievalDocumentType = viewerSource.kind === 'homework'
       ? currentFolderType
       : 'lecture'
+    const recentRetrievalMessages = baseChatSession.messages
+      .filter((message) =>
+        !message.isSummary &&
+        (message.role === 'user' || message.role === 'assistant') &&
+        message.content.trim(),
+      )
+      .slice(-4)
+      .map((message) => ({
+        role: message.role as 'user' | 'assistant',
+        content: message.content,
+      }))
     let retrievedSections: PromptSourceSection[] = []
     if (activeKnowledgeCourseId && retrievalDocumentId) {
       try {
@@ -2309,6 +2358,7 @@ export function PdfWorkspacePage() {
           documentType: retrievalDocumentType,
           topN: 20,
           topK: 6,
+          recentMessages: recentRetrievalMessages,
         })
         retrievedSections = retrieval.results.map((fragment, index) => {
           const pageLabel = fragment.page_number ? `第 ${fragment.page_number} 页` : '页码未知'
@@ -2329,8 +2379,11 @@ export function PdfWorkspacePage() {
         if (retrieval.rerank_source !== 'reranker') {
           console.warn('chat context reranker fallback:', retrieval.rerank_source, retrieval.rerank_error)
         }
+        if (retrieval.rewrite_source === 'fallback') {
+          console.warn('chat retrieval query rewrite fallback:', retrieval.rewrite_error)
+        }
       } catch (error) {
-        console.warn('chat context retrieval failed; using the current page only:', error)
+        console.warn('chat context retrieval failed; keeping pinned context only:', error)
       }
     }
     const questionSourceContext: PromptSourceSection[] = [
@@ -2339,15 +2392,7 @@ export function PdfWorkspacePage() {
         title: '用户显式选择的引用',
         content: explicitReferenceContext,
         bucket: 'pinned',
-        priority: 95,
-        trimMode: 'head-tail',
-      },
-      {
-        id: 'current-homework-question',
-        title: '当前练习题',
-        content: activeHomeworkContextMarkdown,
-        bucket: 'pinned',
-        priority: 90,
+        priority: 120,
         trimMode: 'head-tail',
       },
       {
@@ -2355,20 +2400,26 @@ export function PdfWorkspacePage() {
         title: '本次提问附件',
         content: documentAttachmentContext,
         bucket: 'pinned',
-        priority: 85,
+        priority: 115,
+        trimMode: 'head-tail',
+      },
+      {
+        id: 'current-page',
+        title: `当前查看的第 ${activeAnnotationPage} 页`,
+        content: currentPageContext,
+        bucket: 'pinned',
+        priority: 110,
+        trimMode: 'head-tail',
+      },
+      {
+        id: 'current-homework-question',
+        title: '当前练习题',
+        content: activeHomeworkContextMarkdown,
+        bucket: 'pinned',
+        priority: 100,
         trimMode: 'head-tail',
       },
       ...retrievedSections,
-      ...(retrievedSections.length
-        ? []
-        : [{
-            id: 'current-page-fallback',
-            title: `当前查看的第 ${activeAnnotationPage} 页（检索不可用时回退）`,
-            content: currentPageContext,
-            bucket: 'pinned' as const,
-            priority: 70,
-            trimMode: 'head-tail' as const,
-          }]),
     ]
     const imageAttachments = composerAttachments
       .filter((attachment) => attachment.kind === 'image' && attachment.dataUrl)

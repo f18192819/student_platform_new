@@ -41,6 +41,7 @@ class StartAdaptiveTestRequest(BaseModel):
 
 class SubmitAdaptiveAnswerRequest(BaseModel):
   model_config = ConfigDict(extra='forbid')
+  question_id: str = Field(default='', max_length=128)
   answer: str = Field(min_length=1, max_length=20000)
   response_time_ms: int = Field(default=0, ge=0, le=24 * 60 * 60 * 1000)
 
@@ -230,15 +231,28 @@ class AdaptiveTestingService:
   def submit(self, session_id: str, request: SubmitAdaptiveAnswerRequest) -> dict[str, Any]:
     with self._lock:
       session = self._require_session(session_id)
-      if session.status != 'active' or not session.current_question_id:
+      if session.status not in {'active', 'completed'}:
         raise HTTPException(status_code=409, detail='Adaptive test session is not accepting answers.')
       candidates, _ = self._candidates(session.course_id, session.lecture_document_id)
       candidate_by_id = {str(item['question_id']): item for item in candidates}
-      candidate = candidate_by_id.get(session.current_question_id)
+      question_id = str(request.question_id or session.current_question_id or '').strip()
+      unlocked_question_ids = set(session.asked_question_ids)
+      if session.current_question_id:
+        unlocked_question_ids.add(session.current_question_id)
+      if question_id not in unlocked_question_ids:
+        raise HTTPException(status_code=409, detail='This question has not been unlocked in the adaptive test.')
+      candidate = candidate_by_id.get(question_id)
       if not candidate:
-        raise HTTPException(status_code=409, detail='The current source question is no longer available.')
-      if session.current_question_id in session.asked_question_ids:
-        raise HTTPException(status_code=409, detail='This question has already been answered.')
+        raise HTTPException(status_code=409, detail='The selected source question is no longer available.')
+
+      previous_by_question = {
+        event.question_id: event
+        for event in self.store.effective_session_events(session.course_id, session.id)
+      }
+      previous_event = previous_by_question.get(question_id)
+      is_revision = previous_event is not None
+      if not is_revision and (session.status != 'active' or question_id != session.current_question_id):
+        raise HTTPException(status_code=409, detail='Only the current adaptive question can be answered for the first time.')
 
       grading = self.grader.grade(candidate, request.answer.strip())
       event = LearningEvent(
@@ -257,27 +271,26 @@ class AdaptiveTestingService:
         grading_method=grading.method,
         grading_confidence=grading.confidence,
         grading_feedback=grading.feedback,
+        revision=(previous_event.revision + 1) if previous_event else 1,
+        supersedes_event_id=previous_event.id if previous_event else None,
       )
-      session.asked_question_ids.append(event.question_id)
-      remaining = [
-        item for item in candidates
-        if str(item['question_id']) not in set(session.asked_question_ids)
-      ]
-      if len(session.asked_question_ids) >= session.target_question_count or not remaining:
-        session.status = 'completed'
-        session.current_question_id = None
-        session.completed_at = datetime.now(tz=timezone.utc).isoformat()
-      else:
-        session.current_question_id = self._select_next(session, candidates, pending_event=event)
-      try:
-        self.store.record_answer(event, session)
-      except Exception as exc:
-        if 'UNIQUE constraint failed' in str(exc):
-          raise HTTPException(status_code=409, detail='This question has already been answered.') from exc
-        raise
+      if not is_revision:
+        session.asked_question_ids.append(event.question_id)
+        remaining = [
+          item for item in candidates
+          if str(item['question_id']) not in set(session.asked_question_ids)
+        ]
+        if len(session.asked_question_ids) >= session.target_question_count or not remaining:
+          session.status = 'completed'
+          session.current_question_id = None
+          session.completed_at = datetime.now(tz=timezone.utc).isoformat()
+        else:
+          session.current_question_id = self._select_next(session, candidates, pending_event=event)
+      self.store.record_answer(event, session)
 
       response = self._session_payload(session, candidates)
       response['grading'] = grading.model_dump()
+      response['saved_answer'] = self._public_answer(event, candidate)
       response['answered_question'] = {
         **self._public_question(candidate),
         'reference_answer': str(candidate['reference_answer'])[:12000],
@@ -356,8 +369,8 @@ class AdaptiveTestingService:
     remaining = [item for item in candidates if str(item['question_id']) not in asked]
     if not remaining:
       return None
-    lecture_events = self.store.lecture_events(session.course_id, session.lecture_document_id)
-    session_events = self.store.session_events(session.course_id, session.id)
+    lecture_events = self.store.effective_lecture_events(session.course_id, session.lecture_document_id)
+    session_events = self.store.effective_session_events(session.course_id, session.id)
     if pending_event is not None:
       lecture_events.append(pending_event)
       session_events.append(pending_event)
@@ -411,7 +424,11 @@ class AdaptiveTestingService:
     if candidates is None:
       candidates, _ = self._candidates(session.course_id, session.lecture_document_id)
     candidate_by_id = {str(item['question_id']): item for item in candidates}
-    events = self.store.session_events(session.course_id, session.id)
+    events = self.store.effective_session_events(session.course_id, session.id)
+    unlocked_ids = list(dict.fromkeys([
+      *session.asked_question_ids,
+      *([session.current_question_id] if session.current_question_id else []),
+    ]))
     payload: dict[str, Any] = {
       'session': session.model_dump(),
       'progress': {
@@ -421,6 +438,15 @@ class AdaptiveTestingService:
       },
       'current_question': self._public_question(candidate_by_id[session.current_question_id])
       if session.current_question_id in candidate_by_id else None,
+      'questions': [
+        self._public_question(candidate_by_id[question_id])
+        for question_id in unlocked_ids
+        if question_id in candidate_by_id
+      ],
+      'answers': [
+        self._public_answer(event, candidate_by_id.get(event.question_id))
+        for event in events
+      ],
     }
     if session.status == 'completed':
       payload['result'] = self._result(session, candidates, events)
@@ -432,7 +458,7 @@ class AdaptiveTestingService:
     candidates: list[dict[str, Any]],
     session_events: list[LearningEvent],
   ) -> dict[str, Any]:
-    lecture_events = self.store.lecture_events(session.course_id, session.lecture_document_id)
+    lecture_events = self.store.effective_lecture_events(session.course_id, session.lecture_document_id)
     all_concepts = list(dict.fromkeys(
       concept for candidate in candidates for concept in candidate['knowledge_points']
     ))
@@ -522,6 +548,22 @@ class AdaptiveTestingService:
       'difficulty': int(candidate.get('difficulty') or 1),
       'knowledge_points': list(candidate.get('knowledge_points') or []),
       'images': list(candidate.get('images') or []),
+    }
+
+  @staticmethod
+  def _public_answer(event: LearningEvent, candidate: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+      'event_id': event.id,
+      'question_id': event.question_id,
+      'response_text': event.response_text,
+      'score': event.score,
+      'correct': event.correct,
+      'confidence': event.grading_confidence,
+      'feedback': event.grading_feedback,
+      'method': event.grading_method,
+      'revision': event.revision,
+      'reference_answer': str((candidate or {}).get('reference_answer') or '')[:12000],
+      'updated_at': event.created_at,
     }
 
 

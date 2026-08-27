@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+import re
+from typing import Any, Protocol
 
+import requests
 from fastapi import HTTPException
+from pydantic import BaseModel, Field, ValidationError
 
 from .document_pipeline import (
   QDRANT_COLLECTION,
@@ -11,6 +15,126 @@ from .document_pipeline import (
 )
 from .question_pipeline import QUESTION_COLLECTION
 from .question_relations import ApiReranker
+from .runtime_config import load_api_config
+
+
+MAX_REWRITE_MESSAGES = 4
+MAX_REWRITE_MESSAGE_CHARS = 4000
+MAX_REWRITE_QUERY_CHARS = 2000
+
+
+class StandaloneQueryPayload(BaseModel):
+  query: str = Field(min_length=1, max_length=MAX_REWRITE_QUERY_CHARS)
+
+
+class QueryRewriter(Protocol):
+  def rewrite(
+    self,
+    question: str,
+    recent_messages: list[dict[str, Any]],
+  ) -> tuple[str, str, str | None]: ...
+
+
+class StandaloneQueryRewriter:
+  """Resolve follow-up references before embedding without changing the answer question."""
+
+  @staticmethod
+  def _recent_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for message in messages[-MAX_REWRITE_MESSAGES:]:
+      if not isinstance(message, dict):
+        continue
+      role = str(message.get('role') or '').strip()
+      content = str(message.get('content') or '').strip()
+      if role not in {'user', 'assistant'} or not content:
+        continue
+      normalized.append({
+        'role': role,
+        'content': content[:MAX_REWRITE_MESSAGE_CHARS],
+      })
+    return normalized
+
+  @staticmethod
+  def _response_payload(content: str) -> StandaloneQueryPayload:
+    normalized = str(content or '').strip()
+    fenced = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', normalized, re.DOTALL | re.IGNORECASE)
+    if fenced:
+      normalized = fenced.group(1)
+    if not normalized.startswith('{'):
+      object_match = re.search(r'\{.*\}', normalized, re.DOTALL)
+      if object_match:
+        normalized = object_match.group(0)
+    return StandaloneQueryPayload.model_validate(json.loads(normalized))
+
+  @staticmethod
+  def _request(root: str, api_key: str, payload: dict[str, Any]) -> requests.Response:
+    return requests.post(
+      f'{root}/chat/completions',
+      headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+      json=payload,
+      timeout=15,
+    )
+
+  def rewrite(
+    self,
+    question: str,
+    recent_messages: list[dict[str, Any]],
+  ) -> tuple[str, str, str | None]:
+    original = str(question or '').strip()
+    messages = self._recent_messages(recent_messages)
+    # A welcome message alone provides no antecedent and does not justify another model call.
+    if not original or not any(message['role'] == 'user' for message in messages):
+      return original, 'original', None
+
+    try:
+      config = load_api_config() or {}
+      base_url = str(config.get('baseUrl') or '').strip()
+      api_key = str(config.get('apiKey') or '').strip()
+      model = str(config.get('model') or '').strip()
+      if not base_url or not api_key or not model:
+        return original, 'fallback', 'Text model configuration is unavailable for query rewrite.'
+
+      root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
+      schema = StandaloneQueryPayload.model_json_schema()
+      payload = {
+        'model': model,
+        'temperature': 0,
+        'max_tokens': 512,
+        'response_format': {
+          'type': 'json_schema',
+          'json_schema': {'name': 'standalone_retrieval_query', 'strict': True, 'schema': schema},
+        },
+        'messages': [
+          {
+            'role': 'system',
+            'content': (
+              'Rewrite the latest user question as one concise, self-contained retrieval query. '
+              'Resolve words such as this, that, here, it, or omitted subjects only from the recent '
+              'conversation. Preserve formulas, symbols, constraints, and the user intent. Do not '
+              'answer the question and do not add facts. If it is already standalone, return it '
+              'unchanged. Return only an object that matches the JSON Schema.'
+            ),
+          },
+          {
+            'role': 'user',
+            'content': json.dumps({
+              'recent_conversation': messages,
+              'latest_question': original,
+            }, ensure_ascii=False),
+          },
+        ],
+      }
+      response = self._request(root, api_key, payload)
+      if response.status_code >= 400:
+        response = self._request(root, api_key, {**payload, 'response_format': {'type': 'json_object'}})
+      response.raise_for_status()
+      content = str(response.json()['choices'][0]['message']['content'])
+      rewritten = self._response_payload(content).query.strip()
+      return rewritten or original, 'text-model', None
+    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError) as exc:
+      return original, 'fallback', f'{type(exc).__name__}: {exc}'
+    except Exception as exc:  # noqa: BLE001 - query rewriting must never break retrieval.
+      return original, 'fallback', f'{type(exc).__name__}: {exc}'
 
 
 class ChatContextRetriever:
@@ -22,10 +146,12 @@ class ChatContextRetriever:
     embedding: ApiEmbeddingProvider,
     vector_store: QdrantVectorStore,
     reranker: ApiReranker,
+    query_rewriter: QueryRewriter | None = None,
   ) -> None:
     self.embedding = embedding
     self.vector_store = vector_store
     self.reranker = reranker
+    self.query_rewriter = query_rewriter or StandaloneQueryRewriter()
 
   @staticmethod
   def _collections(document_type: str) -> list[str]:
@@ -44,6 +170,7 @@ class ChatContextRetriever:
     document_type: str = '',
     top_n: int = 20,
     top_k: int = 6,
+    recent_messages: list[dict[str, Any]] | None = None,
   ) -> dict[str, Any]:
     normalized_query = str(query or '').strip()
     normalized_course_id = str(course_id or '').strip()
@@ -54,9 +181,14 @@ class ChatContextRetriever:
     if not normalized_course_id:
       raise HTTPException(status_code=422, detail='course_id is required.')
 
+    retrieval_query, rewrite_source, rewrite_error = self.query_rewriter.rewrite(
+      normalized_query,
+      recent_messages or [],
+    )
+    retrieval_query = str(retrieval_query or '').strip() or normalized_query
     candidate_limit = max(1, min(int(top_n), 50))
     result_limit = max(1, min(int(top_k), candidate_limit))
-    query_vector = self.embedding.embed([normalized_query])[0]
+    query_vector = self.embedding.embed([retrieval_query])[0]
     filters = {
       'course_id': normalized_course_id,
       'document_id': normalized_document_id,
@@ -88,7 +220,7 @@ class ChatContextRetriever:
     candidates.sort(key=lambda item: float(item.get('vector_score') or 0.0), reverse=True)
     candidates = candidates[:candidate_limit]
     reranked, source, error = self.reranker.rerank(
-      normalized_query,
+      retrieval_query,
       candidates,
       result_limit,
       batch_size=max(1, len(candidates)),
@@ -105,4 +237,7 @@ class ChatContextRetriever:
       'candidate_count': len(candidates),
       'rerank_source': source,
       'rerank_error': error,
+      'retrieval_query': retrieval_query,
+      'rewrite_source': rewrite_source,
+      'rewrite_error': rewrite_error,
     }

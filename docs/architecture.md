@@ -52,6 +52,10 @@ Learning-state SQLite files live below
 has a separate physical database. `learning_events` is append-only during
 normal operation; deletion cascades may remove rows when their source course,
 lecture, or question document is explicitly deleted.
+Answer edits append a new `LearningEvent` revision that points to the event it
+supersedes. Adaptive selection and mastery projections use only the latest
+revision for each session/question pair, while the full answer history remains
+available for audit and future learning-state recalculation.
 
 ### Providers and Storage
 

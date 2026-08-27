@@ -57,7 +57,7 @@ from backend.audio_alignment import (
   TranscriptSegment,
 )
 from backend.document_pipeline import DocumentPipeline, QDRANT_COLLECTION, local_mineru_service
-from backend.question_pipeline import QUESTION_COLLECTION, QuestionPipeline
+from backend.question_pipeline import QUESTION_COLLECTION, QUESTION_UPLOAD_EXTENSIONS, QuestionPipeline
 from backend.question_relations import QuestionRelationPipeline
 from backend.chat_retrieval import ChatContextRetriever
 from backend.adaptive_testing import (
@@ -100,6 +100,7 @@ question_pipeline: QuestionPipeline | None = None
 question_relation_pipeline: QuestionRelationPipeline | None = None
 chat_context_retriever: ChatContextRetriever | None = None
 pipeline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='document-pipeline')
+relation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='question-relations')
 
 
 def get_document_pipeline() -> DocumentPipeline:
@@ -153,6 +154,26 @@ def refresh_course_question_relations(course_id: str) -> str:
   except Exception as exc:  # noqa: BLE001
     return str(getattr(exc, 'detail', exc))
   return ''
+
+
+def queue_question_relation_refresh(document_id: str) -> None:
+  """Refresh optional relations without blocking indexing status or retry requests."""
+  future = relation_executor.submit(refresh_question_document_relations, document_id)
+
+  def report_failure(completed_future) -> None:
+    try:
+      error = str(completed_future.result() or '')
+    except Exception as exc:  # noqa: BLE001
+      error = str(exc)
+    if error:
+      print(f'Question relation refresh failed for {document_id}: {error}')
+
+  future.add_done_callback(report_failure)
+
+
+def queue_missing_question_relation_refreshes() -> None:
+  for document_id in get_question_relation_pipeline().missing_document_ids():
+    queue_question_relation_refresh(document_id)
 
 
 def _delete_document_relations(document_id: str) -> None:
@@ -246,6 +267,7 @@ async def application_lifespan(_app):
       asyncio.create_task(run_pipeline_task(document_pipeline.resume_pending)),
       asyncio.create_task(run_pipeline_task(question_pipeline.resume_pending)),
     ]
+    queue_missing_question_relation_refreshes()
     yield
   finally:
     if resume_tasks:
@@ -289,7 +311,10 @@ async def process_document_pipeline(
   source_type: str = Form('pdf'),
   document_id: str | None = Form(None),
 ) -> dict[str, Any]:
-  if not (file.filename or '').lower().endswith('.pdf'):
+  if (
+    not (file.filename or '').lower().endswith('.pdf')
+    and str(file.content_type or '').lower() != 'application/pdf'
+  ):
     raise HTTPException(status_code=422, detail='Document pipeline only accepts PDF files.')
   if document_type != 'lecture':
     raise HTTPException(status_code=422, detail='Document pipeline only accepts lecture documents.')
@@ -371,6 +396,11 @@ async def retrieve_chat_context(payload: dict[str, Any] = Body(...)) -> dict[str
     document_type=str(payload.get('document_type') or '').strip(),
     top_n=max(1, min(int(payload.get('top_n') or 20), 50)),
     top_k=max(1, min(int(payload.get('top_k') or 6), 12)),
+    recent_messages=(
+      payload.get('recent_messages')
+      if isinstance(payload.get('recent_messages'), list)
+      else []
+    ),
   )
 
 
@@ -386,8 +416,13 @@ async def process_question_document(
   document_type: str = Form(...),
   document_id: str | None = Form(None),
 ) -> dict[str, Any]:
-  if not (file.filename or '').lower().endswith('.pdf'):
-    raise HTTPException(status_code=422, detail='Question pipeline only accepts PDF files.')
+  file_name = str(file.filename or '').strip()
+  suffix = Path(file_name).suffix.lower()
+  if suffix not in QUESTION_UPLOAD_EXTENSIONS:
+    raise HTTPException(
+      status_code=422,
+      detail='题目文件格式不支持。当前支持 PDF、PNG、JPG、JPEG 和 WebP。',
+    )
   if document_type not in {'homework', 'past-exam'}:
     raise HTTPException(status_code=422, detail='Question pipeline only accepts homework or past-exam documents.')
   state = await run_pipeline_task(
@@ -398,36 +433,24 @@ async def process_question_document(
     document_type=document_type,
     document_id=document_id,
   )
-  relation_refresh_error = ''
-  if state.get('status') == 'completed':
-    relation_refresh_error = await run_pipeline_task(
-      refresh_question_document_relations,
-      str(state['document_id']),
-    )
   result = get_question_pipeline().result(str(state['document_id']))
-  if relation_refresh_error:
-    result['relation_refresh_error'] = relation_refresh_error
   await run_pipeline_task(
     sync_knowledge_homework_pipeline_result,
     str(state['document_id']),
     result,
   )
+  if state.get('status') == 'completed':
+    queue_question_relation_refresh(str(state['document_id']))
   return result
 
 
 @backend_router.post('/api/questions/{document_id}/retry')
 async def retry_question_document(document_id: str) -> dict[str, Any]:
   state = await run_pipeline_task(get_question_pipeline().run, document_id)
-  relation_refresh_error = ''
-  if state.get('status') == 'completed':
-    relation_refresh_error = await run_pipeline_task(
-      refresh_question_document_relations,
-      document_id,
-    )
   result = get_question_pipeline().result(document_id)
-  if relation_refresh_error:
-    result['relation_refresh_error'] = relation_refresh_error
   await run_pipeline_task(sync_knowledge_homework_pipeline_result, document_id, result)
+  if state.get('status') == 'completed':
+    queue_question_relation_refresh(document_id)
   return result
 
 
@@ -485,6 +508,11 @@ async def get_question_relations(question_id: str) -> dict[str, Any]:
   return get_question_relation_pipeline().result(question_id)
 
 
+@backend_router.post('/api/question-relations/rebuild-page-indexes')
+async def rebuild_question_relation_page_indexes() -> dict[str, Any]:
+  return await run_pipeline_task(get_question_relation_pipeline().rebuild_lecture_page_indexes)
+
+
 @backend_router.get('/api/question-relations/courses/{course_id}/lectures/{document_id}/pages/{page_number}')
 async def get_lecture_page_question_relations(
   course_id: str,
@@ -514,6 +542,17 @@ async def delete_knowledge_homework_document_api(
   if result.get('deleted'):
     await asyncio.to_thread(delete_learning_document, course_id, document_id)
   return result
+
+
+@backend_router.get('/api/questions/{document_id}/status')
+async def get_question_document_status(document_id: str) -> dict[str, Any]:
+  state = await asyncio.to_thread(get_question_pipeline().status, document_id)
+  status = str(state.get('status') or '')
+  if status == 'completed' or status.endswith('_failed'):
+    result = await asyncio.to_thread(get_question_pipeline().result, document_id)
+    await asyncio.to_thread(sync_knowledge_homework_pipeline_result, document_id, result)
+    return result
+  return state
 
 
 @backend_router.get("/api/knowledge/library")

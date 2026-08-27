@@ -35,6 +35,20 @@ export type AdaptiveTestSession = {
   completed_at: string | null
 }
 
+export type AdaptiveTestAnswer = {
+  event_id: string
+  question_id: string
+  response_text: string
+  score: number
+  correct: boolean
+  confidence: number
+  feedback: string
+  method: string
+  revision: number
+  reference_answer: string
+  updated_at: string
+}
+
 export type ConceptMastery = {
   knowledge_point: string
   mastery: number
@@ -87,6 +101,8 @@ export type AdaptiveTestPayload = {
     correct: number
   }
   current_question: AdaptiveTestQuestion | null
+  questions: AdaptiveTestQuestion[]
+  answers: AdaptiveTestAnswer[]
   grading?: {
     score: number
     correct: boolean
@@ -95,6 +111,7 @@ export type AdaptiveTestPayload = {
     method: string
   }
   answered_question?: AdaptiveTestQuestion
+  saved_answer?: AdaptiveTestAnswer
   result?: AdaptiveTestResult
   skipped_ungradable_questions?: number
 }
@@ -153,6 +170,7 @@ export async function getActiveAdaptiveTest(
 
 export async function submitAdaptiveAnswer(
   sessionId: string,
+  questionId: string,
   answer: string,
   responseTimeMs: number,
 ) {
@@ -161,7 +179,7 @@ export async function submitAdaptiveAnswer(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer, response_time_ms: responseTimeMs }),
+      body: JSON.stringify({ question_id: questionId, answer, response_time_ms: responseTimeMs }),
     },
   ))
 }
