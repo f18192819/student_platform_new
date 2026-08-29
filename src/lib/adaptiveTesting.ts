@@ -161,6 +161,13 @@ export type AdaptiveTestPayload = {
   result?: AdaptiveTestResult
   skipped_ungradable_questions?: number
   reference_answer_update?: ReferenceAnswerInfo & { question_id: string }
+  preparation?: {
+    state: 'ready' | 'preparing' | 'failed'
+    ready_count: number
+    preparing_count: number
+    failed_count: number
+    message: string
+  }
 }
 
 async function readPayload(response: Response): Promise<AdaptiveTestPayload> {
@@ -251,10 +258,18 @@ export async function correctAdaptiveReferenceAnswer(
   ))
 }
 
+export async function retryAdaptiveTestPreparation(sessionId: string) {
+  return readPayload(await fetch(
+    resolveBackendApiUrl(
+      `/api/adaptive-tests/${encodeURIComponent(sessionId)}/preparation/retry`,
+    ),
+    { method: 'POST' },
+  ))
+}
+
 export async function cancelAdaptiveTest(sessionId: string) {
   return readPayload(await fetch(
     resolveBackendApiUrl(`/api/adaptive-tests/${encodeURIComponent(sessionId)}`),
     { method: 'DELETE' },
   ))
 }
-

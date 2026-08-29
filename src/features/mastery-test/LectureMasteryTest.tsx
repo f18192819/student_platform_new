@@ -8,6 +8,7 @@ import remarkMath from 'remark-math'
 import {
   correctAdaptiveReferenceAnswer,
   getActiveAdaptiveTest,
+  retryAdaptiveTestPreparation,
   startAdaptiveTest,
   submitAdaptiveAnswer,
   type AdaptiveTestAnswer,
@@ -134,6 +135,38 @@ export function LectureMasteryTest({
       })
     return () => controller.abort()
   }, [courseId, lectureDocumentId])
+
+  useEffect(() => {
+    if (
+      !isOpen
+      || payload?.session.status !== 'active'
+      || payload.current_question
+      || payload.preparation?.state === 'failed'
+    ) {
+      return
+    }
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      void getActiveAdaptiveTest(courseId, lectureDocumentId, controller.signal)
+        .then((next) => {
+          if (!next) return
+          setPayload(next)
+          if (next.current_question) {
+            setSelectedQuestionId(next.current_question.question_id)
+            questionStartedAt.current = Date.now()
+          }
+        })
+        .catch((reason) => {
+          if (!controller.signal.aborted) {
+            console.warn('adaptive assessment preparation polling failed:', reason)
+          }
+        })
+    }, 1200)
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [courseId, isOpen, lectureDocumentId, payload])
 
   useEffect(() => {
     const sessionId = payload?.session.id
@@ -290,6 +323,21 @@ export function LectureMasteryTest({
     }
   }
 
+  const retryPreparation = async () => {
+    if (!payload || isLoading) return
+    setError('')
+    setIsLoading(true)
+    try {
+      const next = await retryAdaptiveTestPreparation(payload.session.id)
+      setPayload(next)
+      setSelectedQuestionId(next.current_question?.question_id || '')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '题目准备重试失败。')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
   const close = () => {
     setIsOpen(false)
     setError('')
@@ -390,6 +438,24 @@ export function LectureMasteryTest({
                 <button type="button" className="primary-button" onClick={() => void openTest()}>
                   重试
                 </button>
+              </div>
+            ) : payload && !questions.length && payload.preparation?.state === 'failed' ? (
+              <div className="mastery-test__state mastery-test__state--error">
+                <strong>题目准备失败</strong>
+                <p>{payload.preparation.message || error || '文本处理模型暂时没有返回可用的作答结构。'}</p>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => void retryPreparation()}
+                  disabled={isLoading}
+                >
+                  {isLoading ? '正在重试…' : '重试准备题目'}
+                </button>
+              </div>
+            ) : payload && !questions.length ? (
+              <div className="mastery-test__state" role="status">
+                <strong>正在准备第一题…</strong>
+                <p>AI 正在拆分题目并生成客观作答选项，完成后会自动显示。</p>
               </div>
             ) : result && showResults ? (
               <div className="mastery-result">
@@ -668,6 +734,11 @@ export function LectureMasteryTest({
                 {referenceUpdateNotice ? (
                   <p className="mastery-reference-update-notice">{referenceUpdateNotice}</p>
                 ) : null}
+                {payload.session.status === 'active' && !payload.current_question ? (
+                  <p className="mastery-reference-update-notice" role="status">
+                    下一题正在后台准备，完成后会自动解锁；你可以先查看本题反馈。
+                  </p>
+                ) : null}
                 {error ? <p className="mastery-test__inline-error">{error}</p> : null}
                 <div className="mastery-question__actions">
                   {payload.current_question && payload.current_question.question_id !== currentQuestion.question_id ? (
@@ -714,4 +785,3 @@ export function LectureMasteryTest({
     </>
   )
 }
-

@@ -18,7 +18,7 @@ from .question_pipeline import QuestionAnalyzer
 from .runtime_config import load_api_config
 
 DEFAULT_NUMERIC_TOLERANCE = 1e-6
-ASSESSMENT_POLICY_VERSION = 'generated-reference-answer-v5'
+ASSESSMENT_POLICY_VERSION = 'objective-answer-choice-v7'
 _NUMBER = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$')
 _FRACTION = re.compile(r'^([+-]?\d+)\s*/\s*([+-]?\d+)$')
 _LATEX_FRACTION = re.compile(r'^\\frac\s*\{([+-]?\d+)\}\s*\{([+-]?\d+)\}$')
@@ -28,6 +28,18 @@ _MATH_SIGNAL = re.compile(
   r'[=^_+\-*/×÷±]|[A-Za-z]\s*[({]|\d\s*[A-Za-z])'
 )
 _TEXT_TASK_SIGNAL = re.compile(r'(?:说明|解释|证明|为什么|理由|原理|论证|justify|explain|prove)', re.I)
+_OBJECTIVE_TASK_SIGNAL = re.compile(
+  r'(?:求|求出|求得|求解|计算|写出|给出|列出|确定|化简|解出|判断|选择|比较|指出|填写|'
+  r'为多少|是多少|等于多少)',
+  re.I,
+)
+_SYMBOLIC_TASK_SIGNAL = re.compile(
+  r'(?:求|写出|给出|计算|确定|化简|解出|得到).{0,80}'
+  r'(?:表达式|公式|方程|函数|波函数|矩阵|行列式|特征值|特征向量|极限|导数|积分|'
+  r'电场(?:强度)?|磁场|磁感应强度|场强|电势|电压|电流|功率|频率|角频率|波数|'
+  r'动量|能量|力|速度|加速度|概率|分布)',
+  re.I,
+)
 
 
 def _now() -> str:
@@ -247,6 +259,29 @@ class AssessmentPlanner:
       spec.model_dump(),
     )
     return spec
+
+  def get_cached(
+    self,
+    *,
+    course_id: str,
+    question_id: str,
+    prompt: str,
+    reference_answer: str,
+    analysis: dict[str, Any],
+  ) -> AssessmentSpec | None:
+    """Return a valid persisted spec without ever invoking a model."""
+    saved_answer = self.store.get_question_reference_answer(course_id, question_id)
+    effective_answer = saved_answer.answer_text if saved_answer else str(reference_answer or '').strip()
+    if not effective_answer:
+      return None
+    fingerprint = self._fingerprint(prompt, effective_answer, analysis)
+    cached = self.store.get_assessment_spec(course_id, question_id, fingerprint)
+    if not cached:
+      return None
+    try:
+      return AssessmentSpec.model_validate(cached)
+    except ValidationError:
+      return None
 
   def saved_reference_answer(
     self,
@@ -469,6 +504,11 @@ class AssessmentPlanner:
             '只有多个量必须作为一个不可分割的整体作答时才允许合并，不能为了减少数量而合并。'
             'answer_kind 规则：单一具体数值为 numeric；公式、矩阵、函数、方程或符号结果为 expression；'
             '有唯一短结论、判断、枚举或概念选择的客观答案为 objective；解释、证明、原因和开放论述为 text。'
+            '判定必须偏向可客观作答：凡是“求、计算、写出、给出、确定、化简、解出、判断”等任务，'
+            '只要答案是数值、符号、公式、表达式、物理量或唯一短结论，就不能标为 text。'
+            '只有题目明确要求说明、解释、证明、分析原因、论述思路，或确实不存在唯一客观答案时才使用 text。'
+            '题干要求“求某个物理量、场强、波函数或表达式”时，即使答案是“为零”或参考答案使用中文描述，'
+            '也必须标为 expression，不能标为 text；只有要求解释原因或推导思路时才标为 text。'
             '每个 reference_excerpt 必须逐字摘自真实参考答案，并且只包含当前任务所需的最小充分答案。'
             '如果题干确实要求解释原因，必须单列 text 任务。prompt 面向学生且不能泄漏答案。'
             '最后判断参考答案是否覆盖题干要求的全部任务：全部覆盖时 reference_complete=true 且 uncovered_requirements=[]；'
@@ -515,6 +555,11 @@ class AssessmentPlanner:
               status_code=422,
               detail='参考答案未覆盖原题全部子问，已跳过该题。',
             )
+          if any(
+            not self._validated_excerpt(task.reference_excerpt, reference_answer)
+            for task in candidate.tasks
+          ):
+            raise ValueError('Assessment task reference excerpt is not source-grounded.')
           inventory = candidate
           break
         except HTTPException:
@@ -523,13 +568,14 @@ class AssessmentPlanner:
           continue
       if inventory is None:
         return None
+      tasks = [self._normalize_task_kind(task) for task in inventory.tasks]
       choice_tasks = [
-        task for task in inventory.tasks
+        task for task in tasks
         if task.answer_kind in {'expression', 'objective'}
       ]
       distractor_sets = self._request_distractor_batch(choice_tasks, prompt)
       parts = []
-      for task in inventory.tasks:
+      for task in tasks:
         if task.answer_kind == 'numeric':
           part_type = 'numeric'
         elif task.answer_kind in {'expression', 'objective'}:
@@ -552,6 +598,28 @@ class AssessmentPlanner:
       return PlannedAssessment(parts=parts)
     except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
       return None
+
+  @classmethod
+  def _normalize_task_kind(cls, task: AssessmentTask) -> AssessmentTask:
+    if task.answer_kind == 'numeric' and cls.parse_numeric(task.reference_excerpt) is None:
+      return task.model_copy(update={'answer_kind': 'expression'})
+    if task.answer_kind == 'text' and cls._prompt_requires_objective_answer(task.prompt):
+      return task.model_copy(update={'answer_kind': 'expression'})
+    return task
+
+  @classmethod
+  def _prompt_requires_objective_answer(cls, prompt: str) -> bool:
+    text = str(prompt or '').strip()
+    if not text or _TEXT_TASK_SIGNAL.search(text):
+      return False
+    return bool(_OBJECTIVE_TASK_SIGNAL.search(text) or cls._prompt_requires_symbolic_answer(text))
+
+  @staticmethod
+  def _prompt_requires_symbolic_answer(prompt: str) -> bool:
+    text = str(prompt or '').strip()
+    if not text or _TEXT_TASK_SIGNAL.search(text):
+      return False
+    return bool(_SYMBOLIC_TASK_SIGNAL.search(text))
 
   def _request_distractor_batch(
     self,
@@ -760,7 +828,11 @@ class AssessmentPlanner:
           reference_answer=reference,
         ))
         continue
-      if self._looks_like_expression(reference) or item.type == 'choice':
+      if (
+        self._looks_like_expression(reference)
+        or item.type == 'choice'
+        or self._prompt_requires_objective_answer(item.prompt)
+      ):
         distractors = self._valid_distractors(reference, item.distractors)
         if len(distractors) < 3:
           distractors = self._valid_distractors(
@@ -913,4 +985,3 @@ class AssessmentPlanner:
     except InvalidOperation:
       return None
     return numeric if numeric.is_finite() else None
-
