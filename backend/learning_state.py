@@ -57,7 +57,7 @@ class AdaptiveTestSession(BaseModel):
   course_id: str
   lecture_document_id: str
   status: Literal['active', 'completed', 'cancelled'] = 'active'
-  target_question_count: int = Field(ge=1, le=10)
+  target_question_count: int = Field(ge=0, le=10)
   candidate_question_ids: list[str] = Field(default_factory=list)
   asked_question_ids: list[str] = Field(default_factory=list)
   current_question_id: str | None = None
@@ -88,6 +88,21 @@ class QuestionReferenceAnswer(BaseModel):
   model: str = ''
   confidence: float = Field(default=1.0, ge=0.0, le=1.0)
   needs_review: bool = False
+  created_at: str = Field(default_factory=_now)
+  updated_at: str = Field(default_factory=_now)
+
+
+class AssessmentPreparationRecord(BaseModel):
+  """Durable state for one question's background AssessmentSpec preparation."""
+
+  model_config = ConfigDict(extra='forbid')
+  course_id: str
+  question_id: str
+  source_document_id: str = ''
+  source_fingerprint: str
+  status: Literal['pending', 'processing', 'ready', 'failed', 'needs_review']
+  attempt_count: int = Field(default=0, ge=0)
+  last_error: str = ''
   created_at: str = Field(default_factory=_now)
   updated_at: str = Field(default_factory=_now)
 
@@ -297,6 +312,164 @@ class LearningStateStore:
         (question_id,),
       )
 
+  def ensure_assessment_preparation(
+    self,
+    course_id: str,
+    question_id: str,
+    source_document_id: str,
+    source_fingerprint: str,
+  ) -> AssessmentPreparationRecord:
+    """Create a pending task or invalidate stale state when its source changes."""
+    timestamp = _now()
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        'SELECT * FROM assessment_preparations WHERE question_id = ?',
+        (question_id,),
+      ).fetchone()
+      if row is None:
+        connection.execute(
+          '''
+          INSERT INTO assessment_preparations (
+            course_id, question_id, source_document_id, source_fingerprint,
+            status, attempt_count, last_error, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'pending', 0, '', ?, ?)
+          ''',
+          (course_id, question_id, source_document_id, source_fingerprint, timestamp, timestamp),
+        )
+      elif str(row['source_fingerprint']) != source_fingerprint:
+        connection.execute(
+          '''
+          UPDATE assessment_preparations SET
+            source_document_id = ?, source_fingerprint = ?, status = 'pending',
+            attempt_count = 0, last_error = '', updated_at = ?
+          WHERE question_id = ?
+          ''',
+          (source_document_id, source_fingerprint, timestamp, question_id),
+        )
+      row = connection.execute(
+        'SELECT * FROM assessment_preparations WHERE question_id = ?',
+        (question_id,),
+      ).fetchone()
+    return self._row_to_assessment_preparation(row)
+
+  def get_assessment_preparation(
+    self,
+    course_id: str,
+    question_id: str,
+  ) -> AssessmentPreparationRecord | None:
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        'SELECT * FROM assessment_preparations WHERE question_id = ?',
+        (question_id,),
+      ).fetchone()
+    return self._row_to_assessment_preparation(row) if row else None
+
+  def claim_assessment_preparation(
+    self,
+    course_id: str,
+    question_id: str,
+    source_fingerprint: str,
+    max_attempts: int,
+  ) -> bool:
+    """Atomically move one pending task to processing."""
+    with self._connect(course_id) as connection:
+      cursor = connection.execute(
+        '''
+        UPDATE assessment_preparations SET
+          status = 'processing', attempt_count = attempt_count + 1,
+          last_error = '', updated_at = ?
+        WHERE question_id = ? AND source_fingerprint = ?
+          AND status = 'pending' AND attempt_count < ?
+        ''',
+        (_now(), question_id, source_fingerprint, max_attempts),
+      )
+    return cursor.rowcount == 1
+
+  def finish_assessment_preparation(
+    self,
+    course_id: str,
+    question_id: str,
+    source_fingerprint: str,
+    expected_source_fingerprint: str | None = None,
+  ) -> bool:
+    with self._connect(course_id) as connection:
+      if expected_source_fingerprint is None:
+        cursor = connection.execute(
+          '''
+          UPDATE assessment_preparations SET
+            source_fingerprint = ?, status = 'ready', last_error = '', updated_at = ?
+          WHERE question_id = ?
+          ''',
+          (source_fingerprint, _now(), question_id),
+        )
+      else:
+        cursor = connection.execute(
+          '''
+          UPDATE assessment_preparations SET
+            source_fingerprint = ?, status = 'ready', last_error = '', updated_at = ?
+          WHERE question_id = ? AND source_fingerprint = ?
+          ''',
+          (source_fingerprint, _now(), question_id, expected_source_fingerprint),
+        )
+    return cursor.rowcount == 1
+
+  def fail_assessment_preparation(
+    self,
+    course_id: str,
+    question_id: str,
+    error: str,
+    max_attempts: int,
+  ) -> str:
+    """Return pending while automatic retries remain, otherwise persist failed."""
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        'SELECT attempt_count FROM assessment_preparations WHERE question_id = ?',
+        (question_id,),
+      ).fetchone()
+      attempt_count = int(row['attempt_count']) if row else max_attempts
+      status = 'pending' if attempt_count < max_attempts else 'failed'
+      connection.execute(
+        '''
+        UPDATE assessment_preparations SET status = ?, last_error = ?, updated_at = ?
+        WHERE question_id = ?
+        ''',
+        (status, str(error or '')[:1000], _now(), question_id),
+      )
+    return status
+
+  def retry_assessment_preparation(self, course_id: str, question_id: str) -> None:
+    """A user-initiated retry starts a fresh bounded attempt cycle."""
+    with self._connect(course_id) as connection:
+      connection.execute(
+        '''
+        UPDATE assessment_preparations SET
+          status = 'pending', attempt_count = 0, last_error = '', updated_at = ?
+        WHERE question_id = ?
+        ''',
+        (_now(), question_id),
+      )
+
+  def recover_interrupted_assessment_preparations(self, max_attempts: int) -> int:
+    """Reset processing rows left behind by a previous backend process."""
+    recovered = 0
+    for database in self._database_paths():
+      with self._connect_path(database) as connection:
+        cursor = connection.execute(
+          '''
+          UPDATE assessment_preparations SET
+            status = CASE WHEN attempt_count < ? THEN 'pending' ELSE 'failed' END,
+            last_error = CASE
+              WHEN attempt_count < ? THEN 'Interrupted by backend restart; queued again.'
+              ELSE 'Maximum preparation attempts reached after backend restart.'
+            END,
+            updated_at = ?
+          WHERE status = 'processing'
+          ''',
+          (max_attempts, max_attempts, _now()),
+        )
+        recovered += cursor.rowcount
+    return recovered
+
   def get_question_reference_answer(
     self,
     course_id: str,
@@ -432,6 +605,10 @@ class LearningStateStore:
         (document_id,),
       )
       connection.execute(
+        'DELETE FROM assessment_preparations WHERE source_document_id = ?',
+        (document_id,),
+      )
+      connection.execute(
         'DELETE FROM question_reference_answers WHERE source_document_id = ?',
         (document_id,),
       )
@@ -530,6 +707,23 @@ class LearningStateStore:
       );
       CREATE INDEX IF NOT EXISTS idx_assessment_specs_document
         ON assessment_specs(source_document_id);
+      CREATE TABLE IF NOT EXISTS assessment_preparations (
+        course_id TEXT NOT NULL,
+        question_id TEXT PRIMARY KEY,
+        source_document_id TEXT NOT NULL DEFAULT '',
+        source_fingerprint TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN (
+          'pending', 'processing', 'ready', 'failed', 'needs_review'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_assessment_preparations_status
+        ON assessment_preparations(status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_assessment_preparations_document
+        ON assessment_preparations(source_document_id);
       CREATE TABLE IF NOT EXISTS question_reference_answers (
         question_id TEXT PRIMARY KEY,
         source_document_id TEXT NOT NULL DEFAULT '',
@@ -727,4 +921,18 @@ class LearningStateStore:
       revision=row['revision'],
       supersedes_event_id=row['supersedes_event_id'],
       created_at=row['created_at'],
+    )
+
+  @staticmethod
+  def _row_to_assessment_preparation(row: sqlite3.Row) -> AssessmentPreparationRecord:
+    return AssessmentPreparationRecord(
+      course_id=str(row['course_id']),
+      question_id=str(row['question_id']),
+      source_document_id=str(row['source_document_id']),
+      source_fingerprint=str(row['source_fingerprint']),
+      status=str(row['status']),
+      attempt_count=int(row['attempt_count']),
+      last_error=str(row['last_error']),
+      created_at=str(row['created_at']),
+      updated_at=str(row['updated_at']),
     )

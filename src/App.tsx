@@ -8,6 +8,7 @@ import { KnowledgeLibraryPage } from './pages/KnowledgeLibraryPage'
 import { PdfWorkspacePage } from './pages/PdfWorkspacePage'
 import { StudyPlanPage } from './pages/StudyPlanPage'
 import { runAutoCoursewareSyncOnce } from './features/knowledge-library/autoCoursewareSync'
+import { resumePendingQuestionDocuments } from './lib/questionPipeline'
 import {
   COURSEWARE_AUTO_SYNC_STATUS_EVENT,
   type CoursewareAutoSyncStatusDetail,
@@ -30,6 +31,21 @@ function App() {
     return () => {
       window.clearTimeout(startupTimer)
       window.removeEventListener('pageshow', startAutoCoursewareSync)
+    }
+  }, [])
+
+  useEffect(() => {
+    const checkPendingQuestions = () => {
+      void resumePendingQuestionDocuments().catch((error) => {
+        console.info('[question pipeline] startup recovery check deferred:', error)
+      })
+    }
+
+    const startupTimer = window.setTimeout(checkPendingQuestions, 0)
+    window.addEventListener('pageshow', checkPendingQuestions)
+    return () => {
+      window.clearTimeout(startupTimer)
+      window.removeEventListener('pageshow', checkPendingQuestions)
     }
   }, [])
 

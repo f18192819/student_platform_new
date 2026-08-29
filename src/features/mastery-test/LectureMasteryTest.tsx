@@ -237,7 +237,7 @@ export function LectureMasteryTest({
       const next = await startAdaptiveTest(courseId, lectureDocumentId)
       setPayload(next)
       setSelectedQuestionId(next.current_question?.question_id || next.questions?.[0]?.question_id || '')
-      setShowResults(false)
+      setShowResults(next.session.status === 'completed')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '暂时无法开始测试。')
     } finally {
@@ -439,7 +439,9 @@ export function LectureMasteryTest({
                   重试
                 </button>
               </div>
-            ) : payload && !questions.length && payload.preparation?.state === 'failed' ? (
+            ) : payload?.session.status === 'active'
+              && !questions.length
+              && payload.preparation?.state === 'failed' ? (
               <div className="mastery-test__state mastery-test__state--error">
                 <strong>题目准备失败</strong>
                 <p>{payload.preparation.message || error || '文本处理模型暂时没有返回可用的作答结构。'}</p>
@@ -452,7 +454,7 @@ export function LectureMasteryTest({
                   {isLoading ? '正在重试…' : '重试准备题目'}
                 </button>
               </div>
-            ) : payload && !questions.length ? (
+            ) : payload?.session.status === 'active' && !questions.length ? (
               <div className="mastery-test__state" role="status">
                 <strong>正在准备第一题…</strong>
                 <p>AI 正在拆分题目并生成客观作答选项，完成后会自动显示。</p>

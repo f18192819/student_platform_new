@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import asyncio
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -65,6 +66,8 @@ from backend.adaptive_testing import (
   configure_adaptive_testing,
   delete_learning_course,
   delete_learning_document,
+  queue_related_assessment_preparations,
+  resume_assessment_preparations,
 )
 # KNOWLEDGE_GRAPH_PAUSED: keep the graph modules on disk for a later opt-in restart.
 from backend.knowledge_storage import (
@@ -101,6 +104,9 @@ question_relation_pipeline: QuestionRelationPipeline | None = None
 chat_context_retriever: ChatContextRetriever | None = None
 pipeline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='document-pipeline')
 relation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='question-relations')
+question_resume_lock = threading.Lock()
+question_resume_running = False
+question_resume_task: asyncio.Task | None = None
 
 
 def get_document_pipeline() -> DocumentPipeline:
@@ -133,7 +139,16 @@ def run_document_pipeline_with_relations(document_id: str) -> dict[str, Any]:
   state = get_document_pipeline().run(document_id)
   if state.get('status') == 'completed' and state.get('document_type') == 'lecture':
     try:
-      get_question_relation_pipeline().link_course(str(state.get('course_id') or ''))
+      relation_result = get_question_relation_pipeline().link_course(
+        str(state.get('course_id') or '')
+      )
+      question_ids = {
+        str(question_id)
+        for document in relation_result.get('documents') or []
+        for question_id in document.get('question_ids') or []
+        if str(question_id or '').strip()
+      }
+      queue_related_assessment_preparations(question_ids)
     except Exception as exc:  # noqa: BLE001
       state['relation_refresh_error'] = str(getattr(exc, 'detail', exc))
   return state
@@ -142,7 +157,8 @@ def run_document_pipeline_with_relations(document_id: str) -> dict[str, Any]:
 def refresh_question_document_relations(document_id: str) -> str:
   """Refresh optional relations without turning successful indexing into a 500."""
   try:
-    get_question_relation_pipeline().link_document(document_id)
+    result = get_question_relation_pipeline().link_document(document_id)
+    queue_related_assessment_preparations(set(result.get('question_ids') or []))
   except Exception as exc:  # noqa: BLE001
     return str(getattr(exc, 'detail', exc))
   return ''
@@ -150,7 +166,14 @@ def refresh_question_document_relations(document_id: str) -> str:
 
 def refresh_course_question_relations(course_id: str) -> str:
   try:
-    get_question_relation_pipeline().link_course(course_id)
+    result = get_question_relation_pipeline().link_course(course_id)
+    question_ids = {
+      str(question_id)
+      for document in result.get('documents') or []
+      for question_id in document.get('question_ids') or []
+      if str(question_id or '').strip()
+    }
+    queue_related_assessment_preparations(question_ids)
   except Exception as exc:  # noqa: BLE001
     return str(getattr(exc, 'detail', exc))
   return ''
@@ -174,6 +197,19 @@ def queue_question_relation_refresh(document_id: str) -> None:
 def queue_missing_question_relation_refreshes() -> None:
   for document_id in get_question_relation_pipeline().missing_document_ids():
     queue_question_relation_refresh(document_id)
+
+
+def queue_assessment_preparation_resume() -> None:
+  """Resume durable assessment work after relation recovery, without blocking startup."""
+  future = relation_executor.submit(resume_assessment_preparations)
+
+  def report_failure(completed_future) -> None:
+    try:
+      completed_future.result()
+    except Exception as exc:  # noqa: BLE001
+      print(f'Assessment preparation resume failed: {exc}')
+
+  future.add_done_callback(report_failure)
 
 
 def _delete_document_relations(document_id: str) -> None:
@@ -236,6 +272,30 @@ async def run_pipeline_task(function, *args, **kwargs):
   return await loop.run_in_executor(pipeline_executor, partial(function, *args, **kwargs))
 
 
+def resume_question_pipeline_once() -> int:
+  """Prevent refresh-triggered recovery checks from running concurrently."""
+  global question_resume_running
+  with question_resume_lock:
+    if question_resume_running:
+      return 0
+    question_resume_running = True
+  try:
+    return get_question_pipeline().resume_pending()
+  finally:
+    with question_resume_lock:
+      question_resume_running = False
+
+
+def schedule_question_pipeline_resume() -> asyncio.Task:
+  """Queue one non-blocking recovery pass shared by startup and page refreshes."""
+  global question_resume_task
+  if question_resume_task is None or question_resume_task.done():
+    question_resume_task = asyncio.create_task(
+      run_pipeline_task(resume_question_pipeline_once),
+    )
+  return question_resume_task
+
+
 @asynccontextmanager
 async def application_lifespan(_app):
   global document_pipeline, question_pipeline, question_relation_pipeline, chat_context_retriever
@@ -265,9 +325,10 @@ async def application_lifespan(_app):
     local_mineru_service.start()
     resume_tasks = [
       asyncio.create_task(run_pipeline_task(document_pipeline.resume_pending)),
-      asyncio.create_task(run_pipeline_task(question_pipeline.resume_pending)),
+      schedule_question_pipeline_resume(),
     ]
     queue_missing_question_relation_refreshes()
+    queue_assessment_preparation_resume()
     yield
   finally:
     if resume_tasks:
@@ -444,6 +505,20 @@ async def process_question_document(
   return result
 
 
+@backend_router.post('/api/questions/resume-pending')
+async def resume_pending_question_documents() -> dict[str, Any]:
+  """Recheck interrupted question jobs when the web app is opened or refreshed."""
+  pipeline = get_question_pipeline()
+  pending_count = len(await asyncio.to_thread(pipeline.pending_document_ids))
+  if pending_count:
+    schedule_question_pipeline_resume()
+  return {
+    'checked': True,
+    'pending_count': pending_count,
+    'message': '未处理题目已加入恢复检查。' if pending_count else '没有需要恢复的题目。',
+  }
+
+
 @backend_router.post('/api/questions/{document_id}/retry')
 async def retry_question_document(document_id: str) -> dict[str, Any]:
   state = await run_pipeline_task(get_question_pipeline().run, document_id)
@@ -486,21 +561,33 @@ async def update_question_relation_config(payload: dict[str, Any] = Body(...)) -
 
 @backend_router.post('/api/question-relations/documents/{document_id}/run')
 async def run_question_document_relations(document_id: str) -> dict[str, Any]:
-  return await run_pipeline_task(get_question_relation_pipeline().link_document, document_id)
+  result = await run_pipeline_task(get_question_relation_pipeline().link_document, document_id)
+  queue_related_assessment_preparations(set(result.get('question_ids') or []))
+  return result
 
 
 @backend_router.post('/api/question-relations/documents/{document_id}/questions/{question_id}/run')
 async def run_single_question_relations(document_id: str, question_id: str) -> dict[str, Any]:
-  return await run_pipeline_task(
+  result = await run_pipeline_task(
     get_question_relation_pipeline().link_document_question,
     document_id,
     question_id,
   )
+  queue_related_assessment_preparations({question_id})
+  return result
 
 
 @backend_router.post('/api/question-relations/courses/{course_id}/run')
 async def run_course_question_relations(course_id: str) -> dict[str, Any]:
-  return await run_pipeline_task(get_question_relation_pipeline().link_course, course_id)
+  result = await run_pipeline_task(get_question_relation_pipeline().link_course, course_id)
+  question_ids = {
+    str(question_id)
+    for document in result.get('documents') or []
+    for question_id in document.get('question_ids') or []
+    if str(question_id or '').strip()
+  }
+  queue_related_assessment_preparations(question_ids)
+  return result
 
 
 @backend_router.get('/api/question-relations/questions/{question_id}')

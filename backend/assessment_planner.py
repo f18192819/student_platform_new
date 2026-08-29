@@ -290,6 +290,20 @@ class AssessmentPlanner:
   ) -> QuestionReferenceAnswer | None:
     return self.store.get_question_reference_answer(course_id, question_id)
 
+  def preparation_fingerprint(
+    self,
+    *,
+    course_id: str,
+    question_id: str,
+    prompt: str,
+    reference_answer: str,
+    analysis: dict[str, Any],
+  ) -> str:
+    """Fingerprint the effective source without invoking any model."""
+    saved_answer = self.store.get_question_reference_answer(course_id, question_id)
+    effective_answer = saved_answer.answer_text if saved_answer else str(reference_answer or '').strip()
+    return self._fingerprint(prompt, effective_answer, analysis)
+
   def save_user_correction(
     self,
     *,
@@ -303,26 +317,12 @@ class AssessmentPlanner:
     normalized = str(answer_text or '').strip()
     if not normalized:
       raise HTTPException(status_code=422, detail='修正后的参考答案不能为空。')
-    planned = self._request_plan(prompt, normalized, analysis)
-    if planned is None:
-      raise HTTPException(status_code=502, detail='无法验证修正后的参考答案，请稍后重试。')
-    fingerprint = self._fingerprint(prompt, normalized, analysis)
-    spec = self._materialize(question_id, fingerprint, prompt, normalized, planned)
     answer = QuestionReferenceAnswer(
       question_id=question_id,
       source_document_id=source_document_id,
       answer_text=normalized,
       structured_answer={
         'complete_answer': normalized,
-        'parts': [
-          {
-            'id': f'part-{index}',
-            'prompt': part.prompt,
-            'assessment_type': part.type,
-            'answer': part.reference_excerpt,
-          }
-          for index, part in enumerate(planned.parts, start=1)
-        ],
         'correction_source': 'user',
       },
       answer_source='user_corrected',
@@ -332,18 +332,6 @@ class AssessmentPlanner:
     )
     saved = self.store.save_question_reference_answer(course_id, answer)
     self.store.delete_assessment_spec(course_id, question_id)
-    spec.reference_answer = normalized
-    spec.reference_answer_source = 'user_corrected'
-    spec.reference_answer_confidence = 1.0
-    spec.reference_answer_needs_review = False
-    spec.reference_answer_updated_at = saved.updated_at
-    self.store.save_assessment_spec(
-      course_id,
-      question_id,
-      source_document_id,
-      fingerprint,
-      spec.model_dump(),
-    )
     return saved
 
   @staticmethod
