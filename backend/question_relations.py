@@ -751,6 +751,17 @@ class QuestionRelationPipeline:
   ) -> dict[str, Any]:
     """Return original questions related to any real page in one lecture."""
     questions: dict[str, dict[str, Any]] = {}
+    valid_page_numbers = {
+      int(page.get('page_number') or 0)
+      for page in self._lecture_pages(lecture_document_id)
+      if int(page.get('page_number') or 0) > 0
+    }
+    if not valid_page_numbers:
+      return {
+        'course_id': course_id,
+        'lecture_document_id': lecture_document_id,
+        'questions': [],
+      }
     if not self.relations_dir.is_dir():
       return {
         'course_id': course_id,
@@ -770,7 +781,7 @@ class QuestionRelationPipeline:
         if str(target.get('document_id') or '') != lecture_document_id:
           continue
         page_number = int(target.get('page_number') or 0)
-        if page_number <= 0:
+        if page_number not in valid_page_numbers:
           continue
         matching_relations.append(relation)
       if not matching_relations:
@@ -1480,3 +1491,4 @@ class QuestionRelationPipeline:
         'content': payload.get('content'),
       },
     }
+

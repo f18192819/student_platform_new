@@ -41,6 +41,8 @@ class LearningEvent(BaseModel):
   score: float = Field(ge=0.0, le=1.0)
   response_time_ms: int = Field(default=0, ge=0)
   response_text: str = ''
+  structured_responses: list[dict[str, Any]] = Field(default_factory=list)
+  part_grading_results: list[dict[str, Any]] = Field(default_factory=list)
   grading_method: str
   grading_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
   grading_feedback: str = ''
@@ -72,6 +74,22 @@ class ConceptMastery(BaseModel):
   evidence_count: int = Field(ge=0)
   weighted_evidence: float = Field(ge=0.0)
   correct_streak: int = Field(ge=0)
+
+
+class QuestionReferenceAnswer(BaseModel):
+  """Durable answer projection used when source material has no complete solution."""
+
+  model_config = ConfigDict(extra='forbid')
+  question_id: str
+  source_document_id: str
+  answer_text: str
+  structured_answer: dict[str, Any] = Field(default_factory=dict)
+  answer_source: Literal['ai_generated', 'user_corrected']
+  model: str = ''
+  confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+  needs_review: bool = False
+  created_at: str = Field(default_factory=_now)
+  updated_at: str = Field(default_factory=_now)
 
 
 def project_concept_mastery(
@@ -218,6 +236,135 @@ class LearningStateStore:
       self._insert_event(connection, event)
     return event
 
+  def get_assessment_spec(
+    self,
+    course_id: str,
+    question_id: str,
+    source_fingerprint: str,
+  ) -> dict[str, Any] | None:
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        '''
+        SELECT spec_json FROM assessment_specs
+        WHERE question_id = ? AND source_fingerprint = ?
+        ''',
+        (question_id, source_fingerprint),
+      ).fetchone()
+    if not row:
+      return None
+    try:
+      payload = json.loads(row['spec_json'])
+    except (TypeError, ValueError):
+      return None
+    return payload if isinstance(payload, dict) else None
+
+  def save_assessment_spec(
+    self,
+    course_id: str,
+    question_id: str,
+    source_document_id: str,
+    source_fingerprint: str,
+    spec: dict[str, Any],
+  ) -> None:
+    timestamp = _now()
+    with self._connect(course_id) as connection:
+      connection.execute(
+        '''
+        INSERT INTO assessment_specs (
+          question_id, source_document_id, source_fingerprint, spec_json,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(question_id) DO UPDATE SET
+          source_document_id = excluded.source_document_id,
+          source_fingerprint = excluded.source_fingerprint,
+          spec_json = excluded.spec_json,
+          updated_at = excluded.updated_at
+        ''',
+        (
+          question_id,
+          source_document_id,
+          source_fingerprint,
+          json.dumps(spec, ensure_ascii=False),
+          timestamp,
+          timestamp,
+        ),
+      )
+
+  def delete_assessment_spec(self, course_id: str, question_id: str) -> None:
+    with self._connect(course_id) as connection:
+      connection.execute(
+        'DELETE FROM assessment_specs WHERE question_id = ?',
+        (question_id,),
+      )
+
+  def get_question_reference_answer(
+    self,
+    course_id: str,
+    question_id: str,
+  ) -> QuestionReferenceAnswer | None:
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        'SELECT * FROM question_reference_answers WHERE question_id = ?',
+        (question_id,),
+      ).fetchone()
+    if not row:
+      return None
+    try:
+      structured = json.loads(row['structured_answer_json'])
+    except (TypeError, ValueError):
+      structured = {}
+    return QuestionReferenceAnswer(
+      question_id=str(row['question_id']),
+      source_document_id=str(row['source_document_id']),
+      answer_text=str(row['answer_text']),
+      structured_answer=structured if isinstance(structured, dict) else {},
+      answer_source=str(row['answer_source']),
+      model=str(row['model']),
+      confidence=float(row['confidence']),
+      needs_review=bool(row['needs_review']),
+      created_at=str(row['created_at']),
+      updated_at=str(row['updated_at']),
+    )
+
+  def save_question_reference_answer(
+    self,
+    course_id: str,
+    answer: QuestionReferenceAnswer,
+  ) -> QuestionReferenceAnswer:
+    timestamp = _now()
+    answer.updated_at = timestamp
+    with self._connect(course_id) as connection:
+      connection.execute(
+        '''
+        INSERT INTO question_reference_answers (
+          question_id, source_document_id, answer_text, structured_answer_json,
+          answer_source, model, confidence, needs_review, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(question_id) DO UPDATE SET
+          source_document_id = excluded.source_document_id,
+          answer_text = excluded.answer_text,
+          structured_answer_json = excluded.structured_answer_json,
+          answer_source = excluded.answer_source,
+          model = excluded.model,
+          confidence = excluded.confidence,
+          needs_review = excluded.needs_review,
+          updated_at = excluded.updated_at
+        ''',
+        (
+          answer.question_id,
+          answer.source_document_id,
+          answer.answer_text,
+          json.dumps(answer.structured_answer, ensure_ascii=False),
+          answer.answer_source,
+          answer.model,
+          answer.confidence,
+          int(answer.needs_review),
+          answer.created_at,
+          timestamp,
+        ),
+      )
+    return answer
+
   def record_answer(
     self,
     event: LearningEvent,
@@ -278,6 +425,14 @@ class LearningStateStore:
       )
       connection.execute(
         'DELETE FROM adaptive_test_sessions WHERE lecture_document_id = ?',
+        (document_id,),
+      )
+      connection.execute(
+        'DELETE FROM assessment_specs WHERE source_document_id = ?',
+        (document_id,),
+      )
+      connection.execute(
+        'DELETE FROM question_reference_answers WHERE source_document_id = ?',
         (document_id,),
       )
 
@@ -365,8 +520,33 @@ class LearningStateStore:
       );
       CREATE INDEX IF NOT EXISTS idx_test_sessions_lecture
         ON adaptive_test_sessions(course_id, lecture_document_id, status);
+      CREATE TABLE IF NOT EXISTS assessment_specs (
+        question_id TEXT PRIMARY KEY,
+        source_document_id TEXT NOT NULL DEFAULT '',
+        source_fingerprint TEXT NOT NULL,
+        spec_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_assessment_specs_document
+        ON assessment_specs(source_document_id);
+      CREATE TABLE IF NOT EXISTS question_reference_answers (
+        question_id TEXT PRIMARY KEY,
+        source_document_id TEXT NOT NULL DEFAULT '',
+        answer_text TEXT NOT NULL,
+        structured_answer_json TEXT NOT NULL DEFAULT '{}',
+        answer_source TEXT NOT NULL CHECK(answer_source IN ('ai_generated', 'user_corrected')),
+        model TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 1.0,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_question_reference_answers_document
+        ON question_reference_answers(source_document_id);
       '''
     )
+    connection.execute('PRAGMA optimize')
 
     event_columns = {
       str(row['name'])
@@ -408,6 +588,19 @@ class LearningStateStore:
       );
       '''
     )
+
+    event_columns = {
+      str(row['name'])
+      for row in connection.execute('PRAGMA table_info(learning_events)').fetchall()
+    }
+    if 'structured_responses' not in event_columns:
+      connection.execute(
+        "ALTER TABLE learning_events ADD COLUMN structured_responses TEXT NOT NULL DEFAULT '[]'"
+      )
+    if 'part_grading_results' not in event_columns:
+      connection.execute(
+        "ALTER TABLE learning_events ADD COLUMN part_grading_results TEXT NOT NULL DEFAULT '[]'"
+      )
 
     if needs_revision_migration:
       connection.execute(
@@ -463,10 +656,11 @@ class LearningStateStore:
       INSERT INTO learning_events (
         id, course_id, lecture_document_id, test_session_id, question_id,
         source_type, source_document_id, knowledge_points, difficulty, correct,
-        score, response_time_ms, response_text, grading_method,
+        score, response_time_ms, response_text, structured_responses,
+        part_grading_results, grading_method,
         grading_confidence, grading_feedback, revision, supersedes_event_id,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ''',
       (
         event.id,
@@ -482,6 +676,8 @@ class LearningStateStore:
         event.score,
         event.response_time_ms,
         event.response_text,
+        json.dumps(event.structured_responses, ensure_ascii=False),
+        json.dumps(event.part_grading_results, ensure_ascii=False),
         event.grading_method,
         event.grading_confidence,
         event.grading_feedback,
@@ -523,6 +719,8 @@ class LearningStateStore:
       score=row['score'],
       response_time_ms=row['response_time_ms'],
       response_text=row['response_text'],
+      structured_responses=json.loads(row['structured_responses'] or '[]'),
+      part_grading_results=json.loads(row['part_grading_results'] or '[]'),
       grading_method=row['grading_method'],
       grading_confidence=row['grading_confidence'],
       grading_feedback=row['grading_feedback'],
@@ -530,3 +728,4 @@ class LearningStateStore:
       supersedes_event_id=row['supersedes_event_id'],
       created_at=row['created_at'],
     )
+
