@@ -1252,14 +1252,16 @@ class QuestionPipeline:
     for document_id in document_ids:
       self.delete(document_id)
 
-  def resume_pending(self) -> None:
+  def pending_document_ids(self) -> list[str]:
+    """Return recoverable jobs without touching completed or failed jobs."""
     if not QUESTION_DOCUMENTS_ROOT.is_dir():
-      return
+      return []
+    pending: list[str] = []
     for directory in QUESTION_DOCUMENTS_ROOT.iterdir():
       if not directory.is_dir():
         continue
       state = self._read(directory / 'state.json')
-      if state.get('status') not in {
+      if state.get('status') in {
         'queued',
         'parsing',
         'extracting_questions',
@@ -1267,6 +1269,17 @@ class QuestionPipeline:
         'embedding',
         'vector',
       }:
+        pending.append(str(state.get('document_id') or directory.name))
+    return pending
+
+  def resume_pending(self) -> int:
+    resumed_count = 0
+    for document_id in self.pending_document_ids():
+      directory = self._dir(document_id)
+      if not QUESTION_DOCUMENTS_ROOT.is_dir():
+        return resumed_count
+      state = self._read(directory / 'state.json')
+      if not state:
         continue
       updated_at = float(state.get('updated_at') or 0)
       if updated_at and time.time() - updated_at > QUESTION_RESUME_MAX_AGE_SECONDS:
@@ -1279,7 +1292,9 @@ class QuestionPipeline:
         })
         self._write(directory / 'state.json', state)
         continue
-      self.run(str(state.get('document_id') or directory.name))
+      self.run(document_id)
+      resumed_count += 1
+    return resumed_count
 
   @staticmethod
   def _active_stage(state: dict[str, Any]) -> str:

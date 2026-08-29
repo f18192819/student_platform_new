@@ -730,6 +730,44 @@ class QuestionRelationPipeline:
     )
     return result
 
+  def assessment_relation_targets(
+    self,
+    question_ids: set[str] | None = None,
+  ) -> list[dict[str, Any]]:
+    """List questions that have at least one persisted relation to a real lecture page."""
+    selected = {
+      str(value or '').strip()
+      for value in question_ids or set()
+      if str(value or '').strip()
+    }
+    if question_ids is not None and not selected:
+      return []
+    targets: list[dict[str, Any]] = []
+    paths = sorted(self.relations_dir.glob('*.json')) if self.relations_dir.is_dir() else []
+    for path in paths:
+      record = _read_json(path, {})
+      if not isinstance(record, dict) or record.get('status') != 'completed':
+        continue
+      question_id = str(record.get('question_id') or '').strip()
+      if not question_id or (selected and question_id not in selected):
+        continue
+      lecture_document_ids: set[str] = set()
+      for relation in record.get('relations') or []:
+        if not isinstance(relation, dict) or relation.get('relation_type') != 'question_to_lecture_page':
+          continue
+        target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
+        document_id = str(target.get('document_id') or '').strip()
+        if document_id and int(target.get('page_number') or 0) > 0:
+          lecture_document_ids.add(document_id)
+      if lecture_document_ids:
+        targets.append({
+          'course_id': str(record.get('course_id') or '').strip(),
+          'question_id': question_id,
+          'source_document_id': str(record.get('question_document_id') or '').strip(),
+          'lecture_document_ids': sorted(lecture_document_ids),
+        })
+    return targets
+
   def lecture_page_relations(
     self,
     course_id: str,
@@ -1491,4 +1529,3 @@ class QuestionRelationPipeline:
         'content': payload.get('content'),
       },
     }
-
