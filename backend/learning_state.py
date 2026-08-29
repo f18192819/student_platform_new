@@ -76,6 +76,22 @@ class ConceptMastery(BaseModel):
   correct_streak: int = Field(ge=0)
 
 
+class QuestionReferenceAnswer(BaseModel):
+  """Durable answer projection used when source material has no complete solution."""
+
+  model_config = ConfigDict(extra='forbid')
+  question_id: str
+  source_document_id: str
+  answer_text: str
+  structured_answer: dict[str, Any] = Field(default_factory=dict)
+  answer_source: Literal['ai_generated', 'user_corrected']
+  model: str = ''
+  confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+  needs_review: bool = False
+  created_at: str = Field(default_factory=_now)
+  updated_at: str = Field(default_factory=_now)
+
+
 def project_concept_mastery(
   events: list[LearningEvent],
   known_concepts: list[str] | None = None,
@@ -274,6 +290,81 @@ class LearningStateStore:
         ),
       )
 
+  def delete_assessment_spec(self, course_id: str, question_id: str) -> None:
+    with self._connect(course_id) as connection:
+      connection.execute(
+        'DELETE FROM assessment_specs WHERE question_id = ?',
+        (question_id,),
+      )
+
+  def get_question_reference_answer(
+    self,
+    course_id: str,
+    question_id: str,
+  ) -> QuestionReferenceAnswer | None:
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        'SELECT * FROM question_reference_answers WHERE question_id = ?',
+        (question_id,),
+      ).fetchone()
+    if not row:
+      return None
+    try:
+      structured = json.loads(row['structured_answer_json'])
+    except (TypeError, ValueError):
+      structured = {}
+    return QuestionReferenceAnswer(
+      question_id=str(row['question_id']),
+      source_document_id=str(row['source_document_id']),
+      answer_text=str(row['answer_text']),
+      structured_answer=structured if isinstance(structured, dict) else {},
+      answer_source=str(row['answer_source']),
+      model=str(row['model']),
+      confidence=float(row['confidence']),
+      needs_review=bool(row['needs_review']),
+      created_at=str(row['created_at']),
+      updated_at=str(row['updated_at']),
+    )
+
+  def save_question_reference_answer(
+    self,
+    course_id: str,
+    answer: QuestionReferenceAnswer,
+  ) -> QuestionReferenceAnswer:
+    timestamp = _now()
+    answer.updated_at = timestamp
+    with self._connect(course_id) as connection:
+      connection.execute(
+        '''
+        INSERT INTO question_reference_answers (
+          question_id, source_document_id, answer_text, structured_answer_json,
+          answer_source, model, confidence, needs_review, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(question_id) DO UPDATE SET
+          source_document_id = excluded.source_document_id,
+          answer_text = excluded.answer_text,
+          structured_answer_json = excluded.structured_answer_json,
+          answer_source = excluded.answer_source,
+          model = excluded.model,
+          confidence = excluded.confidence,
+          needs_review = excluded.needs_review,
+          updated_at = excluded.updated_at
+        ''',
+        (
+          answer.question_id,
+          answer.source_document_id,
+          answer.answer_text,
+          json.dumps(answer.structured_answer, ensure_ascii=False),
+          answer.answer_source,
+          answer.model,
+          answer.confidence,
+          int(answer.needs_review),
+          answer.created_at,
+          timestamp,
+        ),
+      )
+    return answer
+
   def record_answer(
     self,
     event: LearningEvent,
@@ -338,6 +429,10 @@ class LearningStateStore:
       )
       connection.execute(
         'DELETE FROM assessment_specs WHERE source_document_id = ?',
+        (document_id,),
+      )
+      connection.execute(
+        'DELETE FROM question_reference_answers WHERE source_document_id = ?',
         (document_id,),
       )
 
@@ -435,8 +530,23 @@ class LearningStateStore:
       );
       CREATE INDEX IF NOT EXISTS idx_assessment_specs_document
         ON assessment_specs(source_document_id);
+      CREATE TABLE IF NOT EXISTS question_reference_answers (
+        question_id TEXT PRIMARY KEY,
+        source_document_id TEXT NOT NULL DEFAULT '',
+        answer_text TEXT NOT NULL,
+        structured_answer_json TEXT NOT NULL DEFAULT '{}',
+        answer_source TEXT NOT NULL CHECK(answer_source IN ('ai_generated', 'user_corrected')),
+        model TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 1.0,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_question_reference_answers_document
+        ON question_reference_answers(source_document_id);
       '''
     )
+    connection.execute('PRAGMA optimize')
 
     event_columns = {
       str(row['name'])

@@ -1389,6 +1389,32 @@
   margin: 16px 0 22px;
 }
 
+.mastery-reference-notice {
+  display: grid;
+  gap: 4px;
+  margin: -6px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid #f0d49a;
+  border-radius: 14px;
+  color: #76531d;
+  background: #fff9ea;
+}
+
+.mastery-reference-notice strong {
+  font-size: 13px;
+}
+
+.mastery-reference-notice span {
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.mastery-reference-notice--verified {
+  border-color: #bfe3d5;
+  color: #17684f;
+  background: #f0faf6;
+}
+
 .mastery-assessment-parts {
   display: grid;
   gap: 14px;
@@ -1642,6 +1668,83 @@
 
 .mastery-saved-answer details .mastery-test__source-text {
   margin-top: 12px;
+}
+
+.mastery-saved-answer > .mastery-reference-correction {
+  display: grid;
+  align-items: stretch;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.mastery-reference-correction > button,
+.mastery-reference-correction > div button {
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid #cad9ec;
+  border-radius: 12px;
+  cursor: pointer;
+  color: #385474;
+  background: #f8fbff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.mastery-reference-correction > button {
+  justify-self: start;
+}
+
+.mastery-reference-correction label {
+  display: grid;
+  gap: 8px;
+}
+
+.mastery-reference-correction label span {
+  color: #385474;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.mastery-reference-correction textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 12px 14px;
+  border: 1px solid #cfdbec;
+  border-radius: 14px;
+  outline: none;
+  color: #1d3151;
+  background: #ffffff;
+  font: inherit;
+  line-height: 1.6;
+}
+
+.mastery-reference-correction textarea:focus {
+  border-color: #64a6ff;
+  box-shadow: 0 0 0 4px rgba(22, 119, 255, 0.1);
+}
+
+.mastery-reference-correction > div {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.mastery-reference-correction > div .primary-button {
+  border-color: transparent;
+  color: #ffffff;
+  background: #1677ff;
+}
+
+.mastery-reference-update-notice {
+  margin: 0 0 14px;
+  padding: 10px 13px;
+  border-radius: 12px;
+  color: #17684f;
+  background: #edf9f4;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .mastery-question__actions {

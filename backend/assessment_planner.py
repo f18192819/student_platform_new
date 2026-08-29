@@ -13,12 +13,12 @@ import requests
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .learning_state import LearningStateStore
+from .learning_state import LearningStateStore, QuestionReferenceAnswer
 from .question_pipeline import QuestionAnalyzer
 from .runtime_config import load_api_config
 
 DEFAULT_NUMERIC_TOLERANCE = 1e-6
-ASSESSMENT_POLICY_VERSION = 'task-inventory-v3'
+ASSESSMENT_POLICY_VERSION = 'generated-reference-answer-v5'
 _NUMBER = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$')
 _FRACTION = re.compile(r'^([+-]?\d+)\s*/\s*([+-]?\d+)$')
 _LATEX_FRACTION = re.compile(r'^\\frac\s*\{([+-]?\d+)\}\s*\{([+-]?\d+)\}$')
@@ -61,11 +61,22 @@ class AssessmentSpec(BaseModel):
   question_id: str
   source_fingerprint: str
   parts: list[AssessmentPart] = Field(min_length=1)
+  reference_answer: str = ''
+  reference_answer_source: Literal['original', 'ai_generated', 'user_corrected'] = 'original'
+  reference_answer_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+  reference_answer_needs_review: bool = False
+  reference_answer_updated_at: str = ''
   created_at: str = Field(default_factory=_now)
 
   def public_payload(self) -> dict[str, Any]:
     return {
       'question_id': self.question_id,
+      'reference_answer_info': {
+        'source': self.reference_answer_source,
+        'confidence': self.reference_answer_confidence,
+        'needs_review': self.reference_answer_needs_review,
+        'updated_at': self.reference_answer_updated_at,
+      },
       'parts': [
         {
           'id': part.id,
@@ -109,6 +120,24 @@ class AssessmentTaskInventory(BaseModel):
   model_config = ConfigDict(extra='forbid')
   task_count: int = Field(ge=1, le=10)
   tasks: list[AssessmentTask] = Field(min_length=1, max_length=10)
+  reference_complete: bool
+  uncovered_requirements: list[str] = Field(max_length=10)
+
+
+class GeneratedAnswerPart(BaseModel):
+  model_config = ConfigDict(extra='forbid')
+  id: str = Field(min_length=1, max_length=80)
+  prompt: str = Field(min_length=1, max_length=1200)
+  answer_kind: Literal['expression', 'numeric', 'objective', 'text']
+  answer: str = Field(min_length=1, max_length=12000)
+
+
+class GeneratedReferenceAnswer(BaseModel):
+  model_config = ConfigDict(extra='forbid')
+  complete_answer: str = Field(min_length=1, max_length=30000)
+  parts: list[GeneratedAnswerPart] = Field(min_length=1, max_length=10)
+  confidence: float = Field(ge=0.0, le=1.0)
+  assumptions: list[str] = Field(default_factory=list, max_length=10)
 
 
 class DistractorPlan(BaseModel):
@@ -141,7 +170,31 @@ class AssessmentPlanner:
     reference_answer: str,
     analysis: dict[str, Any],
   ) -> AssessmentSpec:
-    fingerprint = self._fingerprint(prompt, reference_answer, analysis)
+    saved_answer = self.store.get_question_reference_answer(course_id, question_id)
+    effective_answer = saved_answer.answer_text if saved_answer else str(reference_answer or '').strip()
+    answer_source: Literal['original', 'ai_generated', 'user_corrected'] = (
+      saved_answer.answer_source if saved_answer else 'original'
+    )
+    answer_confidence = saved_answer.confidence if saved_answer else 1.0
+    answer_needs_review = saved_answer.needs_review if saved_answer else False
+    answer_updated_at = saved_answer.updated_at if saved_answer else ''
+
+    if not effective_answer:
+      saved_answer = self._generate_and_save_reference_answer(
+        course_id=course_id,
+        source_document_id=source_document_id,
+        question_id=question_id,
+        prompt=prompt,
+        partial_answer='',
+        analysis=analysis,
+      )
+      effective_answer = saved_answer.answer_text
+      answer_source = saved_answer.answer_source
+      answer_confidence = saved_answer.confidence
+      answer_needs_review = saved_answer.needs_review
+      answer_updated_at = saved_answer.updated_at
+
+    fingerprint = self._fingerprint(prompt, effective_answer, analysis)
     cached = self.store.get_assessment_spec(course_id, question_id, fingerprint)
     if cached:
       try:
@@ -149,13 +202,43 @@ class AssessmentPlanner:
       except ValidationError:
         pass
 
-    planned = self._request_plan(prompt, reference_answer, analysis)
+    try:
+      planned = self._request_plan(prompt, effective_answer, analysis)
+    except HTTPException as exc:
+      if exc.status_code != 422 or answer_source == 'user_corrected':
+        raise
+      saved_answer = self._generate_and_save_reference_answer(
+        course_id=course_id,
+        source_document_id=source_document_id,
+        question_id=question_id,
+        prompt=prompt,
+        partial_answer=effective_answer,
+        analysis=analysis,
+      )
+      effective_answer = saved_answer.answer_text
+      answer_source = saved_answer.answer_source
+      answer_confidence = saved_answer.confidence
+      answer_needs_review = saved_answer.needs_review
+      answer_updated_at = saved_answer.updated_at
+      fingerprint = self._fingerprint(prompt, effective_answer, analysis)
+      cached = self.store.get_assessment_spec(course_id, question_id, fingerprint)
+      if cached:
+        try:
+          return AssessmentSpec.model_validate(cached)
+        except ValidationError:
+          pass
+      planned = self._request_plan(prompt, effective_answer, analysis)
     if planned is None:
       raise HTTPException(
         status_code=502,
         detail='AI 子问盘点失败，未生成不完整测验。请稍后重试。',
       )
-    spec = self._materialize(question_id, fingerprint, prompt, reference_answer, planned)
+    spec = self._materialize(question_id, fingerprint, prompt, effective_answer, planned)
+    spec.reference_answer = effective_answer
+    spec.reference_answer_source = answer_source
+    spec.reference_answer_confidence = answer_confidence
+    spec.reference_answer_needs_review = answer_needs_review
+    spec.reference_answer_updated_at = answer_updated_at
     self.store.save_assessment_spec(
       course_id,
       question_id,
@@ -164,6 +247,69 @@ class AssessmentPlanner:
       spec.model_dump(),
     )
     return spec
+
+  def saved_reference_answer(
+    self,
+    course_id: str,
+    question_id: str,
+  ) -> QuestionReferenceAnswer | None:
+    return self.store.get_question_reference_answer(course_id, question_id)
+
+  def save_user_correction(
+    self,
+    *,
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    prompt: str,
+    answer_text: str,
+    analysis: dict[str, Any],
+  ) -> QuestionReferenceAnswer:
+    normalized = str(answer_text or '').strip()
+    if not normalized:
+      raise HTTPException(status_code=422, detail='修正后的参考答案不能为空。')
+    planned = self._request_plan(prompt, normalized, analysis)
+    if planned is None:
+      raise HTTPException(status_code=502, detail='无法验证修正后的参考答案，请稍后重试。')
+    fingerprint = self._fingerprint(prompt, normalized, analysis)
+    spec = self._materialize(question_id, fingerprint, prompt, normalized, planned)
+    answer = QuestionReferenceAnswer(
+      question_id=question_id,
+      source_document_id=source_document_id,
+      answer_text=normalized,
+      structured_answer={
+        'complete_answer': normalized,
+        'parts': [
+          {
+            'id': f'part-{index}',
+            'prompt': part.prompt,
+            'assessment_type': part.type,
+            'answer': part.reference_excerpt,
+          }
+          for index, part in enumerate(planned.parts, start=1)
+        ],
+        'correction_source': 'user',
+      },
+      answer_source='user_corrected',
+      model='',
+      confidence=1.0,
+      needs_review=False,
+    )
+    saved = self.store.save_question_reference_answer(course_id, answer)
+    self.store.delete_assessment_spec(course_id, question_id)
+    spec.reference_answer = normalized
+    spec.reference_answer_source = 'user_corrected'
+    spec.reference_answer_confidence = 1.0
+    spec.reference_answer_needs_review = False
+    spec.reference_answer_updated_at = saved.updated_at
+    self.store.save_assessment_spec(
+      course_id,
+      question_id,
+      source_document_id,
+      fingerprint,
+      spec.model_dump(),
+    )
+    return saved
 
   @staticmethod
   def _fingerprint(prompt: str, reference_answer: str, analysis: dict[str, Any]) -> str:
@@ -178,6 +324,117 @@ class AssessmentPlanner:
       sort_keys=True,
     )
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+  def _generate_and_save_reference_answer(
+    self,
+    *,
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    prompt: str,
+    partial_answer: str,
+    analysis: dict[str, Any],
+  ) -> QuestionReferenceAnswer:
+    generated, model = self._request_generated_reference_answer(
+      prompt,
+      partial_answer,
+      analysis,
+    )
+    complete_answer = generated.complete_answer.strip()
+    compact_complete = re.sub(r'\s+', '', complete_answer)
+    missing_parts = [
+      part for part in generated.parts
+      if re.sub(r'\s+', '', part.answer) not in compact_complete
+    ]
+    if missing_parts:
+      complete_answer = '\n\n'.join([
+        complete_answer,
+        *(
+          f'### {part.prompt}\n\n{part.answer}'
+          for part in missing_parts
+        ),
+      ])
+    answer = QuestionReferenceAnswer(
+      question_id=question_id,
+      source_document_id=source_document_id,
+      answer_text=complete_answer,
+      structured_answer=generated.model_dump(),
+      answer_source='ai_generated',
+      model=model,
+      confidence=generated.confidence,
+      needs_review=True,
+    )
+    return self.store.save_question_reference_answer(course_id, answer)
+
+  @staticmethod
+  def _request_generated_reference_answer(
+    prompt: str,
+    partial_answer: str,
+    analysis: dict[str, Any],
+  ) -> tuple[GeneratedReferenceAnswer, str]:
+    config = load_api_config() or {}
+    base_url = str(config.get('baseUrl') or '').strip()
+    api_key = str(config.get('apiKey') or '').strip()
+    model = str(config.get('model') or '').strip()
+    if not base_url or not api_key or not model:
+      raise HTTPException(
+        status_code=422,
+        detail='生成参考答案需要先配置文本处理模型。',
+      )
+
+    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
+    schema = GeneratedReferenceAnswer.model_json_schema()
+    payload = {
+      'model': model,
+      'temperature': 0.1,
+      'response_format': {
+        'type': 'json_schema',
+        'json_schema': {'name': 'generated_reference_answer', 'strict': True, 'schema': schema},
+      },
+      'messages': [
+        {
+          'role': 'system',
+          'content': (
+            '你是严谨的课程题目解答器。原题没有参考答案或现有答案只覆盖部分子问，请独立完成整道题。'
+            '必须先枚举题干要求回答的全部独立任务，再逐项给出答案，不能只做最后一问，不能遗漏并列对象或物理量。'
+            '数学表达式使用可渲染的 LaTeX；数值保留单位和必要精度；解释题给出关键推理。'
+            'complete_answer 必须是一份完整、可作为评分依据的 Markdown 解答，并包含 parts 中每一项的答案。'
+            'parts 中每项填写稳定 id、面向学生的任务 prompt、answer_kind 和该项完整答案。'
+            '已有部分答案只能作为线索，需要自行校验；发现错误时应纠正，不能盲目续写。'
+            '若题目信息或图像细节不足，基于题干中明确条件作答，在 assumptions 中说明假设并降低 confidence。'
+            '不要声称答案来自教材或教师；只返回符合 JSON Schema 的 JSON。'
+          ),
+        },
+        {
+          'role': 'user',
+          'content': json.dumps({
+            'question_prompt': prompt[:18000],
+            'existing_partial_answer': partial_answer[:12000],
+            'question_analysis': analysis,
+            'json_schema': schema,
+          }, ensure_ascii=False),
+        },
+      ],
+    }
+    for attempt in range(2):
+      if attempt:
+        payload['response_format'] = {'type': 'json_object'}
+      try:
+        response = requests.post(
+          f'{root}/chat/completions',
+          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+          json=payload,
+          timeout=180,
+        )
+        response.raise_for_status()
+        content = response.json()['choices'][0]['message']['content']
+        generated = GeneratedReferenceAnswer.model_validate(
+          QuestionAnalyzer._extract_json_object(str(content))
+        )
+        return generated, model
+      except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+        continue
+    raise HTTPException(status_code=502, detail='AI 参考答案生成失败，请稍后重试。')
 
   def _request_plan(
     self,
@@ -214,6 +471,9 @@ class AssessmentPlanner:
             '有唯一短结论、判断、枚举或概念选择的客观答案为 objective；解释、证明、原因和开放论述为 text。'
             '每个 reference_excerpt 必须逐字摘自真实参考答案，并且只包含当前任务所需的最小充分答案。'
             '如果题干确实要求解释原因，必须单列 text 任务。prompt 面向学生且不能泄漏答案。'
+            '最后判断参考答案是否覆盖题干要求的全部任务：全部覆盖时 reference_complete=true 且 uncovered_requirements=[]；'
+            '只给出部分子问答案、答案被截断或缺少任何必答项时 reference_complete=false，并在 uncovered_requirements 列出缺失项。'
+            '不能为了让 reference_complete=true 而忽略题干中的子问，也不能为缺失答案的任务虚构 reference_excerpt。'
             '只返回符合 JSON Schema 的 JSON。'
           ),
         },
@@ -250,8 +510,15 @@ class AssessmentPlanner:
           )
           if candidate.task_count != len(candidate.tasks):
             raise ValueError('Assessment task_count does not match tasks.')
+          if not candidate.reference_complete or candidate.uncovered_requirements:
+            raise HTTPException(
+              status_code=422,
+              detail='参考答案未覆盖原题全部子问，已跳过该题。',
+            )
           inventory = candidate
           break
+        except HTTPException:
+          raise
         except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
           continue
       if inventory is None:
@@ -365,7 +632,7 @@ class AssessmentPlanner:
         for item in result.items
         if item.task_id in expected_ids
       }
-      return generated if set(generated) == expected_ids else {}
+      return generated
     except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
       return {}
 
@@ -415,29 +682,27 @@ class AssessmentPlanner:
         },
       ],
     }
-    try:
-      response = requests.post(
-        f'{root}/chat/completions',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json=payload,
-        timeout=60,
-      )
-      if response.status_code >= 400:
+    for attempt in range(2):
+      if attempt:
         payload['response_format'] = {'type': 'json_object'}
+      try:
         response = requests.post(
           f'{root}/chat/completions',
           headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
           json=payload,
-          timeout=60,
+          timeout=90,
         )
-      response.raise_for_status()
-      content = response.json()['choices'][0]['message']['content']
-      result = DistractorPlan.model_validate(
-        QuestionAnalyzer._extract_json_object(str(content))
-      )
-      return result.distractors
-    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
-      return []
+        response.raise_for_status()
+        content = response.json()['choices'][0]['message']['content']
+        result = DistractorPlan.model_validate(
+          QuestionAnalyzer._extract_json_object(str(content))
+        )
+        valid = self._valid_distractors(correct_answer, result.distractors)
+        if len(valid) == 3:
+          return valid
+      except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+        continue
+    return []
 
   def _materialize(
     self,
@@ -467,9 +732,9 @@ class AssessmentPlanner:
           reference_answer,
           self._request_distractors(reference_answer, prompt, 'expression'),
         )
-        parts = [choice] if choice else [
-          self._text_part('part-1', '请输入你的最终表达式。', 1.0, reference_answer)
-        ]
+        if choice is None:
+          raise HTTPException(status_code=502, detail='表达式选项生成失败，请重试。')
+        parts = [choice]
       else:
         parts = [self._text_part('part-1', '简要说明你的结论或思路。', 1.0, reference_answer)]
       return AssessmentSpec(question_id=question_id, source_fingerprint=fingerprint, parts=parts)
@@ -479,8 +744,10 @@ class AssessmentPlanner:
       part_id = f'part-{index}'
       reference = self._validated_excerpt(item.reference_excerpt, reference_answer)
       if not reference:
-        materialized.append(self._text_part(part_id, item.prompt, item.weight, reference_answer))
-        continue
+        raise HTTPException(
+          status_code=502,
+          detail=f'{item.prompt} 的参考答案定位失败，未缓存不完整测验，请重试。',
+        )
       numeric = self.parse_numeric(reference)
       if numeric is not None:
         materialized.append(AssessmentPart(
@@ -517,6 +784,10 @@ class AssessmentPlanner:
         if choice:
           materialized.append(choice)
           continue
+        raise HTTPException(
+          status_code=502,
+          detail=f'{item.prompt} 的选择项生成失败，未缓存不完整测验，请重试。',
+        )
       if item.uncertain:
         materialized.append(self._text_part(part_id, item.prompt, item.weight, reference))
         continue

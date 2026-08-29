@@ -26,6 +26,13 @@ export type AssessmentResponse = {
   value: string
 }
 
+export type ReferenceAnswerInfo = {
+  source: 'original' | 'ai_generated' | 'user_corrected'
+  confidence: number
+  needs_review: boolean
+  updated_at: string
+}
+
 export type PartGradingResult = {
   part_id: string
   type: 'choice' | 'numeric' | 'text' | string
@@ -49,6 +56,7 @@ export type AdaptiveTestQuestion = {
   images: AdaptiveTestQuestionImage[]
   assessment_spec?: {
     question_id: string
+    reference_answer_info: ReferenceAnswerInfo
     parts: AssessmentPart[]
   }
   reference_answer?: string
@@ -152,6 +160,7 @@ export type AdaptiveTestPayload = {
   saved_answer?: AdaptiveTestAnswer
   result?: AdaptiveTestResult
   skipped_ungradable_questions?: number
+  reference_answer_update?: ReferenceAnswerInfo & { question_id: string }
 }
 
 async function readPayload(response: Response): Promise<AdaptiveTestPayload> {
@@ -221,6 +230,23 @@ export async function submitAdaptiveAnswer(
       body: JSON.stringify(legacyAnswer === undefined
         ? { question_id: questionId, responses, response_time_ms: responseTimeMs }
         : { question_id: questionId, answer: legacyAnswer, response_time_ms: responseTimeMs }),
+    },
+  ))
+}
+
+export async function correctAdaptiveReferenceAnswer(
+  sessionId: string,
+  questionId: string,
+  answerText: string,
+) {
+  return readPayload(await fetch(
+    resolveBackendApiUrl(
+      `/api/adaptive-tests/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(questionId)}/reference-answer`,
+    ),
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer_text: answerText }),
     },
   ))
 }

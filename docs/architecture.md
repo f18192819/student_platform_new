@@ -64,6 +64,14 @@ question fingerprint and stored in the same course SQLite database. Choice and
 numeric parts are graded deterministically; only short-text parts may call the
 configured text model. A mixed-part submission still produces one learning
 event so it contributes one unit of evidence to mastery projection.
+When a real source question has no reference answer, or its answer omits a
+required subtask, the assessment planner may generate a complete structured
+reference answer with the configured text model. These answers live in
+`question_reference_answers`, retain their model, confidence, and review
+status, and are never exposed before the student submits an answer. A user
+correction replaces this answer projection, invalidates the cached assessment
+spec, and requires a new answer revision; it does not rewrite prior
+`LearningEvent` evidence.
 
 ### Providers and Storage
 

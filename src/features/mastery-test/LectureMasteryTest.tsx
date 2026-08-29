@@ -6,6 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import remarkMath from 'remark-math'
 
 import {
+  correctAdaptiveReferenceAnswer,
   getActiveAdaptiveTest,
   startAdaptiveTest,
   submitAdaptiveAnswer,
@@ -106,6 +107,9 @@ export function LectureMasteryTest({
   const [selectedQuestionId, setSelectedQuestionId] = useState('')
   const [draftAnswers, setDraftAnswers] = useState<DraftResponses>({})
   const [error, setError] = useState('')
+  const [referenceDraft, setReferenceDraft] = useState('')
+  const [editingReferenceQuestionId, setEditingReferenceQuestionId] = useState('')
+  const [referenceUpdateNotice, setReferenceUpdateNotice] = useState('')
   const [showResults, setShowResults] = useState(false)
   const questionStartedAt = useRef(Date.now())
 
@@ -179,6 +183,8 @@ export function LectureMasteryTest({
     setSelectedQuestionId(questionId)
     setShowResults(false)
     setError('')
+    setEditingReferenceQuestionId('')
+    setReferenceUpdateNotice('')
     questionStartedAt.current = Date.now()
   }
 
@@ -245,6 +251,40 @@ export function LectureMasteryTest({
       setShowResults(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '答案评分失败，请稍后重试。')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const saveReferenceCorrection = async () => {
+    if (!payload || !currentQuestion || !savedAnswer || !referenceDraft.trim() || isLoading) {
+      return
+    }
+    setError('')
+    setReferenceUpdateNotice('')
+    setIsLoading(true)
+    try {
+      const next = await correctAdaptiveReferenceAnswer(
+        payload.session.id,
+        currentQuestion.question_id,
+        referenceDraft.trim(),
+      )
+      const refreshedQuestion = next.questions.find(
+        (question) => question.question_id === currentQuestion.question_id,
+      ) ?? next.current_question
+      const emptyResponses = Object.fromEntries(
+        assessmentParts(refreshedQuestion).map((part) => [part.id, '']),
+      )
+      setPayload(next)
+      setDraftAnswers((current) => ({
+        ...current,
+        [currentQuestion.question_id]: emptyResponses,
+      }))
+      setEditingReferenceQuestionId('')
+      setReferenceUpdateNotice('参考答案已校正，作答结构已重新生成。请重新完成本题并提交新版评分。')
+      questionStartedAt.current = Date.now()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '参考答案修正失败，请稍后重试。')
     } finally {
       setIsLoading(false)
     }
@@ -472,6 +512,20 @@ export function LectureMasteryTest({
                 <div className="mastery-question__concepts">
                   {currentQuestion.knowledge_points.map((concept) => <span key={concept}>{concept}</span>)}
                 </div>
+                {currentQuestion.assessment_spec?.reference_answer_info.source === 'ai_generated' ? (
+                  <aside className="mastery-reference-notice" role="status">
+                    <strong>此题参考答案由 AI 补全</strong>
+                    <span>
+                      生成置信度 {percentage(currentQuestion.assessment_spec.reference_answer_info.confidence)}，
+                      AI 内容可能有误；提交后可查看并校正参考答案。
+                    </span>
+                  </aside>
+                ) : currentQuestion.assessment_spec?.reference_answer_info.source === 'user_corrected' ? (
+                  <aside className="mastery-reference-notice mastery-reference-notice--verified" role="status">
+                    <strong>参考答案已由用户校正</strong>
+                    <span>当前题型、选项和评分依据已按校正后的答案重新生成。</span>
+                  </aside>
+                ) : null}
                 <section className="mastery-assessment-parts" aria-label="本题作答部分">
                   {currentAssessmentParts.map((part, index) => {
                     const partResult = savedAnswer?.part_grading_results?.find(
@@ -563,7 +617,56 @@ export function LectureMasteryTest({
                       <summary>查看参考解答</summary>
                       <SourceText>{savedAnswer.reference_answer}</SourceText>
                     </details>
+                    {currentQuestion.assessment_spec?.reference_answer_info.source !== 'original' ? (
+                      <div className="mastery-reference-correction">
+                        {editingReferenceQuestionId === currentQuestion.question_id ? (
+                          <>
+                            <label>
+                              <span>校正后的完整参考答案</span>
+                              <textarea
+                                value={referenceDraft}
+                                onChange={(event) => setReferenceDraft(event.currentTarget.value)}
+                                rows={7}
+                                disabled={isLoading}
+                              />
+                            </label>
+                            <div>
+                              <button
+                                type="button"
+                                onClick={() => setEditingReferenceQuestionId('')}
+                                disabled={isLoading}
+                              >
+                                取消
+                              </button>
+                              <button
+                                type="button"
+                                className="primary-button"
+                                onClick={() => void saveReferenceCorrection()}
+                                disabled={isLoading || !referenceDraft.trim()}
+                              >
+                                {isLoading ? '正在验证并重建题目…' : '保存校正并重新生成题目'}
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReferenceDraft(savedAnswer.reference_answer)
+                              setEditingReferenceQuestionId(currentQuestion.question_id)
+                              setReferenceUpdateNotice('')
+                            }}
+                            disabled={isLoading}
+                          >
+                            修正参考答案
+                          </button>
+                        )}
+                      </div>
+                    ) : null}
                   </section>
+                ) : null}
+                {referenceUpdateNotice ? (
+                  <p className="mastery-reference-update-notice">{referenceUpdateNotice}</p>
                 ) : null}
                 {error ? <p className="mastery-test__inline-error">{error}</p> : null}
                 <div className="mastery-question__actions">

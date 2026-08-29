@@ -70,6 +70,11 @@ class SubmitAdaptiveAnswerRequest(BaseModel):
     return self
 
 
+class CorrectReferenceAnswerRequest(BaseModel):
+  model_config = ConfigDict(extra='forbid')
+  answer_text: str = Field(min_length=1, max_length=30000)
+
+
 class GradingResult(BaseModel):
   model_config = ConfigDict(extra='forbid')
   score: float = Field(ge=0.0, le=1.0)
@@ -263,6 +268,15 @@ class AdaptiveTestingService:
         candidate_question_ids=[str(item['question_id']) for item in candidates],
       )
       session.current_question_id = self._select_next(session, candidates)
+      if not session.current_question_id:
+        raise HTTPException(
+          status_code=422,
+          detail='没有找到可生成可靠测验结构的关联题目，请检查文本处理模型配置后重试。',
+        )
+      session.target_question_count = min(
+        session.target_question_count,
+        len(session.candidate_question_ids),
+      )
       self.store.create_session(session)
       payload = self._session_payload(session, candidates)
       payload['skipped_ungradable_questions'] = skipped
@@ -303,6 +317,7 @@ class AdaptiveTestingService:
         raise HTTPException(status_code=409, detail='Only the current adaptive question can be answered for the first time.')
 
       assessment_spec = self._assessment_spec(session.course_id, candidate)
+      candidate['reference_answer'] = assessment_spec.reference_answer
       grading, structured_responses, response_text = self._grade_submission(
         candidate,
         assessment_spec,
@@ -351,6 +366,48 @@ class AdaptiveTestingService:
         'reference_answer': str(candidate['reference_answer'])[:12000],
       }
       return response
+
+  def correct_reference_answer(
+    self,
+    session_id: str,
+    question_id: str,
+    request: CorrectReferenceAnswerRequest,
+  ) -> dict[str, Any]:
+    with self._lock:
+      session = self._require_session(session_id)
+      answered_ids = {
+        event.question_id
+        for event in self.store.effective_session_events(session.course_id, session.id)
+      }
+      if question_id not in answered_ids:
+        raise HTTPException(status_code=409, detail='提交本题答案后才能修正参考答案。')
+
+      candidates, _ = self._candidates(session.course_id, session.lecture_document_id)
+      candidate = next(
+        (item for item in candidates if str(item.get('question_id') or '') == question_id),
+        None,
+      )
+      if candidate is None:
+        raise HTTPException(status_code=404, detail='没有找到该题目的原始数据。')
+
+      saved = self.assessment_planner.save_user_correction(
+        course_id=session.course_id,
+        source_document_id=str(candidate.get('document_id') or ''),
+        question_id=question_id,
+        prompt=str(candidate.get('prompt') or ''),
+        answer_text=request.answer_text,
+        analysis=candidate.get('_analysis') if isinstance(candidate.get('_analysis'), dict) else {},
+      )
+      candidate['reference_answer'] = saved.answer_text
+      payload = self._session_payload(session, candidates)
+      payload['reference_answer_update'] = {
+        'question_id': question_id,
+        'source': saved.answer_source,
+        'confidence': saved.confidence,
+        'needs_review': saved.needs_review,
+        'updated_at': saved.updated_at,
+      }
+      return payload
 
   def _grade_submission(
     self,
@@ -518,7 +575,14 @@ class AdaptiveTestingService:
       difficulty_payload = analysis.get('difficulty') if isinstance(analysis.get('difficulty'), dict) else {}
       difficulty = max(1, min(5, int(difficulty_payload.get('level') or 1)))
       prompt, reference_answer, grading_method = split_question_material(question)
-      if not prompt or not reference_answer or not concepts:
+      saved_reference = self.assessment_planner.saved_reference_answer(
+        course_id,
+        str(question.get('question_id') or ''),
+      )
+      if saved_reference:
+        reference_answer = saved_reference.answer_text
+        grading_method = 'llm_reference'
+      if not prompt or not concepts:
         skipped += 1
         continue
       relations = []
@@ -616,7 +680,18 @@ class AdaptiveTestingService:
       )
       return score, str(candidate['question_id'])
 
-    return str(max(remaining, key=priority)['question_id'])
+    for candidate in sorted(remaining, key=priority, reverse=True):
+      question_id = str(candidate['question_id'])
+      try:
+        self._assessment_spec(session.course_id, candidate)
+      except HTTPException:
+        session.candidate_question_ids = [
+          value for value in session.candidate_question_ids
+          if value != question_id
+        ]
+        continue
+      return question_id
+    return None
 
   def _session_payload(
     self,
@@ -627,7 +702,45 @@ class AdaptiveTestingService:
       return {'session': None}
     if candidates is None:
       candidates, _ = self._candidates(session.course_id, session.lecture_document_id)
+    allowed_question_ids = set(session.candidate_question_ids)
+    candidates = [
+      candidate for candidate in candidates
+      if str(candidate.get('question_id') or '') in allowed_question_ids
+    ]
     candidate_by_id = {str(item['question_id']): item for item in candidates}
+    if session.status == 'active' and session.current_question_id:
+      current = candidate_by_id.get(session.current_question_id)
+      try:
+        if current is None:
+          raise HTTPException(status_code=422, detail='Current assessment source is unavailable.')
+        self._assessment_spec(session.course_id, current)
+      except HTTPException:
+        invalid_question_id = str(session.current_question_id)
+        session.candidate_question_ids = [
+          value for value in session.candidate_question_ids
+          if value != invalid_question_id
+        ]
+        candidates = [
+          candidate for candidate in candidates
+          if str(candidate.get('question_id') or '') != invalid_question_id
+        ]
+        session.current_question_id = self._select_next(session, candidates)
+        session.target_question_count = min(
+          session.target_question_count,
+          len(session.candidate_question_ids),
+        )
+        if not session.current_question_id:
+          raise HTTPException(
+            status_code=422,
+            detail='没有找到可生成可靠测验结构的关联题目，请检查文本处理模型配置后重试。',
+          )
+        self.store.save_session(session)
+        allowed_question_ids = set(session.candidate_question_ids)
+        candidates = [
+          candidate for candidate in candidates
+          if str(candidate.get('question_id') or '') in allowed_question_ids
+        ]
+        candidate_by_id = {str(item['question_id']): item for item in candidates}
     events = self.store.effective_session_events(session.course_id, session.id)
     unlocked_ids = list(dict.fromkeys([
       *session.asked_question_ids,
@@ -746,6 +859,7 @@ class AdaptiveTestingService:
 
   def _public_question(self, candidate: dict[str, Any], course_id: str) -> dict[str, Any]:
     assessment = self._assessment_spec(course_id, candidate)
+    candidate['reference_answer'] = assessment.reference_answer
     return {
       'question_id': str(candidate.get('question_id') or ''),
       'source_type': str(candidate.get('source_type') or ''),
@@ -836,6 +950,20 @@ async def submit_adaptive_test_answer(
   request: SubmitAdaptiveAnswerRequest = Body(...),
 ) -> dict[str, Any]:
   return await asyncio.to_thread(_get_service().submit, session_id, request)
+
+
+@adaptive_testing_router.put('/{session_id}/questions/{question_id}/reference-answer')
+async def correct_adaptive_test_reference_answer(
+  session_id: str,
+  question_id: str,
+  request: CorrectReferenceAnswerRequest = Body(...),
+) -> dict[str, Any]:
+  return await asyncio.to_thread(
+    _get_service().correct_reference_answer,
+    session_id,
+    question_id,
+    request,
+  )
 
 
 @adaptive_testing_router.delete('/{session_id}')
