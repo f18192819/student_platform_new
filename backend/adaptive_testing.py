@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .assessment_planner import AssessmentPart, AssessmentPlanner, AssessmentSpec
+from .assessment_preparation import AssessmentPreparationCoordinator
 from .learning_state import (
   AdaptiveTestSession,
   LearningEvent,
@@ -247,6 +248,11 @@ class AdaptiveTestingService:
     self.store = store or LearningStateStore()
     self.grader = grader or ConfiguredQuestionGrader()
     self.assessment_planner = AssessmentPlanner(self.store)
+    self.assessment_preparation = AssessmentPreparationCoordinator(
+      self._assessment_spec,
+      self._cached_assessment_spec,
+      max_workers=2,
+    )
     self._lock = threading.RLock()
 
   def start(self, request: StartAdaptiveTestRequest) -> dict[str, Any]:
@@ -268,11 +274,6 @@ class AdaptiveTestingService:
         candidate_question_ids=[str(item['question_id']) for item in candidates],
       )
       session.current_question_id = self._select_next(session, candidates)
-      if not session.current_question_id:
-        raise HTTPException(
-          status_code=422,
-          detail='没有找到可生成可靠测验结构的关联题目，请检查文本处理模型配置后重试。',
-        )
       session.target_question_count = min(
         session.target_question_count,
         len(session.candidate_question_ids),
@@ -316,7 +317,9 @@ class AdaptiveTestingService:
       if not is_revision and (session.status != 'active' or question_id != session.current_question_id):
         raise HTTPException(status_code=409, detail='Only the current adaptive question can be answered for the first time.')
 
-      assessment_spec = self._assessment_spec(session.course_id, candidate)
+      assessment_spec = self._cached_assessment_spec(session.course_id, candidate)
+      if assessment_spec is None:
+        raise HTTPException(status_code=409, detail='本题作答结构尚未准备完成，请稍后重试。')
       candidate['reference_answer'] = assessment_spec.reference_answer
       grading, structured_responses, response_text = self._grade_submission(
         candidate,
@@ -538,6 +541,19 @@ class AdaptiveTestingService:
       analysis=candidate.get('_analysis') if isinstance(candidate.get('_analysis'), dict) else {},
     )
 
+  def _cached_assessment_spec(
+    self,
+    course_id: str,
+    candidate: dict[str, Any],
+  ) -> AssessmentSpec | None:
+    return self.assessment_planner.get_cached(
+      course_id=course_id,
+      question_id=str(candidate.get('question_id') or ''),
+      prompt=str(candidate.get('prompt') or ''),
+      reference_answer=str(candidate.get('reference_answer') or ''),
+      analysis=candidate.get('_analysis') if isinstance(candidate.get('_analysis'), dict) else {},
+    )
+
   def cancel(self, session_id: str) -> dict[str, Any]:
     with self._lock:
       session = self._require_session(session_id)
@@ -680,18 +696,32 @@ class AdaptiveTestingService:
       )
       return score, str(candidate['question_id'])
 
-    for candidate in sorted(remaining, key=priority, reverse=True):
-      question_id = str(candidate['question_id'])
-      try:
-        self._assessment_spec(session.course_id, candidate)
-      except HTTPException:
-        session.candidate_question_ids = [
-          value for value in session.candidate_question_ids
-          if value != question_id
-        ]
-        continue
-      return question_id
+    ranked = sorted(remaining, key=priority, reverse=True)
+    for candidate in ranked:
+      if self._cached_assessment_spec(session.course_id, candidate) is not None:
+        self._prefetch_assessments(session.course_id, ranked, exclude={str(candidate['question_id'])})
+        return str(candidate['question_id'])
+    self._prefetch_assessments(session.course_id, ranked)
     return None
+
+  def _prefetch_assessments(
+    self,
+    course_id: str,
+    candidates: list[dict[str, Any]],
+    exclude: set[str] | None = None,
+  ) -> None:
+    excluded = exclude or set()
+    scheduled = 0
+    for candidate in candidates:
+      if str(candidate.get('question_id') or '') in excluded:
+        continue
+      status = self.assessment_preparation.status(course_id, candidate)
+      if status.state in {'ready', 'failed'}:
+        continue
+      self.assessment_preparation.schedule(course_id, candidate)
+      scheduled += 1
+      if scheduled >= 3:
+        break
 
   def _session_payload(
     self,
@@ -708,39 +738,24 @@ class AdaptiveTestingService:
       if str(candidate.get('question_id') or '') in allowed_question_ids
     ]
     candidate_by_id = {str(item['question_id']): item for item in candidates}
-    if session.status == 'active' and session.current_question_id:
-      current = candidate_by_id.get(session.current_question_id)
-      try:
-        if current is None:
-          raise HTTPException(status_code=422, detail='Current assessment source is unavailable.')
-        self._assessment_spec(session.course_id, current)
-      except HTTPException:
-        invalid_question_id = str(session.current_question_id)
+    if session.status == 'active':
+      current = candidate_by_id.get(session.current_question_id or '')
+      if session.current_question_id and current is None:
         session.candidate_question_ids = [
-          value for value in session.candidate_question_ids
-          if value != invalid_question_id
+          question_id for question_id in session.candidate_question_ids
+          if question_id != session.current_question_id
         ]
-        candidates = [
-          candidate for candidate in candidates
-          if str(candidate.get('question_id') or '') != invalid_question_id
-        ]
-        session.current_question_id = self._select_next(session, candidates)
         session.target_question_count = min(
           session.target_question_count,
-          len(session.candidate_question_ids),
+          max(1, len(session.candidate_question_ids)),
         )
-        if not session.current_question_id:
-          raise HTTPException(
-            status_code=422,
-            detail='没有找到可生成可靠测验结构的关联题目，请检查文本处理模型配置后重试。',
-          )
+        session.current_question_id = None
+      current_ready = bool(
+        current and self._cached_assessment_spec(session.course_id, current) is not None
+      )
+      if not current_ready:
+        session.current_question_id = self._select_next(session, candidates)
         self.store.save_session(session)
-        allowed_question_ids = set(session.candidate_question_ids)
-        candidates = [
-          candidate for candidate in candidates
-          if str(candidate.get('question_id') or '') in allowed_question_ids
-        ]
-        candidate_by_id = {str(item['question_id']): item for item in candidates}
     events = self.store.effective_session_events(session.course_id, session.id)
     unlocked_ids = list(dict.fromkeys([
       *session.asked_question_ids,
@@ -767,6 +782,7 @@ class AdaptiveTestingService:
         self._public_answer(event, candidate_by_id.get(event.question_id))
         for event in events
       ],
+      'preparation': self._preparation_payload(session, candidates),
     }
     if session.status == 'completed':
       payload['result'] = self._result(session, candidates, events)
@@ -858,7 +874,9 @@ class AdaptiveTestingService:
     return ranked[:10]
 
   def _public_question(self, candidate: dict[str, Any], course_id: str) -> dict[str, Any]:
-    assessment = self._assessment_spec(course_id, candidate)
+    assessment = self._cached_assessment_spec(course_id, candidate)
+    if assessment is None:
+      raise HTTPException(status_code=409, detail='AssessmentSpec is not ready.')
     candidate['reference_answer'] = assessment.reference_answer
     return {
       'question_id': str(candidate.get('question_id') or ''),
@@ -873,6 +891,56 @@ class AdaptiveTestingService:
       'images': list(candidate.get('images') or []),
       'assessment_spec': assessment.public_payload(),
     }
+
+  def _preparation_payload(
+    self,
+    session: AdaptiveTestSession,
+    candidates: list[dict[str, Any]],
+  ) -> dict[str, Any]:
+    asked = set(session.asked_question_ids)
+    remaining = [
+      candidate for candidate in candidates
+      if str(candidate.get('question_id') or '') not in asked
+    ]
+    statuses = [
+      self.assessment_preparation.status(session.course_id, candidate)
+      for candidate in remaining
+    ]
+    ready = sum(status.state == 'ready' for status in statuses)
+    preparing = sum(status.state == 'preparing' for status in statuses)
+    failed = [status.error for status in statuses if status.state == 'failed']
+    state = 'ready' if session.current_question_id else 'preparing'
+    if not session.current_question_id and failed and not ready and not preparing:
+      state = 'failed'
+    return {
+      'state': state,
+      'ready_count': ready,
+      'preparing_count': preparing,
+      'failed_count': len(failed),
+      'message': failed[0] if state == 'failed' else '',
+    }
+
+  def retry_preparation(self, session_id: str) -> dict[str, Any]:
+    with self._lock:
+      session = self._require_session(session_id)
+      candidates, _ = self._candidates(session.course_id, session.lecture_document_id)
+      asked = set(session.asked_question_ids)
+      retried = 0
+      for candidate in candidates:
+        if str(candidate.get('question_id') or '') in asked:
+          continue
+        if self.assessment_preparation.status(session.course_id, candidate).state == 'failed':
+          self.assessment_preparation.retry(session.course_id, candidate)
+          retried += 1
+          if retried >= 3:
+            break
+      if not session.current_question_id:
+        session.current_question_id = self._select_next(session, candidates)
+        self.store.save_session(session)
+      return self._session_payload(session, candidates)
+
+  def close(self) -> None:
+    self.assessment_preparation.close()
 
   @staticmethod
   def _public_answer(event: LearningEvent, candidate: dict[str, Any] | None) -> dict[str, Any]:
@@ -899,6 +967,8 @@ _service: AdaptiveTestingService | None = None
 
 def configure_adaptive_testing(relation_pipeline: QuestionRelationPipeline | None) -> None:
   global _service
+  if _service is not None:
+    _service.close()
   _service = AdaptiveTestingService(relation_pipeline, store=_store) if relation_pipeline else None
 
 
@@ -950,6 +1020,11 @@ async def submit_adaptive_test_answer(
   request: SubmitAdaptiveAnswerRequest = Body(...),
 ) -> dict[str, Any]:
   return await asyncio.to_thread(_get_service().submit, session_id, request)
+
+
+@adaptive_testing_router.post('/{session_id}/preparation/retry')
+async def retry_adaptive_test_preparation(session_id: str) -> dict[str, Any]:
+  return await asyncio.to_thread(_get_service().retry_preparation, session_id)
 
 
 @adaptive_testing_router.put('/{session_id}/questions/{question_id}/reference-answer')

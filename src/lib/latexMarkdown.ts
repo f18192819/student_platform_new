@@ -3,6 +3,24 @@ const DISPLAY_ENVIRONMENT = /\\begin\s*\{(array|aligned|alignedat|cases|gathered
 const RAW_INLINE_LATEX = /(^|[\u3400-\u9fff\uE000-\uF8FF，。；：！？、“”‘’])([^\u3400-\u9fff\uE000-\uF8FF，。；：！？、“”‘’\n]*\\[A-Za-z]+[^\u3400-\u9fff\uE000-\uF8FF，。；：！？、“”‘’\n]*)/gm
 const PLACEHOLDER = '\uE000LATEX_MARKDOWN_'
 
+function stripEquationAnnotations(value: string) {
+  // MinerU and model outputs sometimes retain textbook equation numbers. KaTeX
+  // only accepts \tag in display mode, while most extracted formulas are inline.
+  return value
+    .replace(/\\tag\*?\s*\{[^{}]*\}/g, '')
+    .replace(/\\label\s*\{[^{}]*\}/g, '')
+}
+
+function normalizeTexDelimiters(value: string) {
+  // AI responses frequently use TeX delimiters, but remark-math accepts
+  // Markdown's $...$ / $$...$$ forms only.
+  return value
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_match, formula: string) => (
+      `\n\n$$\n${formula.trim()}\n$$\n\n`
+    ))
+    .replace(/\\\(([^\n]*?)\\\)/g, (_match, formula: string) => `$${formula.trim()}$`)
+}
+
 function protect(
   source: string,
   pattern: RegExp,
@@ -44,7 +62,9 @@ function wrapInlineLatex(source: string) {
 /** Add math delimiters to raw LaTeX emitted by MinerU without touching valid Markdown math. */
 export function prepareMineruMarkdownMath(value: string) {
   const protectedParts: string[] = []
-  let source = String(value || '').replace(/\r\n?/g, '\n')
+  let source = normalizeTexDelimiters(
+    stripEquationAnnotations(String(value || '').replace(/\r\n?/g, '\n')),
+  )
 
   source = protect(source, PROTECTED_MARKDOWN, protectedParts)
   source = protect(
