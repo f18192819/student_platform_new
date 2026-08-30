@@ -338,6 +338,12 @@ class AdaptiveTestingService:
         raise HTTPException(status_code=409, detail='Only the current adaptive question can be answered for the first time.')
 
       assessment_spec = self._cached_assessment_spec(session.course_id, candidate)
+      if assessment_spec is None and previous_event is not None:
+        assessment_spec = self._historical_assessment_spec(
+          session.course_id,
+          candidate,
+          previous_event,
+        )
       if assessment_spec is None:
         raise HTTPException(status_code=409, detail='本题作答结构尚未准备完成，请稍后重试。')
       candidate['reference_answer'] = assessment_spec.reference_answer
@@ -361,6 +367,7 @@ class AdaptiveTestingService:
         response_text=response_text,
         structured_responses=structured_responses,
         part_grading_results=[item.model_dump() for item in grading.parts],
+        assessment_spec_snapshot=assessment_spec.model_dump(),
         grading_method=grading.method,
         grading_confidence=grading.confidence,
         grading_feedback=grading.feedback,
@@ -385,7 +392,7 @@ class AdaptiveTestingService:
       response['grading'] = grading.model_dump()
       response['saved_answer'] = self._public_answer(event, candidate)
       response['answered_question'] = {
-        **self._public_question(candidate, session.course_id),
+        **self._public_question(candidate, session.course_id, assessment_spec),
         'reference_answer': str(candidate['reference_answer'])[:12000],
       }
       return response
@@ -573,6 +580,22 @@ class AdaptiveTestingService:
       prompt=str(candidate.get('prompt') or ''),
       reference_answer=str(candidate.get('reference_answer') or ''),
       analysis=candidate.get('_analysis') if isinstance(candidate.get('_analysis'), dict) else {},
+    )
+
+  def _historical_assessment_spec(
+    self,
+    course_id: str,
+    candidate: dict[str, Any],
+    event: LearningEvent | None = None,
+  ) -> AssessmentSpec | None:
+    if event and event.assessment_spec_snapshot:
+      try:
+        return AssessmentSpec.model_validate(event.assessment_spec_snapshot)
+      except ValidationError:
+        pass
+    return self.assessment_planner.get_latest_cached(
+      course_id=course_id,
+      question_id=str(candidate.get('question_id') or ''),
     )
 
   def _assessment_identity(
@@ -906,10 +929,24 @@ class AdaptiveTestingService:
         ]
         candidate_by_id = {str(item['question_id']): item for item in candidates}
     events = self.store.effective_session_events(session.course_id, session.id)
+    events_by_question = {event.question_id: event for event in events}
     unlocked_ids = list(dict.fromkeys([
       *session.asked_question_ids,
       *([session.current_question_id] if session.current_question_id else []),
     ]))
+    assessments_by_question: dict[str, AssessmentSpec] = {}
+    for question_id in unlocked_ids:
+      candidate = candidate_by_id.get(question_id)
+      if candidate is None:
+        continue
+      event = events_by_question.get(question_id)
+      assessment = (
+        self._historical_assessment_spec(session.course_id, candidate, event)
+        if event is not None
+        else self._cached_assessment_spec(session.course_id, candidate)
+      )
+      if assessment is not None:
+        assessments_by_question[question_id] = assessment
     payload: dict[str, Any] = {
       'session': session.model_dump(),
       'progress': {
@@ -929,12 +966,13 @@ class AdaptiveTestingService:
         ) is not None
       ) else None,
       'questions': [
-        self._public_question(candidate_by_id[question_id], session.course_id)
-        for question_id in unlocked_ids
-        if (
-          question_id in candidate_by_id
-          and self._cached_assessment_spec(session.course_id, candidate_by_id[question_id]) is not None
+        self._public_question(
+          candidate_by_id[question_id],
+          session.course_id,
+          assessments_by_question[question_id],
         )
+        for question_id in unlocked_ids
+        if question_id in candidate_by_id and question_id in assessments_by_question
       ],
       'answers': [
         self._public_answer(event, candidate_by_id.get(event.question_id))
@@ -1031,8 +1069,13 @@ class AdaptiveTestingService:
     ))
     return ranked[:10]
 
-  def _public_question(self, candidate: dict[str, Any], course_id: str) -> dict[str, Any]:
-    assessment = self._cached_assessment_spec(course_id, candidate)
+  def _public_question(
+    self,
+    candidate: dict[str, Any],
+    course_id: str,
+    assessment: AssessmentSpec | None = None,
+  ) -> dict[str, Any]:
+    assessment = assessment or self._cached_assessment_spec(course_id, candidate)
     if assessment is None:
       raise HTTPException(status_code=409, detail='本题作答结构正在准备中，请稍后刷新。')
     candidate['reference_answer'] = assessment.reference_answer
@@ -1212,3 +1255,4 @@ async def correct_adaptive_test_reference_answer(
 @adaptive_testing_router.delete('/{session_id}')
 async def cancel_adaptive_test(session_id: str) -> dict[str, Any]:
   return await asyncio.to_thread(_get_service().cancel, session_id)
+
