@@ -283,6 +283,16 @@ class AssessmentPlanner:
     except ValidationError:
       return None
 
+  def get_latest_cached(self, *, course_id: str, question_id: str) -> AssessmentSpec | None:
+    """Read the last valid spec without requiring the current policy fingerprint."""
+    cached = self.store.get_latest_assessment_spec(course_id, question_id)
+    if not cached:
+      return None
+    try:
+      return AssessmentSpec.model_validate(cached)
+    except ValidationError:
+      return None
+
   def saved_reference_answer(
     self,
     course_id: str,
@@ -973,3 +983,4 @@ class AssessmentPlanner:
     except InvalidOperation:
       return None
     return numeric if numeric.is_finite() else None
+
