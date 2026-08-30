@@ -983,3 +983,4 @@ class AssessmentPlanner:
     except InvalidOperation:
       return None
     return numeric if numeric.is_finite() else None
+

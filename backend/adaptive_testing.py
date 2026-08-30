@@ -865,3 +865,4 @@ async def correct_adaptive_test_reference_answer(
 @adaptive_testing_router.delete('/{session_id}')
 async def cancel_adaptive_test(session_id: str) -> dict[str, Any]:
   return await asyncio.to_thread(_get_service().cancel, session_id)
+

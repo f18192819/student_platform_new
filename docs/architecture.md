@@ -161,3 +161,4 @@ instead.
 - `knowledgeBase.ts` and `ai.ts` remain intentionally broad compatibility
   facades. New stateful frontend behavior belongs in feature hooks/controllers,
   while callers can continue importing the facade during gradual migration.
+

@@ -45,3 +45,4 @@ __all__ = [
   'mount_student_learning_platform_demo_frontend',
   'transcribe_audio_file_with_chunking',
 ]
+
