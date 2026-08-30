@@ -1,33 +1,36 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import threading
 import time
-from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any
 
-import requests
 from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .assessment_planner import AssessmentPart, AssessmentPlanner, AssessmentSpec
+from .adaptive_candidates import CandidateProvider, RelationCandidateProvider, RelationQuestionQuery
+from .adaptive_grading import (
+  GradingResult,
+  ConfiguredQuestionGrader,
+  PartGrader,
+  QuestionGrader,
+  StructuredPartGrader,
+)
+from .assessment_planner import AssessmentPlanner, AssessmentSpec
 from .assessment_preparation import AssessmentPreparationCoordinator
+from .adaptive_results import AdaptiveTestResultAssembler
+from .adaptive_selection import QuestionSelectionStrategy, RuleBasedQuestionSelectionStrategy
+from .learning_repositories import LearningStateRepositories
 from .learning_state import (
   AdaptiveTestSession,
   LearningEvent,
   LearningStateStore,
-  aggregate_mastery,
-  project_concept_mastery,
 )
-from .question_pipeline import QuestionAnalyzer, question_image_attachments, resolve_question_image_asset
-from .question_relations import QuestionRelationPipeline
-from .runtime_config import load_api_config
+from .question_pipeline import resolve_question_image_asset
 
 adaptive_testing_router = APIRouter(prefix='/api/adaptive-tests', tags=['adaptive-testing'])
 LOGGER = logging.getLogger(__name__)
@@ -35,15 +38,6 @@ _REFERENCE_MARKER = re.compile(
   r'(?im)^\s*(?:\d{2,8}\s*)?(?:参考答案|标准答案|解答|答案|解析|solution|answer)\s*[:：]\s*'
 )
 _SEGMENT_ID_LINE = re.compile(r'(?m)^\s*\d{3,8}\s*$')
-_SUPPORTED_SOURCE_TYPES = {
-  'homework',
-  'past-exam',
-  'exercise-set',
-  'lecture-example',
-  'classroom-example',
-}
-
-
 class StartAdaptiveTestRequest(BaseModel):
   model_config = ConfigDict(extra='forbid')
   course_id: str = Field(min_length=1)
@@ -77,36 +71,6 @@ class SubmitAdaptiveAnswerRequest(BaseModel):
 class CorrectReferenceAnswerRequest(BaseModel):
   model_config = ConfigDict(extra='forbid')
   answer_text: str = Field(min_length=1, max_length=30000)
-
-
-class GradingResult(BaseModel):
-  model_config = ConfigDict(extra='forbid')
-  score: float = Field(ge=0.0, le=1.0)
-  correct: bool
-  confidence: float = Field(ge=0.0, le=1.0)
-  feedback: str = Field(max_length=1200)
-  method: str = Field(max_length=80)
-
-
-class PartGradingResult(BaseModel):
-  model_config = ConfigDict(extra='forbid')
-  part_id: str
-  type: str
-  score: float = Field(ge=0.0, le=1.0)
-  correct: bool
-  confidence: float = Field(ge=0.0, le=1.0)
-  feedback: str = Field(max_length=1200)
-  method: str = Field(max_length=80)
-
-
-class StructuredGradingResult(GradingResult):
-  parts: list[PartGradingResult] = Field(default_factory=list)
-
-
-class QuestionGrader(Protocol):
-  def grade(self, candidate: dict[str, Any], answer: str) -> GradingResult: ...
-
-  def grade_text(self, prompt: str, reference: str, answer: str) -> GradingResult: ...
 
 
 def _clean_source_text(value: Any) -> str:
@@ -148,109 +112,30 @@ def split_question_material(question: dict[str, Any]) -> tuple[str, str, str]:
   return content, '', 'ungradable'
 
 
-class ConfiguredQuestionGrader:
-  """Grades subjective answers only; mastery projection remains deterministic code."""
-
-  def grade(self, candidate: dict[str, Any], answer: str) -> GradingResult:
-    method = str(candidate.get('grading_method') or '')
-    reference = str(candidate.get('reference_answer') or '').strip()
-    if method == 'exact_answer':
-      expected = self._normalize_exact(reference)
-      submitted = self._normalize_exact(answer)
-      correct = bool(expected and submitted == expected)
-      return GradingResult(
-        score=1.0 if correct else 0.0,
-        correct=correct,
-        confidence=1.0,
-        feedback='答案匹配。' if correct else '答案与现有标准答案不一致。',
-        method='exact_answer',
-      )
-    if method != 'llm_reference' or not reference:
-      raise HTTPException(status_code=422, detail='This question does not have a reliable grading reference.')
-
-    return self.grade_text(str(candidate.get('prompt') or ''), reference, answer)
-
-  def grade_text(self, prompt: str, reference: str, answer: str) -> GradingResult:
-    if not reference.strip():
-      raise HTTPException(status_code=422, detail='This assessment part has no grading reference.')
-
-    config = load_api_config() or {}
-    base_url = str(config.get('baseUrl') or '').strip()
-    api_key = str(config.get('apiKey') or '').strip()
-    model = str(config.get('model') or '').strip()
-    if not base_url or not api_key or not model:
-      raise HTTPException(status_code=422, detail='Text model configuration is required for subjective grading.')
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
-    schema = GradingResult.model_json_schema()
-    payload = {
-      'model': model,
-      'temperature': 0.0,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'question_grading', 'strict': True, 'schema': schema},
-      },
-      'messages': [
-        {
-          'role': 'system',
-          'content': (
-            '你是严格但允许等价推导和部分分的课程题目评分器。只比较学生答案与题目、参考解答，'
-            '不得因为措辞或推导顺序不同而扣分；关键公式、结论或思路正确即可给相应分数。'
-            'score 为 0 到 1，confidence 表示评分把握。correct 先按 score >= 0.75 返回。'
-            '反馈应简短指出正确部分或首个关键缺失。只返回符合 JSON Schema 的对象。'
-          ),
-        },
-        {
-          'role': 'user',
-          'content': json.dumps({
-            'question': prompt,
-            'reference_answer': reference[:16000],
-            'student_answer': answer,
-            'json_schema': schema,
-          }, ensure_ascii=False),
-        },
-      ],
-    }
-    try:
-      response = requests.post(
-        f'{root}/chat/completions',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json=payload,
-        timeout=90,
-      )
-      if response.status_code >= 400:
-        fallback = {**payload, 'response_format': {'type': 'json_object'}}
-        response = requests.post(
-          f'{root}/chat/completions',
-          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-          json=fallback,
-          timeout=90,
-        )
-      response.raise_for_status()
-      content = response.json()['choices'][0]['message']['content']
-      grading = GradingResult.model_validate(QuestionAnalyzer._extract_json_object(str(content)))
-    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError) as exc:
-      raise HTTPException(status_code=502, detail=f'Text model grading failed: {exc}') from exc
-    # One stable threshold keeps the mastery algorithm independent of provider wording.
-    grading.correct = grading.score >= 0.75
-    grading.method = 'llm_reference'
-    return grading
-
-  @staticmethod
-  def _normalize_exact(value: str) -> str:
-    return re.sub(r'[\s,，。.;；:：]', '', value).casefold()
-
-
 class AdaptiveTestingService:
   def __init__(
     self,
-    relation_pipeline: QuestionRelationPipeline,
+    relation_pipeline: RelationQuestionQuery,
     store: LearningStateStore | None = None,
     grader: QuestionGrader | None = None,
+    repositories: LearningStateRepositories | None = None,
+    candidate_provider: CandidateProvider | None = None,
+    part_grader: PartGrader | None = None,
+    selection_strategy: QuestionSelectionStrategy | None = None,
+    result_assembler: AdaptiveTestResultAssembler | None = None,
   ) -> None:
-    self.relation_pipeline = relation_pipeline
     self.store = store or LearningStateStore()
     self.grader = grader or ConfiguredQuestionGrader()
+    self.part_grader = part_grader or StructuredPartGrader(self.grader)
+    self.repositories = repositories or LearningStateRepositories.from_store(self.store)
+    self.selection_strategy = selection_strategy or RuleBasedQuestionSelectionStrategy()
+    self.result_assembler = result_assembler or AdaptiveTestResultAssembler()
     self.assessment_planner = AssessmentPlanner(self.store)
+    self.candidate_provider = candidate_provider or RelationCandidateProvider(
+      relation_pipeline,
+      self.assessment_planner,
+      split_question_material,
+    )
     self.assessment_preparation = AssessmentPreparationCoordinator(
       self._assessment_spec,
       self._cached_assessment_spec,
@@ -264,7 +149,10 @@ class AdaptiveTestingService:
   def start(self, request: StartAdaptiveTestRequest) -> dict[str, Any]:
     started_at = time.perf_counter()
     with self._lock:
-      existing = self.store.find_active(request.course_id, request.lecture_document_id)
+      existing = self.repositories.sessions.find_active(
+        request.course_id,
+        request.lecture_document_id,
+      )
       if existing:
         return self._session_payload(existing)
       candidates, skipped = self._candidates(request.course_id, request.lecture_document_id)
@@ -285,7 +173,7 @@ class AdaptiveTestingService:
         session.target_question_count,
         len(session.candidate_question_ids),
       )
-      self.store.create_session(session)
+      self.repositories.sessions.create(session)
       payload = self._session_payload(session, candidates)
       payload['skipped_ungradable_questions'] = skipped
       LOGGER.info(
@@ -304,7 +192,7 @@ class AdaptiveTestingService:
       return payload
 
   def active(self, course_id: str, lecture_document_id: str) -> dict[str, Any]:
-    session = self.store.find_active(course_id, lecture_document_id)
+    session = self.repositories.sessions.find_active(course_id, lecture_document_id)
     return self._session_payload(session) if session else {'session': None}
 
   def get(self, session_id: str) -> dict[str, Any]:
@@ -330,7 +218,7 @@ class AdaptiveTestingService:
 
       previous_by_question = {
         event.question_id: event
-        for event in self.store.effective_session_events(session.course_id, session.id)
+        for event in self.repositories.events.for_session(session.course_id, session.id)
       }
       previous_event = previous_by_question.get(question_id)
       is_revision = previous_event is not None
@@ -347,10 +235,11 @@ class AdaptiveTestingService:
       if assessment_spec is None:
         raise HTTPException(status_code=409, detail='本题作答结构尚未准备完成，请稍后重试。')
       candidate['reference_answer'] = assessment_spec.reference_answer
-      grading, structured_responses, response_text = self._grade_submission(
+      grading, structured_responses, response_text = self.part_grader.grade(
         candidate,
         assessment_spec,
-        request,
+        [response.model_dump() for response in request.responses],
+        str(request.answer or '').strip(),
       )
       event = LearningEvent(
         course_id=session.course_id,
@@ -386,7 +275,7 @@ class AdaptiveTestingService:
           session.completed_at = datetime.now(tz=timezone.utc).isoformat()
         else:
           session.current_question_id = self._select_next(session, candidates, pending_event=event)
-      self.store.record_answer(event, session)
+      self.repositories.progress.record(event, session)
 
       response = self._session_payload(session, candidates)
       response['grading'] = grading.model_dump()
@@ -407,7 +296,7 @@ class AdaptiveTestingService:
       session = self._require_session(session_id)
       answered_ids = {
         event.question_id
-        for event in self.store.effective_session_events(session.course_id, session.id)
+        for event in self.repositories.events.for_session(session.course_id, session.id)
       }
       if question_id not in answered_ids:
         raise HTTPException(status_code=409, detail='提交本题答案后才能修正参考答案。')
@@ -439,125 +328,6 @@ class AdaptiveTestingService:
         'updated_at': saved.updated_at,
       }
       return payload
-
-  def _grade_submission(
-    self,
-    candidate: dict[str, Any],
-    assessment_spec: AssessmentSpec,
-    request: SubmitAdaptiveAnswerRequest,
-  ) -> tuple[StructuredGradingResult, list[dict[str, str]], str]:
-    if not request.responses:
-      legacy_answer = str(request.answer or '').strip()
-      legacy = self.grader.grade(candidate, legacy_answer)
-      return (
-        StructuredGradingResult(**legacy.model_dump(), parts=[]),
-        [],
-        legacy_answer,
-      )
-
-    response_by_id = {
-      response.part_id: response.value.strip()
-      for response in request.responses
-      if response.value.strip()
-    }
-    required_ids = {part.id for part in assessment_spec.parts if part.required}
-    if not required_ids.issubset(response_by_id):
-      missing = ', '.join(sorted(required_ids - set(response_by_id)))
-      raise HTTPException(status_code=422, detail=f'Required assessment parts are missing: {missing}')
-    if set(response_by_id) - {part.id for part in assessment_spec.parts}:
-      raise HTTPException(status_code=422, detail='The submission contains an unknown assessment part.')
-
-    part_results: list[PartGradingResult] = []
-    for part in assessment_spec.parts:
-      value = response_by_id.get(part.id, '')
-      if not value and not part.required:
-        continue
-      part_results.append(self._grade_part(candidate, part, value))
-
-    weighted_score = sum(
-      result.score * next(part.weight for part in assessment_spec.parts if part.id == result.part_id)
-      for result in part_results
-    )
-    weighted_confidence = sum(
-      result.confidence * next(part.weight for part in assessment_spec.parts if part.id == result.part_id)
-      for result in part_results
-    )
-    score = round(max(0.0, min(weighted_score, 1.0)), 4)
-    confidence = round(max(0.0, min(weighted_confidence, 1.0)), 4)
-    correct = score >= 0.75
-    feedback = '；'.join(
-      f'{result.part_id}: {result.feedback}' for result in part_results if result.feedback
-    )[:1200]
-    responses = [
-      {'part_id': part.id, 'value': response_by_id.get(part.id, '')}
-      for part in assessment_spec.parts
-      if part.id in response_by_id
-    ]
-    response_text = '\n'.join(
-      f'{item["part_id"]}: {item["value"]}' for item in responses
-    )
-    return (
-      StructuredGradingResult(
-        score=score,
-        correct=correct,
-        confidence=confidence,
-        feedback=feedback,
-        method='structured_parts',
-        parts=part_results,
-      ),
-      responses,
-      response_text,
-    )
-
-  def _grade_part(
-    self,
-    candidate: dict[str, Any],
-    part: AssessmentPart,
-    value: str,
-  ) -> PartGradingResult:
-    if part.type == 'choice':
-      correct = bool(part.correct_option_id and value == part.correct_option_id)
-      return PartGradingResult(
-        part_id=part.id,
-        type=part.type,
-        score=1.0 if correct else 0.0,
-        correct=correct,
-        confidence=1.0,
-        feedback='选择正确。' if correct else '选择错误。',
-        method='choice_exact',
-      )
-    if part.type == 'numeric':
-      submitted = AssessmentPlanner.parse_numeric(value)
-      expected = AssessmentPlanner.parse_numeric(str(part.expected_value or ''))
-      correct = False
-      if submitted is not None and expected is not None:
-        tolerance = Decimal(str(part.tolerance or 0.0))
-        allowed_error = max(tolerance, abs(expected) * tolerance)
-        correct = abs(submitted - expected) <= allowed_error
-      return PartGradingResult(
-        part_id=part.id,
-        type=part.type,
-        score=1.0 if correct else 0.0,
-        correct=correct,
-        confidence=1.0,
-        feedback='数值正确。' if correct else '数值不正确或格式无法识别。',
-        method='numeric_tolerance',
-      )
-
-    grading = self.grader.grade_text(
-      f'{candidate.get("prompt") or ""}\n\n当前作答部分：{part.prompt}',
-      part.reference_answer,
-      value,
-    )
-    return PartGradingResult(
-      part_id=part.id,
-      type=part.type,
-      score=grading.score,
-      correct=grading.correct,
-      confidence=grading.confidence,
-      feedback=grading.feedback,
-      method='llm_reference',
-    )
 
   def _assessment_spec(self, course_id: str, candidate: dict[str, Any]) -> AssessmentSpec:
     return self.assessment_planner.get_or_create(
@@ -616,7 +386,7 @@ class AdaptiveTestingService:
 
   def queue_related_assessments(self, question_ids: set[str] | None = None) -> dict[str, int]:
     """Queue specs for related questions without waiting for any model request."""
-    targets = self.relation_pipeline.assessment_relation_targets(question_ids)
+    targets = self.candidate_provider.assessment_targets(question_ids)
     queued = ready = failed = 0
     seen: set[tuple[str, str]] = set()
     for target in targets:
@@ -666,11 +436,11 @@ class AdaptiveTestingService:
         session.status = 'cancelled'
         session.current_question_id = None
         session.completed_at = datetime.now(tz=timezone.utc).isoformat()
-        self.store.save_session(session)
+        self.repositories.sessions.save(session)
       return self._session_payload(session)
 
   def _require_session(self, session_id: str) -> AdaptiveTestSession:
-    session = self.store.find_session(session_id)
+    session = self.repositories.sessions.find(session_id)
     if not session:
       raise HTTPException(status_code=404, detail='Adaptive test session not found.')
     return session
@@ -680,73 +450,7 @@ class AdaptiveTestingService:
     course_id: str,
     lecture_document_id: str,
   ) -> tuple[list[dict[str, Any]], int]:
-    related = self.relation_pipeline.lecture_document_questions(course_id, lecture_document_id)
-    candidates: list[dict[str, Any]] = []
-    skipped = 0
-    for question in related.get('questions') or []:
-      document_type = str(question.get('document_type') or '')
-      if document_type not in _SUPPORTED_SOURCE_TYPES:
-        continue
-      analysis = question.get('analysis') if isinstance(question.get('analysis'), dict) else {}
-      concepts = list(dict.fromkeys(
-        str(value or '').strip()
-        for value in analysis.get('knowledge_points') or []
-        if str(value or '').strip()
-      ))
-      difficulty_payload = analysis.get('difficulty') if isinstance(analysis.get('difficulty'), dict) else {}
-      difficulty = max(1, min(5, int(difficulty_payload.get('level') or 1)))
-      prompt, reference_answer, grading_method = split_question_material(question)
-      saved_reference = self.assessment_planner.saved_reference_answer(
-        course_id,
-        str(question.get('question_id') or ''),
-      )
-      if saved_reference:
-        reference_answer = saved_reference.answer_text
-        grading_method = 'llm_reference'
-      if not prompt or not concepts:
-        skipped += 1
-        continue
-      relations = []
-      for relation in question.get('lecture_relations') or []:
-        if not isinstance(relation, dict) or relation.get('relation_type') != 'question_to_lecture_page':
-          continue
-        target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
-        if str(target.get('document_id') or '') != lecture_document_id:
-          continue
-        if int(target.get('page_number') or 0) <= 0:
-          continue
-        target_course_id = str(target.get('course_id') or '').strip()
-        if target_course_id and target_course_id != course_id:
-          continue
-        relations.append(relation)
-      if not relations:
-        skipped += 1
-        continue
-      candidates.append({
-        **question,
-        '_analysis': analysis,
-        'prompt': prompt,
-        'reference_answer': reference_answer,
-        'grading_method': grading_method,
-        'knowledge_points': concepts,
-        'difficulty': difficulty,
-        'source_type': (
-          'lecture_example'
-          if document_type in {'lecture-example', 'classroom-example'}
-          else 'past-exam' if document_type == 'past-exam' else 'homework'
-        ),
-        'images': question_image_attachments(
-          str(question.get('document_id') or ''),
-          question,
-          prompt,
-        ),
-        'lecture_relations': relations,
-        'relation_score': max(
-          (float(item.get('rerank_score') or item.get('vector_score') or 0.0) for item in relations),
-          default=0.0,
-        ),
-      })
-    return candidates, skipped
+    return self.candidate_provider.candidates(course_id, lecture_document_id)
 
   def _select_next(
     self,
@@ -759,50 +463,20 @@ class AdaptiveTestingService:
     remaining = [item for item in candidates if str(item['question_id']) not in asked]
     if not remaining:
       return None
-    lecture_events = self.store.effective_lecture_events(session.course_id, session.lecture_document_id)
-    session_events = self.store.effective_session_events(session.course_id, session.id)
+    lecture_events = self.repositories.events.for_lecture(
+      session.course_id,
+      session.lecture_document_id,
+    )
+    session_events = self.repositories.events.for_session(session.course_id, session.id)
     if pending_event is not None:
       lecture_events.append(pending_event)
       session_events.append(pending_event)
-    all_concepts = [
-      concept for candidate in candidates for concept in candidate['knowledge_points']
-    ]
-    projections = {
-      item.knowledge_point: item
-      for item in project_concept_mastery(lecture_events, list(dict.fromkeys(all_concepts)))
-    }
-    covered = Counter(
-      concept for event in session_events for concept in event.knowledge_points
+    ranked = self.selection_strategy.rank(
+      session,
+      candidates,
+      lecture_events,
+      session_events,
     )
-    wrong = Counter(
-      concept for event in session_events if not event.correct for concept in event.knowledge_points
-    )
-    used_difficulties = Counter(event.difficulty for event in session_events)
-
-    def priority(candidate: dict[str, Any]) -> tuple[float, str]:
-      concepts = candidate['knowledge_points']
-      uncovered_ratio = sum(1 for concept in concepts if covered[concept] == 0) / len(concepts)
-      wrong_ratio = sum(wrong[concept] for concept in concepts) / len(concepts)
-      mastery_gap = sum(1.0 - projections[concept].mastery for concept in concepts) / len(concepts)
-      confident_streak = sum(
-        1 for concept in concepts
-        if projections[concept].correct_streak >= 2 and projections[concept].confidence >= 0.45
-      ) / len(concepts)
-      difficulty_bonus = 0.6 if used_difficulties[int(candidate['difficulty'])] == 0 else 0.0
-      breadth_bonus = min(len(concepts), 6) * 0.05
-      relation_bonus = min(max(float(candidate['relation_score']), 0.0), 1.0) * 0.25
-      score = (
-        (4.0 * uncovered_ratio)
-        + (3.0 * wrong_ratio)
-        + (2.0 * mastery_gap)
-        + difficulty_bonus
-        + breadth_bonus
-        + relation_bonus
-        - (1.5 * confident_streak)
-      )
-      return score, str(candidate['question_id'])
-
-    ranked = sorted(remaining, key=priority, reverse=True)
     for candidate in ranked:
       if self._cached_assessment_spec(session.course_id, candidate) is not None:
         self._prefetch_assessments(session.course_id, ranked, exclude={str(candidate['question_id'])})
@@ -872,7 +546,7 @@ class AdaptiveTestingService:
       changed = True
 
     answered_count = len(
-      self.store.effective_session_events(session.course_id, session.id)
+      self.repositories.events.for_session(session.course_id, session.id)
     )
     if session.status == 'active' and answered_count >= session.target_question_count:
       session.status = 'completed'
@@ -880,7 +554,7 @@ class AdaptiveTestingService:
       session.completed_at = datetime.now(tz=timezone.utc).isoformat()
       changed = True
     if changed:
-      self.store.save_session(session)
+      self.repositories.sessions.save(session)
 
     allowed = set(retained_ids)
     return [
@@ -921,14 +595,14 @@ class AdaptiveTestingService:
       )
       if not current_ready:
         session.current_question_id = self._select_next(session, candidates)
-        self.store.save_session(session)
+        self.repositories.sessions.save(session)
         allowed_question_ids = set(session.candidate_question_ids)
         candidates = [
           candidate for candidate in candidates
           if str(candidate.get('question_id') or '') in allowed_question_ids
         ]
         candidate_by_id = {str(item['question_id']): item for item in candidates}
-    events = self.store.effective_session_events(session.course_id, session.id)
+    events = self.repositories.events.for_session(session.course_id, session.id)
     events_by_question = {event.question_id: event for event in events}
     unlocked_ids = list(dict.fromkeys([
       *session.asked_question_ids,
@@ -990,84 +664,20 @@ class AdaptiveTestingService:
     candidates: list[dict[str, Any]],
     session_events: list[LearningEvent],
   ) -> dict[str, Any]:
-    lecture_events = self.store.effective_lecture_events(session.course_id, session.lecture_document_id)
-    all_concepts = list(dict.fromkeys(
-      concept for candidate in candidates for concept in candidate['knowledge_points']
-    ))
-    concepts = project_concept_mastery(lecture_events, all_concepts)
-    overall, confidence = aggregate_mastery(concepts)
-    weak = [
-      concept for concept in concepts
-      if concept.mastery < 0.7 or concept.evidence_count == 0
-    ]
-    candidate_by_id = {str(item['question_id']): item for item in candidates}
-    wrong_questions = []
-    for event in session_events:
-      if event.correct:
-        continue
-      candidate = candidate_by_id.get(event.question_id)
-      wrong_questions.append({
-        'question_id': event.question_id,
-        'source_type': event.source_type,
-        'source_document_id': event.source_document_id,
-        'title': str((candidate or {}).get('title') or ''),
-        'page_number': (candidate or {}).get('page_number'),
-        'score': event.score,
-        'answer': event.response_text,
-        'structured_responses': event.structured_responses,
-        'part_grading_results': event.part_grading_results,
-        'feedback': event.grading_feedback,
-        'reference_answer': str((candidate or {}).get('reference_answer') or '')[:12000],
-        'images': list((candidate or {}).get('images') or []),
-      })
-    return {
-      'overall_mastery': overall,
-      'confidence': confidence,
-      'questions_answered': len(session_events),
-      'questions_correct': sum(1 for event in session_events if event.correct),
-      'concept_mastery': [item.model_dump() for item in concepts],
-      'weak_concepts': [item.model_dump() for item in weak],
-      'wrong_questions': wrong_questions,
-      'recommended_pages': self._recommended_pages(candidates, weak),
-      'mastery_scope': 'lecture_history',
-    }
+    lecture_events = self.repositories.events.for_lecture(
+      session.course_id,
+      session.lecture_document_id,
+    )
+    return self.result_assembler.assemble(
+      session,
+      candidates,
+      session_events,
+      lecture_events,
+    )
 
   @staticmethod
   def _recommended_pages(candidates: list[dict[str, Any]], weak: list[Any]) -> list[dict[str, Any]]:
-    weak_by_name = {item.knowledge_point: item for item in weak}
-    pages: dict[tuple[str, int], dict[str, Any]] = {}
-    for candidate in candidates:
-      matched_concepts = [
-        concept for concept in candidate['knowledge_points'] if concept in weak_by_name
-      ]
-      if not matched_concepts:
-        continue
-      for relation in candidate['lecture_relations']:
-        target = relation.get('target') if isinstance(relation.get('target'), dict) else {}
-        document_id = str(target.get('document_id') or '')
-        page_number = int(target.get('page_number') or 0)
-        if not document_id or page_number <= 0:
-          continue
-        key = (document_id, page_number)
-        score = float(relation.get('rerank_score') or relation.get('vector_score') or 0.0)
-        existing = pages.setdefault(key, {
-          'document_id': document_id,
-          'document_name': str(target.get('document_name') or ''),
-          'page_id': str(target.get('page_id') or ''),
-          'page_number': page_number,
-          'title': str(target.get('title') or ''),
-          'knowledge_points': [],
-          'relation_score': score,
-        })
-        existing['knowledge_points'] = list(dict.fromkeys(existing['knowledge_points'] + matched_concepts))
-        existing['relation_score'] = max(existing['relation_score'], score)
-    ranked = list(pages.values())
-    ranked.sort(key=lambda item: (
-      min(weak_by_name[name].mastery for name in item['knowledge_points']),
-      -float(item['relation_score']),
-      int(item['page_number']),
-    ))
-    return ranked[:10]
+    return AdaptiveTestResultAssembler.recommended_pages(candidates, weak)
 
   def _public_question(
     self,
@@ -1137,7 +747,7 @@ class AdaptiveTestingService:
             break
       if not session.current_question_id:
         session.current_question_id = self._select_next(session, candidates)
-        self.store.save_session(session)
+        self.repositories.sessions.save(session)
       return self._session_payload(session, candidates)
 
   def close(self) -> None:
@@ -1166,7 +776,7 @@ _store = LearningStateStore()
 _service: AdaptiveTestingService | None = None
 
 
-def configure_adaptive_testing(relation_pipeline: QuestionRelationPipeline | None) -> None:
+def configure_adaptive_testing(relation_pipeline: RelationQuestionQuery | None) -> None:
   global _service
   if _service is not None:
     _service.close()

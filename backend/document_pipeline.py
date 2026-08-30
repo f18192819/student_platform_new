@@ -115,6 +115,24 @@ def _json_write_lock(path: Path) -> Lock:
     return _JSON_WRITE_LOCKS.setdefault(path, Lock())
 
 
+def safe_storage_name(value: str) -> str:
+  """Return the stable filesystem-safe identifier used by pipeline artifacts."""
+  return _safe_name(value)
+
+
+def read_json_file(path: Path, fallback: Any) -> Any:
+  if not path.is_file():
+    return fallback
+  try:
+    return json.loads(path.read_text(encoding='utf-8'))
+  except (OSError, json.JSONDecodeError):
+    return fallback
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
+  _write_json(path, value)
+
+
 def _read_index_progress(path: Path) -> set[str]:
   """Read the durable checkpoint for batches already written to Qdrant."""
   payload = _read_json(path, {})
@@ -545,6 +563,20 @@ def _archive_result(archive: bytes, target: Path) -> tuple[str, list[dict[str, A
   canonical_markdown_path = target / 'mineru' / 'artifacts' / 'full.md'
   canonical_markdown_path.write_text(markdown, encoding='utf-8')
   return markdown, blocks, page_count
+
+
+def extract_middle_layout_blocks(
+  payload: Any,
+  artifact_parent: str = '',
+) -> list[dict[str, Any]]:
+  return _middle_layout_blocks(payload, artifact_parent)
+
+
+def archive_parser_result(
+  archive: bytes,
+  target: Path,
+) -> tuple[str, list[dict[str, Any]], int]:
+  return _archive_result(archive, target)
 
 
 def _pages_from_mineru(document: dict[str, Any], markdown: str, blocks: list[dict[str, Any]], page_count: int) -> list[dict[str, Any]]:

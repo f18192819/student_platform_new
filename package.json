@@ -7,6 +7,9 @@
     "dev": "vite --host 127.0.0.1 --port 4173",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test:backend": "python -m unittest discover -s backend/tests -p \"test_*.py\" -v",
+    "test:frontend": "tsx --test frontend-tests/*.test.ts",
+    "test": "npm run test:backend && npm run test:frontend",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "serve:local": "python -m uvicorn app:app --host 127.0.0.1 --port 8000"
   },

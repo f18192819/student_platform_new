@@ -375,7 +375,7 @@ function buildStructuredBlocksForPage(
 }
 
 function normalizeMatchText(value: string) {
-  return value.replace(/\s+/g, '').replace(/[，。；：、,.;:()（）【】\[\]]/g, '').toLowerCase()
+  return value.replace(/\s+/g, '').replace(/[，。；：、,.;:()（）【】[\]]/g, '').toLowerCase()
 }
 
 function findQuestionStartBlock(question: HomeworkQuestion, blocks: TextBlock[]) {
@@ -1589,6 +1589,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     }, 320)
     return true
   }
+  const scrollToQuestionAnchorEffect = useEffectEvent(scrollToQuestionAnchor)
 
   useEffect(() => {
     if (
@@ -1610,7 +1611,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     if (!pageData) {
       return
     }
-    scrollToQuestionAnchor(selectedHomeworkQuestion, pageData)
+    scrollToQuestionAnchorEffect(selectedHomeworkQuestion, pageData)
   }, [currentPage, isRendering, pdfController, selectedHomeworkQuestion, structuredBlocks])
 
   useEffect(() => {

@@ -15,6 +15,7 @@ import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/Rela
 import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
 import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageLecturePlayback'
 import { useReaderPanelResize } from '../features/pdf-workspace/hooks/useReaderPanelResize'
+import { useRelatedMaterials } from '../features/pdf-workspace/hooks/useRelatedMaterials'
 import type {
   ComposerAttachment,
   DraftDoubt,
@@ -98,11 +99,6 @@ import {
   extractPdfPreview,
   extractPdfPreviewFromBuffer,
 } from '../lib/pdf'
-import {
-  getLecturePageRelations,
-  getQuestionRelations,
-  type QuestionRelation,
-} from '../lib/questionRelations'
 import type {
   ApiConfig,
   ChatMessage,
@@ -115,63 +111,6 @@ import type {
   StructuredDocumentBlock,
   StoredDoubtAnnotation,
 } from '../types'
-
-function mapQuestionRelationCards(relations: QuestionRelation[]): RelatedMaterialCard[] {
-  return relations
-    .map((relation) => {
-      const target = relation.target
-      const documentType = String(target.document_type || '')
-      const isLecture = documentType === 'lecture'
-      const content = String(target.content || '')
-      return {
-        id: relation.relation_id,
-        kind: isLecture ? ('lecture' as const) : ('question' as const),
-        documentId: String(target.document_id || ''),
-        documentName: String(target.document_name || ''),
-        documentType,
-        pageNumber: Number(target.page_number) || null,
-        questionId: target.question_id ? String(target.question_id) : null,
-        title: String(target.title || ''),
-        content,
-        chapter: '',
-        confidence: typeof relation.confidence === 'number' ? relation.confidence : null,
-      }
-    })
-    .filter((card) => Boolean(card.documentId))
-}
-
-function mapLecturePageRelationCards(
-  relations: QuestionRelation[],
-  lectureDocumentId: string,
-  pageNumber: number,
-): RelatedMaterialCard[] {
-  return relations
-    .map<RelatedMaterialCard | null>((relation) => {
-      const question = relation.question
-      const target = relation.target
-      if (
-        !question?.document_id ||
-        String(target.document_id || '') !== lectureDocumentId ||
-        Number(target.page_number) !== pageNumber
-      ) {
-        return null
-      }
-      return {
-        id: relation.relation_id,
-        kind: 'question' as const,
-        documentId: String(question.document_id),
-        documentName: String(question.document_name || ''),
-        documentType: String(question.document_type || ''),
-        pageNumber: Number(question.page_number) || null,
-        questionId: question.question_id ? String(question.question_id) : null,
-        title: String(question.title || ''),
-        content: String(question.content || ''),
-        chapter: String(question.analysis?.chapter || ''),
-        confidence: typeof relation.confidence === 'number' ? relation.confidence : null,
-      }
-    })
-    .filter((card): card is RelatedMaterialCard => card !== null)
-}
 
 export function PdfWorkspacePage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -216,8 +155,6 @@ export function PdfWorkspacePage() {
   const [annotations, setAnnotations] = useState<StoredDoubtAnnotation[]>([])
   const [homeworkDocuments, setHomeworkDocuments] = useState<HomeworkDocument[]>([])
   const [homeworkFocus, setHomeworkFocus] = useState<HomeworkFocus | null>(null)
-  const [relatedMaterialCards, setRelatedMaterialCards] = useState<RelatedMaterialCard[]>([])
-  const [isLoadingRelatedMaterials, setIsLoadingRelatedMaterials] = useState(false)
   const [, setIsExtractingHomework] = useState(false)
   const [_isProcessingLesson, setIsProcessingLesson] = useState(false)
   const [isLessonRecording, setIsLessonRecording] = useState(false)
@@ -338,76 +275,17 @@ export function PdfWorkspacePage() {
         : '',
     [selectedHomework, selectedHomeworkQuestion, viewerSource.kind],
   )
-
-  useEffect(() => {
-    const controller = new AbortController()
-    const sourceQuestionId =
-      viewerSource.kind === 'homework' ? selectedHomeworkQuestion?.id ?? null : null
-    const lectureDocumentId = viewerSource.kind === 'lecture' ? knowledgeFileId : null
-
-    if (!activeKnowledgeCourseId || (!sourceQuestionId && !lectureDocumentId)) {
-      setRelatedMaterialCards([])
-      setIsLoadingRelatedMaterials(false)
-      return () => controller.abort()
-    }
-
-    setIsLoadingRelatedMaterials(true)
-    void (async () => {
-      try {
-        // A newly parsed question can become visible before its slower relation
-        // projection is ready. Poll only while that projection is pending.
-        for (let attempt = 0; attempt < 120 && !controller.signal.aborted; attempt += 1) {
-          const record = sourceQuestionId
-            ? await getQuestionRelations(sourceQuestionId, controller.signal)
-            : await getLecturePageRelations(
-                activeKnowledgeCourseId,
-                lectureDocumentId!,
-                currentPage,
-                controller.signal,
-              )
-          if (controller.signal.aborted) {
-            return
-          }
-          setRelatedMaterialCards(
-            sourceQuestionId
-              ? mapQuestionRelationCards(record.relations)
-              : mapLecturePageRelationCards(record.relations, lectureDocumentId!, currentPage),
-          )
-          if (!sourceQuestionId || !['missing', 'processing'].includes(record.status)) {
-            break
-          }
-          await new Promise<void>((resolve) => {
-            const timeoutId = window.setTimeout(resolve, 5_000)
-            controller.signal.addEventListener(
-              'abort',
-              () => {
-                window.clearTimeout(timeoutId)
-                resolve()
-              },
-              { once: true },
-            )
-          })
-        }
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          console.warn('Unable to load related materials:', error)
-          setRelatedMaterialCards([])
-        }
-      } finally {
-        if (!controller.signal.aborted) {
-          setIsLoadingRelatedMaterials(false)
-        }
-      }
-    })()
-
-    return () => controller.abort()
-  }, [
-    activeKnowledgeCourseId,
-    currentPage,
-    knowledgeFileId,
-    selectedHomeworkQuestion?.id,
-    viewerSource.kind,
-  ])
+  const {
+    relatedMaterialCards,
+    isLoadingRelatedMaterials,
+    removeRelatedMaterial,
+  } = useRelatedMaterials({
+    courseId: activeKnowledgeCourseId,
+    sourceKind: viewerSource.kind,
+    questionId: selectedHomeworkQuestion?.id ?? null,
+    lectureDocumentId: knowledgeFileId,
+    pageNumber: currentPage,
+  })
 
   const selectedAnnotationConversation = useMemo<ChatMessage[]>(
     () => buildAnnotationConversation(selectedAnnotation, chatMessages),
@@ -842,7 +720,13 @@ export function PdfWorkspacePage() {
     return () => {
       cancelled = true
     }
-  }, [initialFileId, initialHomeworkId, initialHomeworkQuestionId, initialPageNumber])
+  }, [
+    currentFolderType,
+    initialFileId,
+    initialHomeworkId,
+    initialHomeworkQuestionId,
+    initialPageNumber,
+  ])
 
   useEffect(() => {
     if (initialFileId || !activeKnowledgeCourseId) {
@@ -2102,9 +1986,7 @@ export function PdfWorkspacePage() {
     if (card.kind === 'lecture') {
       if (!getKnowledgeFile(card.documentId)) {
         console.warn('Related lecture no longer exists in the course library:', card.documentId)
-        setRelatedMaterialCards((current) =>
-          current.filter((candidate) => candidate.id !== card.id),
-        )
+        removeRelatedMaterial(card.id)
         return
       }
       setSearchParams(
@@ -2125,9 +2007,7 @@ export function PdfWorkspacePage() {
     )
     if (!targetExists) {
       console.warn('Related question document no longer exists in the course library:', card.documentId)
-      setRelatedMaterialCards((current) =>
-        current.filter((candidate) => candidate.id !== card.id),
-      )
+      removeRelatedMaterial(card.id)
       return
     }
 

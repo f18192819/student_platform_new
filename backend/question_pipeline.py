@@ -15,7 +15,15 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import PROJECT_ROOT
-from .document_pipeline import ApiEmbeddingProvider, DocumentParser, LocalMinerUParser, QdrantVectorStore, _archive_result, _middle_layout_blocks, _write_json
+from .document_pipeline import (
+  ApiEmbeddingProvider,
+  DocumentParser,
+  LocalMinerUParser,
+  QdrantVectorStore,
+  archive_parser_result,
+  extract_middle_layout_blocks,
+  write_json_atomic,
+)
 from .runtime_config import load_api_config
 
 QUESTION_PIPELINE_ROOT = PROJECT_ROOT / '.runtime' / 'question-pipeline'
@@ -64,7 +72,7 @@ def _layout_blocks_with_image_assets(document_id: str) -> list[dict[str, Any]]:
       parent = middle_path.parent.relative_to(artifacts_root).as_posix()
       enriched_by_id.update({
         str(item.get('id') or ''): item
-        for item in _middle_layout_blocks(payload, parent)
+        for item in extract_middle_layout_blocks(payload, parent)
         if isinstance(item, dict) and item.get('kind') == 'image'
       })
     except (OSError, ValueError, json.JSONDecodeError):
@@ -78,7 +86,7 @@ def _layout_blocks_with_image_assets(document_id: str) -> list[dict[str, Any]]:
       block['assetPath'] = asset_path
       changed = True
   if changed:
-    _write_json(layout_path, blocks)
+    write_json_atomic(layout_path, blocks)
   return [item for item in blocks if isinstance(item, dict)]
 
 
@@ -793,24 +801,30 @@ class AIQuestionExtractor:
     return final_groups
 
 
+def extract_json_object(content: str) -> dict[str, Any]:
+  """Parse the first JSON object from an OpenAI-compatible text response."""
+  cleaned = content.strip()
+  if cleaned.startswith('```'):
+    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE).strip()
+  decoder = json.JSONDecoder()
+  for match in re.finditer(r'\{', cleaned):
+    try:
+      value, _ = decoder.raw_decode(cleaned[match.start():])
+    except json.JSONDecodeError:
+      continue
+    if isinstance(value, dict):
+      return value
+  raise ValueError('Text model response does not contain a JSON object.')
+
+
 class QuestionAnalyzer:
   _TOP_LEVEL_FIELDS = set(QuestionAnalysis.model_fields)
   _DIFFICULTY_FIELDS = set(Difficulty.model_fields)
 
   @staticmethod
   def _extract_json_object(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith('```'):
-      cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE).strip()
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'\{', cleaned):
-      try:
-        value, _ = decoder.raw_decode(cleaned[match.start():])
-      except json.JSONDecodeError:
-        continue
-      if isinstance(value, dict):
-        return value
-    raise ValueError('Text model response does not contain a JSON object.')
+    """Compatibility shim; new cross-module callers use extract_json_object."""
+    return extract_json_object(content)
 
   @classmethod
   def _normalize_analysis_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1017,7 +1031,7 @@ class QuestionPipeline:
         self._write(directory / 'state.json', state)
         source_file = Path(str(state.get('source_file') or 'source.pdf')).name
         parsed = self.parser.parse(directory / source_file)
-        markdown, blocks, page_count = _archive_result(parsed['archive'], directory)
+        markdown, blocks, page_count = archive_parser_result(parsed['archive'], directory)
         self._write(directory / 'document.json', {
           'document_id': document_id, 'document_name': state['document_name'], 'course_id': state['course_id'],
           'document_type': state['document_type'], 'source_type': state.get('source_type', 'pdf'),
@@ -1389,4 +1403,4 @@ class QuestionPipeline:
 
   @staticmethod
   def _write(path: Path, value: Any) -> None:
-    _write_json(path, value)
+    write_json_atomic(path, value)

@@ -6,12 +6,8 @@ import shutil
 import time
 import json
 import subprocess
-import threading
 import mimetypes
-from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from typing import Any
 from urllib.parse import parse_qs, urlparse, quote, unquote
 import re
@@ -24,8 +20,6 @@ from fastapi.responses import FileResponse
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -54,14 +48,6 @@ tsinghua_router = APIRouter(prefix='/api/tsinghua-sync', tags=['tsinghua-sync'])
 
 def _utc_now() -> str:
   return time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime())
-
-
-def _iso_age_seconds(value: str) -> float:
-  try:
-    created = datetime.fromisoformat(value)
-  except Exception:
-    return 0.0
-  return max(0.0, time.time() - created.timestamp())
 
 
 def _normalize_text(value: Any) -> str:
@@ -2327,275 +2313,8 @@ def _download_courseware_file_via_api_for_session(
   raise HTTPException(status_code=502, detail=f'课件接口下载失败：{joined}')
 
 
-@dataclass
-class LearnSyncSession:
-  session_id: str
-  driver: webdriver.Chrome | None = None
-  runtime_dir: Path = Path('.')
-  browser_binary: str = ''
-  created_at: str = ''
-  updated_at: str = ''
-  stage: str = 'navigating'
-  current_url: str = COURSE_HOME_URL
-  title: str = ''
-  cookies: list[dict[str, Any]] = field(default_factory=list)
-  course_entries: list[dict[str, str]] = field(default_factory=list)
-  imported_courses: list[dict[str, str]] = field(default_factory=list)
-  downloaded_courseware: list[dict[str, Any]] = field(default_factory=list)
-  last_error: str | None = None
-  # 关闭标志：置位后正在进行的拉取/导入循环会尽快退出，不再访问 driver。
-  closed: bool = False
-
-  def status_payload(self) -> dict[str, Any]:
-    if self.driver is None:
-      sample = _course_sample_from_entries(self.course_entries)
-      stage = self.stage
-      if stage not in {'awaiting_login', 'awaiting_2fa', 'closed'} and sample:
-        stage = 'ready'
-      return {
-        'sessionId': self.session_id,
-        'stage': stage,
-        'currentUrl': self.current_url,
-        'title': self.title,
-        'courseSample': sample,
-        'importedCourses': self.imported_courses,
-        'lastError': self.last_error,
-        'createdAt': self.created_at,
-        'updatedAt': self.updated_at,
-      }
-    try:
-      current_url = self.driver.current_url
-      title = self.driver.title
-      page_source = self.driver.page_source
-      stage = _guess_stage(current_url, title, page_source)
-      dom_sample = _extract_current_term_courses_from_dom(self.driver)
-      html_sample = _extract_current_term_courses_from_html(page_source)
-      sample = (dom_sample or html_sample)[:8]
-      if stage not in {'awaiting_login', 'awaiting_2fa'} and sample:
-        stage = 'ready'
-        _persist_cookies(self.driver)
-      return {
-        'sessionId': self.session_id,
-        'stage': stage,
-        'currentUrl': current_url,
-        'title': title,
-        'courseSample': sample,
-        'importedCourses': self.imported_courses,
-        'lastError': self.last_error,
-        'createdAt': self.created_at,
-        'updatedAt': self.updated_at,
-      }
-    except Exception as exc:
-      return {
-        'sessionId': self.session_id,
-        'stage': 'closed',
-        'currentUrl': '',
-        'title': '',
-        'courseSample': [],
-        'importedCourses': self.imported_courses,
-        'lastError': self.last_error or str(exc),
-        'createdAt': self.created_at,
-        'updatedAt': self.updated_at,
-      }
-
-
-class LearnSyncRegistry:
-  def __init__(self) -> None:
-    self._lock = Lock()
-    self._sessions: dict[str, LearnSyncSession] = {}
-
-  def create(self) -> LearnSyncSession:
-    with self._lock:
-      existing_ids = list(self._sessions.keys())
-    for existing_id in existing_ids:
-      self.close(existing_id)
-
-    persisted_cookies = _load_persisted_cookies()
-    if persisted_cookies:
-      try:
-        course_entries = _fetch_course_entries_via_cookie_session_v2(persisted_cookies)
-      except HTTPException:
-        course_entries = []
-      if course_entries:
-        session_id = f'learn-sync-{int(time.time() * 1000)}'
-        runtime_dir = SYNC_RUNTIME_DIR / session_id
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        created_at = _utc_now()
-        session = LearnSyncSession(
-          session_id=session_id,
-          runtime_dir=runtime_dir,
-          browser_binary=_find_browser_binary(),
-          created_at=created_at,
-          updated_at=created_at,
-          stage='ready',
-          current_url=COURSE_HOME_URL,
-          title='缃戠粶瀛﹀爞',
-          cookies=persisted_cookies,
-          course_entries=course_entries,
-        )
-        with self._lock:
-          self._sessions[session_id] = session
-        return session
-
-    auth_config = load_tsinghua_auth_config()
-    username = _normalize_text(str((auth_config or {}).get('username') or ''))
-    password = str((auth_config or {}).get('password') or '')
-    if not username or not password:
-      raise HTTPException(status_code=422, detail='请先在 API 配置中填写网络学堂用户名和密码。')
-    for existing in []:
-      try:
-        current_url = existing.driver.current_url
-        title = existing.driver.title
-        page_source = existing.driver.page_source
-        stage = _guess_stage(current_url, title, page_source)
-        age_seconds = _iso_age_seconds(existing.created_at)
-        should_recreate = False
-        if stage in {'awaiting_login', 'awaiting_2fa', 'closed'} and age_seconds > 20:
-          should_recreate = True
-        elif '登录超时' in title or 'login timeout' in title.lower():
-          should_recreate = True
-        elif LEARN_HOST in current_url and not _extract_current_term_courses_from_dom(existing.driver):
-          source_head = page_source[:4000].lower()
-          if any(token in source_head for token in ('re_log', 'closecurrentpage', 'log_fail.png', '404')):
-            should_recreate = True
-        if should_recreate:
-          try:
-            existing.driver.quit()
-          except Exception:
-            pass
-          with self._lock:
-            self._sessions.pop(existing.session_id, None)
-          continue
-        return existing
-      except Exception:
-        with self._lock:
-          self._sessions.pop(existing.session_id, None)
-
-    session_id = f'learn-sync-{int(time.time() * 1000)}'
-    runtime_dir = SYNC_RUNTIME_DIR / session_id
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    browser_binary = _find_browser_binary()
-    created_at = _utc_now()
-    session = LearnSyncSession(
-      session_id=session_id,
-      runtime_dir=runtime_dir,
-      browser_binary=browser_binary,
-      created_at=created_at,
-      updated_at=created_at,
-      stage='navigating',
-      current_url=COURSE_HOME_URL,
-      title='网络学堂同步中',
-    )
-
-    with self._lock:
-      self._sessions[session_id] = session
-
-    try:
-      payload = _run_playwright_login(runtime_dir, browser_binary, username, password)
-      session.cookies = [item for item in payload.get('cookies', []) if isinstance(item, dict)]
-      payload_entries = _normalize_course_material_entries(payload.get('courseEntries'))
-      session.course_entries = payload_entries or _fetch_course_entries_via_cookie_session_v2(session.cookies)
-      session.current_url = _normalize_text(str(payload.get('currentUrl') or COURSE_HOME_URL))
-      session.title = _normalize_text(str(payload.get('title') or '网络学堂'))
-      session.stage = 'ready' if session.course_entries else 'awaiting_login'
-      session.updated_at = _utc_now()
-      _persist_cookie_payload(session.cookies)
-      if not session.course_entries:
-        raise HTTPException(status_code=502, detail='登录成功，但没有拿到课程列表。')
-      return session
-    except HTTPException as exc:
-      session.stage = 'awaiting_login'
-      session.last_error = str(exc.detail or '')
-      session.updated_at = _utc_now()
-      with self._lock:
-        self._sessions.pop(session_id, None)
-      shutil.rmtree(runtime_dir, ignore_errors=True)
-      raise
-
-    options = ChromeOptions()
-    options.binary_location = browser_binary
-    options.add_argument(f'--user-data-dir={runtime_dir.as_posix()}')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--no-first-run')
-    options.add_argument('--no-default-browser-check')
-    options.add_argument('--window-size=1440,980')
-    options.add_experimental_option(
-      'prefs',
-      {
-        'download.prompt_for_download': False,
-        'download.directory_upgrade': True,
-        'profile.default_content_settings.popups': 0,
-      },
-    )
-    options.add_experimental_option('excludeSwitches', ['enable-automation'])
-    options.add_experimental_option('useAutomationExtension', False)
-
-    try:
-      driver = webdriver.Chrome(service=ChromeService(), options=options)
-    except Exception as exc:
-      raise HTTPException(status_code=500, detail=f'Unable to launch browser for 网络学堂同步: {exc}') from exc
-
-    try:
-      driver.maximize_window()
-    except Exception:
-      pass
-    _configure_download_dir(driver, runtime_dir / 'downloads')
-    driver.get(COURSE_HOME_URL)
-    if _restore_cookies(driver):
-      driver.get(COURSE_HOME_URL)
-    created_at = _utc_now()
-    session = LearnSyncSession(
-      session_id=session_id,
-      driver=driver,
-      runtime_dir=runtime_dir,
-      browser_binary=browser_binary,
-      created_at=created_at,
-      updated_at=created_at,
-    )
-
-    with self._lock:
-      self._sessions[session_id] = session
-
-    _maybe_auto_login(driver)
-    return session
-
-  def get(self, session_id: str) -> LearnSyncSession:
-    with self._lock:
-      session = self._sessions.get(session_id)
-    if not session:
-      raise HTTPException(status_code=404, detail='网络学堂同步会话不存在或已关闭。')
-    return session
-
-  def close(self, session_id: str) -> bool:
-    with self._lock:
-      session = self._sessions.get(session_id)
-    if session is None:
-      # 幂等关闭：会话已不存在视为已关闭，避免前端卡在“会话不存在”错误里无法重试。
-      return True
-
-    # 先置关闭标志：正在运行的拉取/导入循环检测到后会尽快退出，停止访问 driver。
-    session.closed = True
-
-    if session.driver is not None:
-      try:
-        _persist_cookies(session.driver)
-      except Exception:
-        pass
-
-      def _quit_driver() -> None:
-        try:
-          session.driver.quit()
-        except Exception:
-          pass
-
-      quit_thread = threading.Thread(target=_quit_driver, daemon=True)
-      quit_thread.start()
-      quit_thread.join(timeout=5.0)
-
-    shutil.rmtree(session.runtime_dir, ignore_errors=True)
-    with self._lock:
-      self._sessions.pop(session_id, None)
-    return True
+# Public compatibility type; the active implementation lives in the focused state module.
+LearnSyncSession = sync_state.LearnSyncSession
 
 
 _registry = sync_state.LearnSyncRegistry(

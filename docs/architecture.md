@@ -8,24 +8,72 @@ extend a feature boundary rather than adding business logic directly to
 
 - `src/features/*`: feature-owned React UI and state; shared rendering belongs
   in `src/lib/*` only when it is used by more than one feature.
-- `app.py`: FastAPI composition, lifecycle hooks, and thin HTTP adapters. It
-  may validate request data and schedule work, but it must not own persistence
-  formats or provider-specific workflows.
+- `app.py`: composition root only. It creates the process runtime, registers
+  feature routers, and attaches the application lifespan.
+- `backend/application_runtime.py`: process-scoped provider assembly, MinerU
+  lifecycle, worker ownership, and deterministic shutdown.
+- `backend/pipeline_router.py`: stable HTTP DTOs plus the document/question
+  `PipelineApiService`; existing pipeline and relation API paths live here.
+- `backend/knowledge_router.py`: knowledge-library and asset HTTP DTOs plus the
+  deletion application service that coordinates tombstones and derived data.
+- `backend/media_router.py`: isolated compatibility boundary for the existing
+  ASR, classroom-alignment, recording, and Office conversion implementation.
+- `backend/pipeline_orchestration.py`: application-level document/question
+  processing and deletion orchestration. It depends on pipeline protocols,
+  not FastAPI.
 - `backend/document_pipeline.py`: local MinerU parsing, page/chunk generation,
   embedding, and Qdrant writes for course material.
 - `backend/question_pipeline.py`: question extraction and structured question
   analysis.
-- `backend/question_relations.py`: retrieval and persisted relations between
-  questions and course material.
-- `backend/learning_state.py`: course-partitioned adaptive-test sessions,
-  append-only learning evidence, and recalculable concept mastery projections.
-- `backend/adaptive_testing.py`: real-question eligibility, grading adapters,
-  explainable next-question selection, and mastery-test result assembly.
+- `backend/question_relations.py`: relation construction and projection writes.
+- `backend/question_relation_query.py`: stable read-only relation interface used
+  by Adaptive Test and reader features.
+- `backend/learning_state.py`: physical course-partitioned SQLite implementation.
+- `backend/learning_repositories.py`: narrow session/event/progress repository
+  interfaces over the same compatible SQLite files.
+- `backend/adaptive_testing.py`: HTTP DTO compatibility and test-session workflow.
+- `backend/adaptive_candidates.py`, `adaptive_selection.py`,
+  `adaptive_grading.py`, and `adaptive_results.py`: replaceable candidate,
+  selection, grading, and result policies.
 - `backend/assessment_planner.py`: persisted per-question answer contracts for
   choice, numeric, and short-text assessment parts. Private answer keys never
   cross the backend boundary.
 - `backend/knowledge_storage.py`: course-scoped durable files and SQLite data.
 - `backend/tsinghua_*.py`: external course synchronization only.
+
+## Dependency Direction
+
+Before this refactor, `app.py` constructed and coordinated concrete pipelines,
+Adaptive Test queried the relation builder directly, and question parsing
+imported private document helpers. Page components also owned long-running
+polling loops.
+
+The progressive target now in use is:
+
+```text
+Router / React Page
+  -> Application service / feature hook
+  -> Protocol or stable public facade
+  -> SQLite, Qdrant, MinerU, LLM, requests
+```
+
+Adaptive Test depends on `QuestionRelationQuery`, not relation construction.
+Question parsing uses public document artifact functions. React pages compose
+`useRelatedMaterials` and `useKnowledgePipelinePolling`; both own cancellation
+and cleanup for their requests and timers.
+
+Application routes do not construct SQLite, Qdrant, MinerU, or LLM clients.
+They obtain process-owned services from `ApplicationRuntime`; pipeline stage
+coordination and deletion cascades are implemented outside FastAPI handlers.
+
+## Compatibility Facades
+
+The public API paths and persisted schemas remain unchanged. `knowledgeBase.ts`,
+`ai.ts`, and `pdf.ts` remain import-compatible facades while their feature-owned
+implementations move behind them. Existing private document helper names remain
+temporarily available inside `document_pipeline.py`, but cross-module callers
+must use `safe_storage_name`, `read_json_file`, `write_json_atomic`,
+`archive_parser_result`, and `extract_middle_layout_blocks`.
 
 ## Extension Rules
 
@@ -35,6 +83,11 @@ Keep audio ingestion, transcription, segmentation, and lecture mapping inside
 an audio-specific backend module. HTTP endpoints should call that module and
 return stable DTOs. Audio artifacts must be stored under a course/document
 scope and cleaned up through the same deletion path as their source document.
+
+`media_router.py` intentionally preserves the existing algorithms as one
+compatibility unit. New media behavior should be added behind explicit ASR,
+alignment, or recording service interfaces rather than extending that module's
+HTTP handlers with additional provider logic.
 
 ### Learning State
 
@@ -95,3 +148,16 @@ The active PDF route is `/api/documents/process` backed by local MinerU.
 The retired cloud MinerU route is intentionally absent. Avoid adding a second
 parser path; add behavior to `DocumentPipeline` or a provider implementation
 instead.
+
+## Remaining Technical Debt
+
+- The isolated media compatibility module is still large and mixes ASR,
+  retrieval-assisted classroom mapping, recording storage, and Office
+  conversion. Split it by those capabilities only when characterization tests
+  exist for the real provider responses.
+- `tsinghua_sync.py` still combines external-site adapters and sync workflows.
+  Session ownership has moved to `tsinghua_sync_state.py`; subsequent changes
+  should extract request adapters without changing the public router paths.
+- `knowledgeBase.ts` and `ai.ts` remain intentionally broad compatibility
+  facades. New stateful frontend behavior belongs in feature hooks/controllers,
+  while callers can continue importing the facade during gradual migration.

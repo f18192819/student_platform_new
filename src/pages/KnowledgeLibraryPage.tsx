@@ -17,16 +17,12 @@ import {
   buildPendingHomeworkDocument,
   getMineruUploadError,
   getMineruUploadKind,
-  getHomeworkDocumentProcessingStatus,
-  getLectureDocumentProcessingStatus,
   MINERU_UPLOAD_ACCEPT,
   processHomeworkDocumentWithPipeline,
   readHomeworkAssetPayload,
   retryHomeworkDocumentProcessing,
   retryLectureDocumentProcessing,
   submitLectureDocumentForProcessing,
-  type DocumentPipelineStatus,
-  type QuestionPipelineResult,
 } from '../lib/mineru'
 import { getKnowledgeCourseDisplayName } from '../lib/knowledgeBaseCourses'
 import { parseTsinghuaCourseDisplayName } from '../lib/tsinghuaCourseLabels'
@@ -51,7 +47,12 @@ import {
   importCoursewareFiles,
 } from '../features/knowledge-library/coursewareImport'
 import { useKnowledgeLibraryState } from '../features/knowledge-library/useKnowledgeLibraryState'
-import type { HomeworkDocument, KnowledgeFile, KnowledgeLibraryFolderType, StructuredDocumentBlock } from '../types'
+import {
+  applyQuestionPipelineResult,
+  syncLecturePipelineResult,
+} from '../features/knowledge-library/pipelineProjection'
+import { useKnowledgePipelinePolling } from '../features/knowledge-library/useKnowledgePipelinePolling'
+import type { HomeworkDocument, KnowledgeFile, KnowledgeLibraryFolderType } from '../types'
 
 type LibraryFolderType = KnowledgeLibraryFolderType | 'homework' | 'past-exam'
 type CoursewarePickerItem = TsinghuaCoursewareFile & { wasDeleted: boolean }
@@ -88,31 +89,6 @@ function formatCoursewareKind(file: TsinghuaCoursewareFile) {
 
 function isPipelineFailure(status: string | null | undefined) {
   return Boolean(status && status.endsWith('_failed'))
-}
-
-function applyQuestionPipelineResult(
-  document: HomeworkDocument,
-  result: QuestionPipelineResult,
-): HomeworkDocument {
-  const failed = result.status.endsWith('_failed')
-  return {
-    ...document,
-    pageCount: result.pageCount ?? document.pageCount,
-    status: result.status === 'completed' ? 'ready' : failed ? 'error' : 'processing',
-    pipelineStatus: result.status,
-    parserStatus: result.parserStatus || document.parserStatus || null,
-    extractionStatus: result.extractionStatus || document.extractionStatus || null,
-    analysisStatus: result.analysisStatus || document.analysisStatus || null,
-    embeddingStatus: result.embeddingStatus || document.embeddingStatus || null,
-    vectorStatus: result.vectorStatus || document.vectorStatus || null,
-    embeddingCompletedQuestions: result.embeddingCompletedQuestions,
-    vectorCompletedQuestions: result.vectorCompletedQuestions,
-    extractedMarkdown: result.markdown || document.extractedMarkdown,
-    layoutBlocks: result.layoutBlocks.length ? result.layoutBlocks : document.layoutBlocks,
-    questions: result.questions.length ? result.questions : document.questions,
-    errorMessage: result.error,
-    updatedAt: new Date().toISOString(),
-  }
 }
 
 function formatQuestionPipelineStatus(document: HomeworkDocument) {
@@ -163,18 +139,6 @@ function formatPipelineStatus(status: string | null | undefined) {
     case 'vector_failed': return 'Qdrant 写入失败'
     case 'state_failed': return '任务状态保存失败'
     default: return status ? '正在处理文档' : '未提交处理任务'
-  }
-}
-
-function pipelineFields(payload: DocumentPipelineStatus) {
-  return {
-    pipelineStatus: payload.status,
-    mineruStatus: payload.mineru_status,
-    embeddingStatus: payload.embedding_status,
-    vectorStatus: payload.vector_status,
-    pipelineError: payload.error || null,
-    chunkCount: Number(payload.chunk_count || 0) || null,
-    indexedChunkCount: Number(payload.vector_completed_chunks || payload.embedding_completed_chunks || 0) || null,
   }
 }
 
@@ -292,10 +256,6 @@ export function KnowledgeLibraryPage() {
       ? getKnowledgeHomeworkDocumentsByCourseFolder(activeCourse.id, activeFolderType)
       : []
   const activeCourseId = activeCourse?.id ?? ''
-  const pendingQuestionDocumentIds = activeFolderDocuments
-    .filter((document) => document.status === 'processing')
-    .map((document) => document.id)
-    .join('|')
 
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
@@ -317,78 +277,14 @@ export function KnowledgeLibraryPage() {
   const [courseSettingsCandidates, setCourseSettingsCandidates] = useState<TsinghuaCourseCandidate[]>([])
   const [courseSettingsAssociationId, setCourseSettingsAssociationId] = useState('')
 
-  const syncPipelineResult = async (fileId: string, payload: DocumentPipelineStatus) => {
-    const file = knowledgeLibrary.files.find((item) => item.id === fileId)
-    if (!file) return
-    await upsertKnowledgeFile({
-      fileId,
-      sourceKey: file.sourceKey,
-      fileName: file.fileName,
-      pageCount: Number(payload.page_count || file.pageCount),
-      byteSize: file.byteSize,
-      markdown: payload.status === 'completed' ? String(payload.markdown || file.markdown) : file.markdown,
-      layoutBlocks: payload.status === 'completed'
-        ? ((payload.layout_blocks as StructuredDocumentBlock[] | undefined) ?? file.layoutBlocks)
-        : file.layoutBlocks,
-      courseId: file.courseId,
-      ...pipelineFields(payload),
-    })
-  }
-
-  useEffect(() => {
-    const pendingFiles = files.filter((file) =>
-      file.pipelineStatus && !isPipelineFailure(file.pipelineStatus) && file.pipelineStatus !== 'completed',
-    )
-    if (!pendingFiles.length) return
-    let cancelled = false
-    const poll = async () => {
-      for (const file of pendingFiles) {
-        try {
-          const result = await getLectureDocumentProcessingStatus(file.id)
-          if (!cancelled) await syncPipelineResult(file.id, result)
-        } catch (error) {
-          if (!cancelled) console.warn('document pipeline status request failed:', error)
-        }
-      }
-    }
-    void poll()
-    const timer = window.setInterval(() => void poll(), 2000)
-    return () => { cancelled = true; window.clearInterval(timer) }
-  }, [knowledgeLibrary, activeCourse?.id])
-
-  useEffect(() => {
-    if (!activeCourseId || !isHomeworkFolder || !pendingQuestionDocumentIds) return
-    const documentIds = pendingQuestionDocumentIds.split('|').filter(Boolean)
-    let cancelled = false
-    const poll = async () => {
-      for (const documentId of documentIds) {
-        try {
-          const result = await getHomeworkDocumentProcessingStatus(documentId)
-          if (cancelled) return
-          const current = getKnowledgeHomeworkDocumentsByCourseFolder(
-            activeCourseId,
-            activeFolderType === 'past-exam' ? 'past-exam' : 'homework',
-          )
-          const latest = current.find((item) => item.id === documentId)
-          if (!latest) continue
-          const updated = applyQuestionPipelineResult(latest, result)
-          saveKnowledgeHomeworkDocuments(
-            activeCourseId,
-            activeFolderType === 'past-exam' ? 'past-exam' : 'homework',
-            [updated, ...current.filter((item) => item.id !== documentId)],
-          )
-        } catch (error) {
-          if (!cancelled) console.warn('question pipeline status request failed:', error)
-        }
-      }
-    }
-    void poll()
-    const timer = window.setInterval(() => void poll(), 2000)
-    return () => {
-      cancelled = true
-      window.clearInterval(timer)
-    }
-  }, [activeCourseId, activeFolderType, isHomeworkFolder, pendingQuestionDocumentIds])
+  useKnowledgePipelinePolling({
+    files,
+    courseId: activeCourseId,
+    folderType: isHomeworkFolder
+      ? (activeFolderType === 'past-exam' ? 'past-exam' : 'homework')
+      : null,
+    documents: activeFolderDocuments,
+  })
 
   useEffect(() => () => {
     const sessionId = syncSessionRef.current
@@ -529,7 +425,7 @@ export function KnowledgeLibraryPage() {
       })
       if (activeFolderType !== 'other') {
         const status = await submitLectureDocumentForProcessing(previewFile, activeCourse.id, storedFile.id)
-        await syncPipelineResult(storedFile.id, status)
+        await syncLecturePipelineResult(storedFile.id, status)
       }
       navigate(`/pdf?file=${storedFile.id}&course=${activeCourse.id}`)
     } catch (error) {
@@ -540,7 +436,7 @@ export function KnowledgeLibraryPage() {
   const retryFile = async (fileId: string) => {
     setUploadError('')
     try {
-      await syncPipelineResult(fileId, await retryLectureDocumentProcessing(fileId))
+      await syncLecturePipelineResult(fileId, await retryLectureDocumentProcessing(fileId))
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : '重试任务未能启动。')
     }

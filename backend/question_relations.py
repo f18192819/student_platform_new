@@ -29,6 +29,7 @@ from .question_pipeline import (
 )
 from .knowledge_storage import read_knowledge_library
 from .runtime_config import load_api_config
+from .question_relation_query import FileQuestionRelationQuery
 
 QUESTION_RELATIONS_ROOT = PROJECT_ROOT / '.runtime' / 'question-relations'
 RELATION_CONFIG_PATH = QUESTION_RELATIONS_ROOT / 'config.json'
@@ -485,6 +486,13 @@ class QuestionRelationPipeline:
     self.question_reverse_index_dir = root / 'question-targets'
     self.question_documents_root = question_documents_root
     self.lecture_documents_root = lecture_documents_root
+    self.query = FileQuestionRelationQuery(
+      relations_dir=self.relations_dir,
+      lecture_page_index_dir=self.lecture_page_index_dir,
+      question_reverse_index_dir=self.question_reverse_index_dir,
+      question_documents_root=self.question_documents_root,
+      lecture_documents_root=self.lecture_documents_root,
+    )
 
   def config(self) -> dict[str, Any]:
     return normalize_relation_config(_read_json(self.config_path, DEFAULT_RELATION_CONFIG))

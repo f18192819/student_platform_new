@@ -14,7 +14,12 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import PROJECT_ROOT
-from .document_pipeline import DOCUMENTS_ROOT, _read_json, _safe_name, _write_json
+from .document_pipeline import (
+  DOCUMENTS_ROOT,
+  read_json_file,
+  safe_storage_name,
+  write_json_atomic,
+)
 from .question_pipeline import QUESTION_DOCUMENTS_ROOT
 from .question_relations import RELATIONS_DIR
 from .runtime_config import load_api_config
@@ -470,17 +475,17 @@ class KnowledgeGraphPipeline:
     self.extractor = extractor or PageKnowledgeExtractor()
 
   def _dir(self, document_id: str) -> Path:
-    return GRAPH_DOCUMENTS_ROOT / _safe_name(document_id)
+    return GRAPH_DOCUMENTS_ROOT / safe_storage_name(document_id)
 
   def status(self, document_id: str) -> dict[str, Any]:
-    state = _read_json(self._dir(document_id) / 'state.json', {})
+    state = read_json_file(self._dir(document_id) / 'state.json', {})
     if not state:
       raise HTTPException(status_code=404, detail='Knowledge graph job not found.')
     return state
 
   def sync_document(self, document_id: str) -> dict[str, Any]:
-    lecture_dir = DOCUMENTS_ROOT / _safe_name(document_id)
-    question_dir = QUESTION_DOCUMENTS_ROOT / _safe_name(document_id)
+    lecture_dir = DOCUMENTS_ROOT / safe_storage_name(document_id)
+    question_dir = QUESTION_DOCUMENTS_ROOT / safe_storage_name(document_id)
     if (lecture_dir / 'state.json').is_file():
       return self._sync_lecture(lecture_dir)
     if (question_dir / 'state.json').is_file():
@@ -493,7 +498,7 @@ class KnowledgeGraphPipeline:
       if not root.is_dir():
         continue
       for directory in root.iterdir():
-        state = _read_json(directory / 'state.json', {})
+        state = read_json_file(directory / 'state.json', {})
         if state.get('course_id') == course_id and state.get('status') == 'completed':
           results.append(self.sync_document(str(state.get('document_id') or directory.name)))
     return {'course_id': course_id, 'document_count': len(results), 'documents': results}
@@ -527,7 +532,7 @@ class KnowledgeGraphPipeline:
     self.store.close()
 
   def _sync_lecture(self, directory: Path) -> dict[str, Any]:
-    state = _read_json(directory / 'state.json', {})
+    state = read_json_file(directory / 'state.json', {})
     document_id = str(state.get('document_id') or directory.name)
     graph_state = self._base_state(state, document_id)
     if state.get('status') != 'completed':
@@ -546,7 +551,7 @@ class KnowledgeGraphPipeline:
         page_id = str(page.get('page_id') or '')
         if page_id and page_id not in analyses:
           analyses[page_id] = self.extractor.analyze(page)
-          _write_json(analyses_path, analyses)
+          write_json_atomic(analyses_path, analyses)
       self.store.upsert_lecture(state, pages, analyses)
       return self._save_state(graph_state | {
         'status': 'completed', 'page_count': len(pages), 'analyzed_page_count': len(analyses),
@@ -558,7 +563,7 @@ class KnowledgeGraphPipeline:
       return self._save_state(graph_state | {'status': 'failed', 'error': str(exc), 'updated_at': time.time()})
 
   def _sync_questions(self, directory: Path) -> dict[str, Any]:
-    state = _read_json(directory / 'state.json', {})
+    state = read_json_file(directory / 'state.json', {})
     document_id = str(state.get('document_id') or directory.name)
     graph_state = self._base_state(state, document_id)
     if state.get('status') != 'completed':
@@ -568,7 +573,10 @@ class KnowledgeGraphPipeline:
       questions_path = directory / 'questions.json'
       questions = json.loads(questions_path.read_text(encoding='utf-8')) if questions_path.is_file() else []
       records = {
-        str(question.get('question_id')): _read_json(RELATIONS_DIR / f"{_safe_name(str(question.get('question_id')))}.json", {})
+        str(question.get('question_id')): read_json_file(
+          RELATIONS_DIR / f"{safe_storage_name(str(question.get('question_id')))}.json",
+          {},
+        )
         for question in questions if isinstance(question, dict) and question.get('question_id')
       }
       self.store.upsert_questions(state, questions, records)
@@ -591,7 +599,7 @@ class KnowledgeGraphPipeline:
     }
 
   def _save_state(self, state: dict[str, Any]) -> dict[str, Any]:
-    _write_json(self._dir(str(state['document_id'])) / 'state.json', state)
+    write_json_atomic(self._dir(str(state['document_id'])) / 'state.json', state)
     return state
 
   def _require_store_available(self) -> None:

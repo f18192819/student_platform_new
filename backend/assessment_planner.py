@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .learning_state import LearningStateStore, QuestionReferenceAnswer
-from .question_pipeline import QuestionAnalyzer
+from .question_pipeline import extract_json_object
 from .runtime_config import load_api_config
 
 DEFAULT_NUMERIC_TOLERANCE = 1e-6
@@ -462,7 +462,7 @@ class AssessmentPlanner:
         response.raise_for_status()
         content = response.json()['choices'][0]['message']['content']
         generated = GeneratedReferenceAnswer.model_validate(
-          QuestionAnalyzer._extract_json_object(str(content))
+          extract_json_object(str(content))
         )
         return generated, model
       except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
@@ -544,7 +544,7 @@ class AssessmentPlanner:
           response.raise_for_status()
           content = response.json()['choices'][0]['message']['content']
           candidate = AssessmentTaskInventory.model_validate(
-            QuestionAnalyzer._extract_json_object(str(content))
+            extract_json_object(str(content))
           )
           if candidate.task_count != len(candidate.tasks):
             raise ValueError('Assessment task_count does not match tasks.')
@@ -690,7 +690,7 @@ class AssessmentPlanner:
       response.raise_for_status()
       content = response.json()['choices'][0]['message']['content']
       result = DistractorBatch.model_validate(
-        QuestionAnalyzer._extract_json_object(str(content))
+        extract_json_object(str(content))
       )
       expected_ids = {task.id for task in tasks}
       generated = {
@@ -761,7 +761,7 @@ class AssessmentPlanner:
         response.raise_for_status()
         content = response.json()['choices'][0]['message']['content']
         result = DistractorPlan.model_validate(
-          QuestionAnalyzer._extract_json_object(str(content))
+          extract_json_object(str(content))
         )
         valid = self._valid_distractors(correct_answer, result.distractors)
         if len(valid) == 3:
