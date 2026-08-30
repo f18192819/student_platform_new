@@ -43,6 +43,7 @@ class LearningEvent(BaseModel):
   response_text: str = ''
   structured_responses: list[dict[str, Any]] = Field(default_factory=list)
   part_grading_results: list[dict[str, Any]] = Field(default_factory=list)
+  assessment_spec_snapshot: dict[str, Any] = Field(default_factory=dict)
   grading_method: str
   grading_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
   grading_feedback: str = ''
@@ -264,6 +265,25 @@ class LearningStateStore:
         WHERE question_id = ? AND source_fingerprint = ?
         ''',
         (question_id, source_fingerprint),
+      ).fetchone()
+    if not row:
+      return None
+    try:
+      payload = json.loads(row['spec_json'])
+    except (TypeError, ValueError):
+      return None
+    return payload if isinstance(payload, dict) else None
+
+  def get_latest_assessment_spec(
+    self,
+    course_id: str,
+    question_id: str,
+  ) -> dict[str, Any] | None:
+    """Return the latest persisted spec for historical answer rendering."""
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        'SELECT spec_json FROM assessment_specs WHERE question_id = ?',
+        (question_id,),
       ).fetchone()
     if not row:
       return None
@@ -795,6 +815,10 @@ class LearningStateStore:
       connection.execute(
         "ALTER TABLE learning_events ADD COLUMN part_grading_results TEXT NOT NULL DEFAULT '[]'"
       )
+    if 'assessment_spec_snapshot' not in event_columns:
+      connection.execute(
+        "ALTER TABLE learning_events ADD COLUMN assessment_spec_snapshot TEXT NOT NULL DEFAULT '{}'"
+      )
 
     if needs_revision_migration:
       connection.execute(
@@ -851,10 +875,10 @@ class LearningStateStore:
         id, course_id, lecture_document_id, test_session_id, question_id,
         source_type, source_document_id, knowledge_points, difficulty, correct,
         score, response_time_ms, response_text, structured_responses,
-        part_grading_results, grading_method,
+        part_grading_results, assessment_spec_snapshot, grading_method,
         grading_confidence, grading_feedback, revision, supersedes_event_id,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ''',
       (
         event.id,
@@ -872,6 +896,7 @@ class LearningStateStore:
         event.response_text,
         json.dumps(event.structured_responses, ensure_ascii=False),
         json.dumps(event.part_grading_results, ensure_ascii=False),
+        json.dumps(event.assessment_spec_snapshot, ensure_ascii=False),
         event.grading_method,
         event.grading_confidence,
         event.grading_feedback,
@@ -915,6 +940,7 @@ class LearningStateStore:
       response_text=row['response_text'],
       structured_responses=json.loads(row['structured_responses'] or '[]'),
       part_grading_results=json.loads(row['part_grading_results'] or '[]'),
+      assessment_spec_snapshot=json.loads(row['assessment_spec_snapshot'] or '{}'),
       grading_method=row['grading_method'],
       grading_confidence=row['grading_confidence'],
       grading_feedback=row['grading_feedback'],
@@ -936,3 +962,4 @@ class LearningStateStore:
       created_at=str(row['created_at']),
       updated_at=str(row['updated_at']),
     )
+
