@@ -16,6 +16,10 @@ class QuestionPipelinePublicInterfaceTest(unittest.TestCase):
 
     self.assertEqual([1, 2], payload['questions'])
 
+  def test_extract_json_object_preserves_legacy_value_error(self):
+    with self.assertRaises(ValueError):
+      extract_json_object('not json')
+
 
 if __name__ == '__main__':
   unittest.main()

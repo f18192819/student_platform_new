@@ -10,7 +10,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Protocol
 
-import requests
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -23,6 +22,11 @@ from .document_pipeline import (
   archive_parser_result,
   extract_middle_layout_blocks,
   write_json_atomic,
+)
+from .provider_transport import (
+  ProviderTransportError,
+  StructuredChatClient,
+  extract_json_object as extract_provider_json_object,
 )
 from .runtime_config import load_api_config
 
@@ -300,9 +304,15 @@ class QuestionConsolidation(BaseModel):
 class AIQuestionExtractor:
   """Use the text model to group MinerU source segments into complete questions."""
 
-  def __init__(self, max_batch_chars: int = 12000, max_batch_segments: int = 100) -> None:
+  def __init__(
+    self,
+    max_batch_chars: int = 12000,
+    max_batch_segments: int = 100,
+    chat_client: StructuredChatClient | None = None,
+  ) -> None:
     self.max_batch_chars = max(1000, max_batch_chars)
     self.max_batch_segments = max(10, max_batch_segments)
+    self.chat_client = chat_client or StructuredChatClient()
     self.last_model = ''
 
   def extract(
@@ -508,9 +518,9 @@ class AIQuestionExtractor:
         }, ensure_ascii=False),
       },
     ]
-    content = self._chat_json(root, api_key, model, schema, messages)
+    provider_payload = self._chat_json(root, api_key, model, schema, messages)
     try:
-      return self._validate_segmentation(content, segments)
+      return self._validate_segmentation(provider_payload, segments)
     except (ValidationError, ValueError) as first_error:
       repair_messages = [
         {
@@ -525,7 +535,7 @@ class AIQuestionExtractor:
           'content': json.dumps({
             'json_schema': schema,
             'validation_error': str(first_error),
-            'invalid_response': content,
+            'invalid_response': provider_payload,
             'source_window': request_context,
           }, ensure_ascii=False),
         },
@@ -539,49 +549,28 @@ class AIQuestionExtractor:
           detail=f'Text model returned invalid question segmentation after repair: {repair_error}',
         ) from repair_error
 
-  @staticmethod
   def _chat_json(
+    self,
     root: str,
     api_key: str,
     model: str,
     schema: dict[str, Any],
     messages: list[dict[str, str]],
-  ) -> str:
-    payload: dict[str, Any] = {
-      'model': model,
-      'temperature': 0,
-      'messages': messages,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'question_segmentation', 'strict': True, 'schema': schema},
-      },
-    }
-    response = requests.post(
-      f'{root}/chat/completions',
-      headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-      json=payload,
-      timeout=120,
-    )
-    if response.status_code == 400:
-      payload['response_format'] = {'type': 'json_object'}
-      response = requests.post(
-        f'{root}/chat/completions',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json=payload,
+  ) -> dict[str, Any]:
+    try:
+      return self.chat_client.complete_json(
+        base_url=root,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        schema=schema,
+        schema_name='question_structure',
         timeout=120,
+        temperature=0,
+        allow_plain_fallback=True,
       )
-      if response.status_code == 400:
-        payload.pop('response_format', None)
-        response = requests.post(
-          f'{root}/chat/completions',
-          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-          json=payload,
-          timeout=120,
-        )
-    response.raise_for_status()
-    return str(
-      (((response.json().get('choices') or [{}])[0].get('message') or {}).get('content') or '')
-    ).strip()
+    except ProviderTransportError as exc:
+      raise HTTPException(status_code=502, detail=f'Question extraction provider failed: {exc}') from exc
 
   @staticmethod
   def _normalize_model_list(value: Any) -> Any:
@@ -598,10 +587,9 @@ class AIQuestionExtractor:
   @classmethod
   def _validate_segmentation(
     cls,
-    content: str,
+    payload: dict[str, Any],
     segments: list[dict[str, Any]],
   ) -> list[dict[str, Any]]:
-    payload = QuestionAnalyzer._extract_json_object(content)
     for wrapper in ('segmentation', 'result', 'data'):
       wrapped = payload.get(wrapper)
       if isinstance(wrapped, dict) and 'questions' not in payload:
@@ -703,9 +691,9 @@ class AIQuestionExtractor:
         }, ensure_ascii=False),
       },
     ]
-    content = self._chat_json(root, api_key, model, schema, messages)
+    provider_payload = self._chat_json(root, api_key, model, schema, messages)
     try:
-      return self._validate_consolidation(content, groups)
+      return self._validate_consolidation(provider_payload, groups)
     except (ValidationError, ValueError) as first_error:
       repair_messages = [
         {
@@ -721,7 +709,7 @@ class AIQuestionExtractor:
           'content': json.dumps({
             'json_schema': schema,
             'validation_error': str(first_error),
-            'invalid_response': content,
+            'invalid_response': provider_payload,
             'provisional_groups': provisional,
           }, ensure_ascii=False),
         },
@@ -738,10 +726,9 @@ class AIQuestionExtractor:
   @classmethod
   def _validate_consolidation(
     cls,
-    content: str,
+    payload: dict[str, Any],
     groups: list[dict[str, Any]],
   ) -> list[dict[str, Any]]:
-    payload = QuestionAnalyzer._extract_json_object(content)
     for wrapper in ('consolidation', 'result', 'data'):
       wrapped = payload.get(wrapper)
       if isinstance(wrapped, dict) and 'questions' not in payload:
@@ -802,24 +789,19 @@ class AIQuestionExtractor:
 
 
 def extract_json_object(content: str) -> dict[str, Any]:
-  """Parse the first JSON object from an OpenAI-compatible text response."""
-  cleaned = content.strip()
-  if cleaned.startswith('```'):
-    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE).strip()
-  decoder = json.JSONDecoder()
-  for match in re.finditer(r'\{', cleaned):
-    try:
-      value, _ = decoder.raw_decode(cleaned[match.start():])
-    except json.JSONDecodeError:
-      continue
-    if isinstance(value, dict):
-      return value
-  raise ValueError('Text model response does not contain a JSON object.')
+  """Compatibility facade for callers that previously imported this helper."""
+  try:
+    return extract_provider_json_object(content)
+  except ProviderTransportError as exc:
+    raise ValueError(str(exc)) from exc
 
 
 class QuestionAnalyzer:
   _TOP_LEVEL_FIELDS = set(QuestionAnalysis.model_fields)
   _DIFFICULTY_FIELDS = set(Difficulty.model_fields)
+
+  def __init__(self, chat_client: StructuredChatClient | None = None) -> None:
+    self.chat_client = chat_client or StructuredChatClient()
 
   @staticmethod
   def _extract_json_object(content: str) -> dict[str, Any]:
@@ -852,22 +834,8 @@ class QuestionAnalyzer:
     return {key: value for key, value in normalized.items() if key in cls._TOP_LEVEL_FIELDS}
 
   @classmethod
-  def _validate_content(cls, content: str) -> QuestionAnalysis:
-    payload = cls._extract_json_object(content)
+  def _validate_payload(cls, payload: dict[str, Any]) -> QuestionAnalysis:
     return QuestionAnalysis.model_validate(cls._normalize_analysis_payload(payload))
-
-  @staticmethod
-  def _post_chat(root: str, api_key: str, payload: dict[str, Any]) -> requests.Response:
-    return requests.post(
-      f'{root}/chat/completions',
-      headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-      json=payload,
-      timeout=120,
-    )
-
-  @staticmethod
-  def _response_content(response: requests.Response) -> str:
-    return str((((response.json().get('choices') or [{}])[0].get('message') or {}).get('content') or '')).strip()
 
   def analyze(self, question: dict[str, Any]) -> QuestionAnalysis:
     config = load_api_config() or {}
@@ -877,7 +845,6 @@ class QuestionAnalyzer:
     if not base_url or not api_key or not model:
       raise HTTPException(status_code=422, detail='Text model configuration is required for question analysis.')
 
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = QuestionAnalysis.model_json_schema()
     expected_shape = {
       'question_type': '计算题/选择题/证明题等',
@@ -889,10 +856,7 @@ class QuestionAnalyzer:
       'skills': [],
       'summary': '',
     }
-    payload = {
-      'model': model,
-      'temperature': 0.1,
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -917,32 +881,24 @@ class QuestionAnalyzer:
             },
           }, ensure_ascii=False),
         },
-      ],
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'question_analysis', 'strict': True, 'schema': schema},
-      },
-    }
-    response = self._post_chat(root, api_key, payload)
-    if response.status_code == 400:
-      # MiniMax and some compatible gateways support json_object but reject
-      # OpenAI's stricter json_schema response format.
-      fallback_payload = {**payload, 'response_format': {'type': 'json_object'}}
-      response = self._post_chat(root, api_key, fallback_payload)
-      if response.status_code == 400:
-        unstructured_payload = {
-          key: value for key, value in fallback_payload.items() if key != 'response_format'
-        }
-        response = self._post_chat(root, api_key, unstructured_payload)
-    response.raise_for_status()
-    content = self._response_content(response)
+      ]
     try:
-      return self._validate_content(content)
+      provider_payload = self.chat_client.complete_json(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        schema=schema,
+        schema_name='question_analysis',
+        timeout=120,
+        temperature=0.1,
+        allow_plain_fallback=True,
+      )
+      return self._validate_payload(provider_payload)
+    except ProviderTransportError as exc:
+      raise HTTPException(status_code=502, detail=f'Question analysis provider failed: {exc}') from exc
     except (ValidationError, ValueError) as first_error:
-      repair_payload = {
-        'model': model,
-        'temperature': 0,
-        'messages': [
+      repair_messages = [
           {
             'role': 'system',
             'content': (
@@ -956,23 +912,23 @@ class QuestionAnalyzer:
             'content': json.dumps({
               'required_output_shape': expected_shape,
               'validation_error': str(first_error),
-              'invalid_response': content,
+              'invalid_response': provider_payload,
             }, ensure_ascii=False),
           },
-        ],
-        'response_format': {'type': 'json_object'},
-      }
-      repair_response = self._post_chat(root, api_key, repair_payload)
-      if repair_response.status_code == 400:
-        unstructured_repair_payload = {
-          key: value for key, value in repair_payload.items() if key != 'response_format'
-        }
-        repair_response = self._post_chat(root, api_key, unstructured_repair_payload)
-      repair_response.raise_for_status()
-      repaired_content = self._response_content(repair_response)
+        ]
       try:
-        return self._validate_content(repaired_content)
-      except (ValidationError, ValueError) as repair_error:
+        repaired_payload = self.chat_client.complete_json(
+          base_url=base_url,
+          api_key=api_key,
+          model=model,
+          messages=repair_messages,
+          schema=None,
+          timeout=120,
+          temperature=0,
+          allow_plain_fallback=True,
+        )
+        return self._validate_payload(repaired_payload)
+      except (ProviderTransportError, ValidationError, ValueError) as repair_error:
         raise HTTPException(
           status_code=502,
           detail=f'Text model returned invalid question analysis after repair: {repair_error}',
@@ -1404,4 +1360,3 @@ class QuestionPipeline:
   @staticmethod
   def _write(path: Path, value: Any) -> None:
     write_json_atomic(path, value)
-

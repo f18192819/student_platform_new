@@ -7,10 +7,9 @@ from typing import Any, Protocol
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-import requests
 
 from .assessment_planner import AssessmentPart, AssessmentPlanner, AssessmentSpec
-from .question_pipeline import extract_json_object
+from .provider_transport import ProviderTransportError, StructuredChatClient
 from .runtime_config import load_api_config
 
 
@@ -46,6 +45,9 @@ class QuestionGrader(Protocol):
 class ConfiguredQuestionGrader:
   """Grades subjective answers only; mastery projection remains deterministic code."""
 
+  def __init__(self, chat_client: StructuredChatClient | None = None) -> None:
+    self.chat_client = chat_client or StructuredChatClient()
+
   def grade(self, candidate: dict[str, Any], answer: str) -> GradingResult:
     method = str(candidate.get('grading_method') or '')
     reference = str(candidate.get('reference_answer') or '').strip()
@@ -75,16 +77,8 @@ class ConfiguredQuestionGrader:
     model = str(config.get('model') or '').strip()
     if not base_url or not api_key or not model:
       raise HTTPException(status_code=422, detail='Text model configuration is required for subjective grading.')
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = GradingResult.model_json_schema()
-    payload = {
-      'model': model,
-      'temperature': 0.0,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'question_grading', 'strict': True, 'schema': schema},
-      },
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -103,27 +97,20 @@ class ConfiguredQuestionGrader:
             'json_schema': schema,
           }, ensure_ascii=False),
         },
-      ],
-    }
+      ]
     try:
-      response = requests.post(
-        f'{root}/chat/completions',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json=payload,
+      provider_payload = self.chat_client.complete_json(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        schema=schema,
+        schema_name='question_grading',
         timeout=90,
+        temperature=0.0,
       )
-      if response.status_code >= 400:
-        fallback = {**payload, 'response_format': {'type': 'json_object'}}
-        response = requests.post(
-          f'{root}/chat/completions',
-          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-          json=fallback,
-          timeout=90,
-        )
-      response.raise_for_status()
-      content = response.json()['choices'][0]['message']['content']
-      grading = GradingResult.model_validate(extract_json_object(str(content)))
-    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError) as exc:
+      grading = GradingResult.model_validate(provider_payload)
+    except (ProviderTransportError, ValidationError) as exc:
       raise HTTPException(status_code=502, detail=f'Text model grading failed: {exc}') from exc
     # One stable threshold keeps the mastery algorithm independent of provider wording.
     grading.correct = grading.score >= 0.75

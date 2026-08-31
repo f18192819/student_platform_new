@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
-import re
 from typing import Any, Protocol
 
-import requests
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 
@@ -15,6 +12,7 @@ from .document_pipeline import (
 )
 from .question_pipeline import QUESTION_COLLECTION
 from .question_relations import ApiReranker
+from .provider_transport import ProviderTransportError, StructuredChatClient
 from .runtime_config import load_api_config
 
 
@@ -38,6 +36,9 @@ class QueryRewriter(Protocol):
 class StandaloneQueryRewriter:
   """Resolve follow-up references before embedding without changing the answer question."""
 
+  def __init__(self, chat_client: StructuredChatClient | None = None) -> None:
+    self.chat_client = chat_client or StructuredChatClient()
+
   @staticmethod
   def _recent_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     normalized: list[dict[str, str]] = []
@@ -55,25 +56,8 @@ class StandaloneQueryRewriter:
     return normalized
 
   @staticmethod
-  def _response_payload(content: str) -> StandaloneQueryPayload:
-    normalized = str(content or '').strip()
-    fenced = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', normalized, re.DOTALL | re.IGNORECASE)
-    if fenced:
-      normalized = fenced.group(1)
-    if not normalized.startswith('{'):
-      object_match = re.search(r'\{.*\}', normalized, re.DOTALL)
-      if object_match:
-        normalized = object_match.group(0)
-    return StandaloneQueryPayload.model_validate(json.loads(normalized))
-
-  @staticmethod
-  def _request(root: str, api_key: str, payload: dict[str, Any]) -> requests.Response:
-    return requests.post(
-      f'{root}/chat/completions',
-      headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-      json=payload,
-      timeout=15,
-    )
+  def _response_payload(payload: dict[str, Any]) -> StandaloneQueryPayload:
+    return StandaloneQueryPayload.model_validate(payload)
 
   def rewrite(
     self,
@@ -94,17 +78,17 @@ class StandaloneQueryRewriter:
       if not base_url or not api_key or not model:
         return original, 'fallback', 'Text model configuration is unavailable for query rewrite.'
 
-      root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
       schema = StandaloneQueryPayload.model_json_schema()
-      payload = {
-        'model': model,
-        'temperature': 0,
-        'max_tokens': 512,
-        'response_format': {
-          'type': 'json_schema',
-          'json_schema': {'name': 'standalone_retrieval_query', 'strict': True, 'schema': schema},
-        },
-        'messages': [
+      provider_payload = self.chat_client.complete_json(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        schema=schema,
+        schema_name='standalone_retrieval_query',
+        timeout=15,
+        temperature=0,
+        extra_payload={'max_tokens': 512},
+        messages=[
           {
             'role': 'system',
             'content': (
@@ -123,15 +107,10 @@ class StandaloneQueryRewriter:
             }, ensure_ascii=False),
           },
         ],
-      }
-      response = self._request(root, api_key, payload)
-      if response.status_code >= 400:
-        response = self._request(root, api_key, {**payload, 'response_format': {'type': 'json_object'}})
-      response.raise_for_status()
-      content = str(response.json()['choices'][0]['message']['content'])
-      rewritten = self._response_payload(content).query.strip()
+      )
+      rewritten = self._response_payload(provider_payload).query.strip()
       return rewritten or original, 'text-model', None
-    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError) as exc:
+    except (ProviderTransportError, TypeError, ValueError, ValidationError) as exc:
       return original, 'fallback', f'{type(exc).__name__}: {exc}'
     except Exception as exc:  # noqa: BLE001 - query rewriting must never break retrieval.
       return original, 'fallback', f'{type(exc).__name__}: {exc}'

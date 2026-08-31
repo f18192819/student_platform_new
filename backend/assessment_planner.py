@@ -9,12 +9,11 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from typing import Any, Literal
 
-import requests
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .learning_state import LearningStateStore, QuestionReferenceAnswer
-from .question_pipeline import extract_json_object
+from .provider_transport import ProviderTransportError, StructuredChatClient
 from .runtime_config import load_api_config
 
 DEFAULT_NUMERIC_TOLERANCE = 1e-6
@@ -169,8 +168,13 @@ class DistractorBatch(BaseModel):
 class AssessmentPlanner:
   """Plans and persists how one real source question is answered during a test."""
 
-  def __init__(self, store: LearningStateStore) -> None:
+  def __init__(
+    self,
+    store: LearningStateStore,
+    chat_client: StructuredChatClient | None = None,
+  ) -> None:
     self.store = store
+    self.chat_client = chat_client or StructuredChatClient()
 
   def get_or_create(
     self,
@@ -399,8 +403,8 @@ class AssessmentPlanner:
     )
     return self.store.save_question_reference_answer(course_id, answer)
 
-  @staticmethod
   def _request_generated_reference_answer(
+    self,
     prompt: str,
     partial_answer: str,
     analysis: dict[str, Any],
@@ -415,16 +419,8 @@ class AssessmentPlanner:
         detail='生成参考答案需要先配置文本处理模型。',
       )
 
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = GeneratedReferenceAnswer.model_json_schema()
-    payload = {
-      'model': model,
-      'temperature': 0.1,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'generated_reference_answer', 'strict': True, 'schema': schema},
-      },
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -447,25 +443,22 @@ class AssessmentPlanner:
             'json_schema': schema,
           }, ensure_ascii=False),
         },
-      ],
-    }
-    for attempt in range(2):
-      if attempt:
-        payload['response_format'] = {'type': 'json_object'}
+      ]
+    for response_schema in (schema, None):
       try:
-        response = requests.post(
-          f'{root}/chat/completions',
-          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-          json=payload,
+        provider_payload = self.chat_client.complete_json(
+          base_url=base_url,
+          api_key=api_key,
+          model=model,
+          messages=messages,
+          schema=response_schema,
+          schema_name='generated_reference_answer',
           timeout=180,
+          temperature=0.1,
         )
-        response.raise_for_status()
-        content = response.json()['choices'][0]['message']['content']
-        generated = GeneratedReferenceAnswer.model_validate(
-          extract_json_object(str(content))
-        )
+        generated = GeneratedReferenceAnswer.model_validate(provider_payload)
         return generated, model
-      except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+      except (ProviderTransportError, ValidationError):
         continue
     raise HTTPException(status_code=502, detail='AI 参考答案生成失败，请稍后重试。')
 
@@ -482,16 +475,8 @@ class AssessmentPlanner:
     if not base_url or not api_key or not model:
       return None
 
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = AssessmentTaskInventory.model_json_schema()
-    payload = {
-      'model': model,
-      'temperature': 0.15,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'assessment_task_inventory', 'strict': True, 'schema': schema},
-      },
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -527,25 +512,22 @@ class AssessmentPlanner:
             ensure_ascii=False,
           ),
         },
-      ],
-    }
+      ]
     try:
       inventory = None
-      for attempt in range(2):
-        if attempt:
-          payload['response_format'] = {'type': 'json_object'}
+      for response_schema in (schema, None):
         try:
-          response = requests.post(
-            f'{root}/chat/completions',
-            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-            json=payload,
+          provider_payload = self.chat_client.complete_json(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            schema=response_schema,
+            schema_name='assessment_task_inventory',
             timeout=150,
+            temperature=0.15,
           )
-          response.raise_for_status()
-          content = response.json()['choices'][0]['message']['content']
-          candidate = AssessmentTaskInventory.model_validate(
-            extract_json_object(str(content))
-          )
+          candidate = AssessmentTaskInventory.model_validate(provider_payload)
           if candidate.task_count != len(candidate.tasks):
             raise ValueError('Assessment task_count does not match tasks.')
           if not candidate.reference_complete or candidate.uncovered_requirements:
@@ -562,7 +544,7 @@ class AssessmentPlanner:
           break
         except HTTPException:
           raise
-        except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+        except (ProviderTransportError, TypeError, ValueError, ValidationError):
           continue
       if inventory is None:
         return None
@@ -594,7 +576,7 @@ class AssessmentPlanner:
           uncertain=False,
         ))
       return PlannedAssessment(parts=parts)
-    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+    except (ProviderTransportError, TypeError, ValueError, ValidationError):
       return None
 
   @classmethod
@@ -634,16 +616,8 @@ class AssessmentPlanner:
     if not base_url or not api_key or not model:
       return {}
 
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = DistractorBatch.model_json_schema()
-    payload = {
-      'model': model,
-      'temperature': 0.35,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'assessment_distractor_batch', 'strict': True, 'schema': schema},
-      },
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -670,28 +644,19 @@ class AssessmentPlanner:
             'json_schema': schema,
           }, ensure_ascii=False),
         },
-      ],
-    }
+      ]
     try:
-      response = requests.post(
-        f'{root}/chat/completions',
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json=payload,
+      provider_payload = self.chat_client.complete_json(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        schema=schema,
+        schema_name='assessment_distractor_batch',
         timeout=90,
+        temperature=0.35,
       )
-      if response.status_code >= 400:
-        payload['response_format'] = {'type': 'json_object'}
-        response = requests.post(
-          f'{root}/chat/completions',
-          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-          json=payload,
-          timeout=90,
-        )
-      response.raise_for_status()
-      content = response.json()['choices'][0]['message']['content']
-      result = DistractorBatch.model_validate(
-        extract_json_object(str(content))
-      )
+      result = DistractorBatch.model_validate(provider_payload)
       expected_ids = {task.id for task in tasks}
       generated = {
         item.task_id: item.distractors
@@ -699,7 +664,7 @@ class AssessmentPlanner:
         if item.task_id in expected_ids
       }
       return generated
-    except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+    except (ProviderTransportError, TypeError, ValueError, ValidationError):
       return {}
 
   def _request_distractors(
@@ -716,16 +681,8 @@ class AssessmentPlanner:
     if not base_url or not api_key or not model:
       return []
 
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = DistractorPlan.model_json_schema()
-    payload = {
-      'model': model,
-      'temperature': 0.35,
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'expression_distractors', 'strict': True, 'schema': schema},
-      },
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -746,27 +703,24 @@ class AssessmentPlanner:
             'json_schema': schema,
           }, ensure_ascii=False),
         },
-      ],
-    }
-    for attempt in range(2):
-      if attempt:
-        payload['response_format'] = {'type': 'json_object'}
+      ]
+    for response_schema in (schema, None):
       try:
-        response = requests.post(
-          f'{root}/chat/completions',
-          headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-          json=payload,
+        provider_payload = self.chat_client.complete_json(
+          base_url=base_url,
+          api_key=api_key,
+          model=model,
+          messages=messages,
+          schema=response_schema,
+          schema_name='expression_distractors',
           timeout=90,
+          temperature=0.35,
         )
-        response.raise_for_status()
-        content = response.json()['choices'][0]['message']['content']
-        result = DistractorPlan.model_validate(
-          extract_json_object(str(content))
-        )
+        result = DistractorPlan.model_validate(provider_payload)
         valid = self._valid_distractors(correct_answer, result.distractors)
         if len(valid) == 3:
           return valid
-      except (requests.RequestException, KeyError, TypeError, ValueError, ValidationError):
+      except (ProviderTransportError, TypeError, ValueError, ValidationError):
         continue
     return []
 
@@ -983,4 +937,3 @@ class AssessmentPlanner:
     except InvalidOperation:
       return None
     return numeric if numeric.is_finite() else None
-

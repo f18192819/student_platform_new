@@ -30,6 +30,7 @@ from .question_pipeline import (
 from .knowledge_storage import read_knowledge_library
 from .runtime_config import load_api_config
 from .question_relation_query import FileQuestionRelationQuery
+from .provider_transport import ProviderTransportError, StructuredChatClient
 
 QUESTION_RELATIONS_ROOT = PROJECT_ROOT / '.runtime' / 'question-relations'
 RELATION_CONFIG_PATH = QUESTION_RELATIONS_ROOT / 'config.json'
@@ -216,24 +217,11 @@ class AiLectureRelationVerifier:
 
   _FIELDS = set(LectureRelationVerification.model_fields)
 
-  @staticmethod
-  def _extract_json_object(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith('```'):
-      cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE).strip()
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'\{', cleaned):
-      try:
-        value, _ = decoder.raw_decode(cleaned[match.start():])
-      except json.JSONDecodeError:
-        continue
-      if isinstance(value, dict):
-        return value
-    raise ValueError('Text model response does not contain a JSON object.')
+  def __init__(self, chat_client: StructuredChatClient | None = None) -> None:
+    self.chat_client = chat_client or StructuredChatClient()
 
   @classmethod
-  def _validate_content(cls, content: str) -> LectureRelationVerification:
-    payload = cls._extract_json_object(content)
+  def _validate_payload(cls, payload: dict[str, Any]) -> LectureRelationVerification:
     for wrapper in ('verification', 'result', 'data'):
       wrapped = payload.get(wrapper)
       if isinstance(wrapped, dict) and not cls._FIELDS.intersection(payload):
@@ -248,19 +236,6 @@ class AiLectureRelationVerifier:
     elif evidence is None:
       normalized['concrete_evidence'] = []
     return LectureRelationVerification.model_validate(normalized)
-
-  @staticmethod
-  def _post(root: str, api_key: str, payload: dict[str, Any]) -> requests.Response:
-    return requests.post(
-      f'{root}/chat/completions',
-      headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-      json=payload,
-      timeout=120,
-    )
-
-  @staticmethod
-  def _content(response: requests.Response) -> str:
-    return str((((response.json().get('choices') or [{}])[0].get('message') or {}).get('content') or '')).strip()
 
   def verify(
     self,
@@ -278,7 +253,6 @@ class AiLectureRelationVerifier:
     if not base_url or not api_key or not model:
       raise HTTPException(status_code=422, detail='Text model configuration is required for lecture relation verification.')
 
-    root = re.sub(r'/(chat/completions|embeddings|rerank)$', '', base_url.rstrip('/'))
     schema = LectureRelationVerification.model_json_schema()
     expected_shape = {
       'related': False,
@@ -306,10 +280,7 @@ class AiLectureRelationVerifier:
       },
       'expansion_context': expansion_context or {'kind': 'seed'},
     }
-    payload = {
-      'model': model,
-      'temperature': 0,
-      'messages': [
+    messages = [
         {
           'role': 'system',
           'content': (
@@ -327,26 +298,21 @@ class AiLectureRelationVerifier:
           ),
         },
         {'role': 'user', 'content': json.dumps(user_content, ensure_ascii=False)},
-      ],
-      'response_format': {
-        'type': 'json_schema',
-        'json_schema': {'name': 'lecture_relation_verification', 'strict': True, 'schema': schema},
-      },
-    }
-    response = self._post(root, api_key, payload)
-    if response.status_code == 400:
-      response = self._post(root, api_key, {**payload, 'response_format': {'type': 'json_object'}})
-      if response.status_code == 400:
-        response = self._post(root, api_key, {key: value for key, value in payload.items() if key != 'response_format'})
-    response.raise_for_status()
-    content = self._content(response)
+      ]
     try:
-      decision = self._validate_content(content)
+      payload = self.chat_client.complete_json(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        schema=schema,
+        schema_name='lecture_relation_verification',
+        timeout=120,
+        allow_plain_fallback=True,
+      )
+      decision = self._validate_payload(payload)
     except (ValidationError, ValueError) as first_error:
-      repair_payload = {
-        'model': model,
-        'temperature': 0,
-        'messages': [
+      repair_messages = [
           {
             'role': 'system',
             'content': '修复讲义关联审核 JSON。只输出一个符合给定结构的 JSON 对象，不要增加事实。',
@@ -356,21 +322,28 @@ class AiLectureRelationVerifier:
             'content': json.dumps({
               'required_output_shape': expected_shape,
               'validation_error': str(first_error),
-              'invalid_response': content,
+              'invalid_response': payload if 'payload' in locals() else {},
             }, ensure_ascii=False),
           },
-        ],
-        'response_format': {'type': 'json_object'},
-      }
-      repair_response = self._post(root, api_key, repair_payload)
-      if repair_response.status_code == 400:
-        repair_response = self._post(
-          root,
-          api_key,
-          {key: value for key, value in repair_payload.items() if key != 'response_format'},
+        ]
+      try:
+        repaired = self.chat_client.complete_json(
+          base_url=base_url,
+          api_key=api_key,
+          model=model,
+          messages=repair_messages,
+          schema=None,
+          timeout=120,
+          allow_plain_fallback=True,
         )
-      repair_response.raise_for_status()
-      decision = self._validate_content(self._content(repair_response))
+        decision = self._validate_payload(repaired)
+      except (ProviderTransportError, ValidationError, ValueError) as repair_error:
+        raise HTTPException(
+          status_code=502,
+          detail=f'Text model returned invalid lecture verification after repair: {repair_error}',
+        ) from repair_error
+    except ProviderTransportError as error:
+      raise HTTPException(status_code=502, detail=str(error)) from error
     normalized = decision.model_dump()
     normalized['reason'] = re.sub(r'</?item(?:\s[^>]*)?>', '', normalized['reason'], flags=re.IGNORECASE).strip()
     normalized['concrete_evidence'] = [
@@ -483,12 +456,14 @@ class QuestionRelationPipeline:
     self.relations_dir = root / 'relations'
     self.document_index_dir = root / 'documents'
     self.lecture_page_index_dir = root / 'lecture-pages'
+    self.lecture_document_index_dir = root / 'lecture-document-index'
     self.question_reverse_index_dir = root / 'question-targets'
     self.question_documents_root = question_documents_root
     self.lecture_documents_root = lecture_documents_root
     self.query = FileQuestionRelationQuery(
       relations_dir=self.relations_dir,
       lecture_page_index_dir=self.lecture_page_index_dir,
+      lecture_document_index_dir=self.lecture_document_index_dir,
       question_reverse_index_dir=self.question_reverse_index_dir,
       question_documents_root=self.question_documents_root,
       lecture_documents_root=self.lecture_documents_root,
@@ -555,6 +530,7 @@ class QuestionRelationPipeline:
     # previous reverse-page entries now so an interrupted retry cannot leave
     # stale lecture cards behind.
     self._sync_lecture_page_indexes(previous_record, record)
+    self._sync_lecture_document_indexes(previous_record, record)
     self._sync_question_reverse_indexes(previous_record, record)
     for target_name, collection, document_types, relation_type in targets:
       record['current_target'] = target_name
@@ -617,10 +593,12 @@ class QuestionRelationPipeline:
       )
       record['generated_at'] = time.time()
       _write_json(record_path, record)
+      self._sync_lecture_document_indexes(previous_record, record)
       self._sync_question_reverse_indexes(previous_record, record)
     record.update({'generated_at': time.time(), 'status': 'completed', 'current_target': None})
     _write_json(record_path, record)
     self._sync_lecture_page_indexes(previous_record, record)
+    self._sync_lecture_document_indexes(previous_record, record)
     self._sync_question_reverse_indexes(previous_record, record)
     return record
 
@@ -924,12 +902,16 @@ class QuestionRelationPipeline:
     if self.question_reverse_index_dir.is_dir():
       for path in self.question_reverse_index_dir.rglob('*.json'):
         path.unlink()
+    if self.lecture_document_index_dir.is_dir():
+      for path in self.lecture_document_index_dir.rglob('*.json'):
+        path.unlink()
     indexed_records = 0
     for path in self.relations_dir.glob('*.json') if self.relations_dir.is_dir() else []:
       record = _read_json(path, {})
       if not isinstance(record, dict):
         continue
       self._sync_lecture_page_indexes({}, record)
+      self._sync_lecture_document_indexes({}, record)
       self._sync_question_reverse_indexes({}, record)
       indexed_records += 1
     page_files = (
@@ -947,6 +929,20 @@ class QuestionRelationPipeline:
       'lecture_pages': page_files,
       'question_targets': question_target_files,
     }
+
+  def rebuild_lecture_document_indexes(self) -> int:
+    """Repair the lecture reverse projection for data created by older versions."""
+    if self.lecture_document_index_dir.is_dir():
+      for path in self.lecture_document_index_dir.glob('*.json'):
+        path.unlink()
+    indexed_records = 0
+    for path in self.relations_dir.glob('*.json') if self.relations_dir.is_dir() else []:
+      record = _read_json(path, {})
+      if not isinstance(record, dict):
+        continue
+      self._sync_lecture_document_indexes({}, record)
+      indexed_records += 1
+    return indexed_records
 
   def delete_question_document(self, document_id: str) -> None:
     """Delete source-question relation records before its question document is removed."""
@@ -975,6 +971,7 @@ class QuestionRelationPipeline:
       if path.is_file():
         previous_record = _read_json(path, {})
         self._sync_lecture_page_indexes(previous_record, {})
+        self._sync_lecture_document_indexes(previous_record, {})
         self._sync_question_reverse_indexes(previous_record, {})
         path.unlink()
     for question_id in question_ids:
@@ -1018,11 +1015,15 @@ class QuestionRelationPipeline:
           record['updated_at'] = time.time()
           _write_json(path, record)
           self._sync_lecture_page_indexes(previous_record, record)
+          self._sync_lecture_document_indexes(previous_record, record)
           self._sync_question_reverse_indexes(previous_record, record)
 
     reverse_index_directory = self.lecture_page_index_dir / _safe_name(document_id)
     if reverse_index_directory.is_dir():
       shutil.rmtree(reverse_index_directory)
+    lecture_document_index = self.lecture_document_index_dir / f'{_safe_name(document_id)}.json'
+    if lecture_document_index.is_file():
+      lecture_document_index.unlink()
 
   def _lecture_page_index_path(self, document_id: str, page_number: int) -> Path:
     return self.lecture_page_index_dir / _safe_name(document_id) / f'page-{page_number}.json'
@@ -1112,6 +1113,63 @@ class QuestionRelationPipeline:
         'lecture_document_id': document_id,
         'page_number': page_number,
         'relations': relations,
+        'updated_at': time.time(),
+      })
+
+  @staticmethod
+  def _lecture_document_ids(record: dict[str, Any]) -> set[str]:
+    return {
+      str((relation.get('target') or {}).get('document_id') or '').strip()
+      for relation in record.get('relations') or []
+      if isinstance(relation, dict)
+      and relation.get('relation_type') == 'question_to_lecture_page'
+      and str((relation.get('target') or {}).get('document_id') or '').strip()
+    }
+
+  def _sync_lecture_document_indexes(
+    self,
+    previous_record: dict[str, Any],
+    current_record: dict[str, Any],
+  ) -> None:
+    """Maintain the lecture-to-question projection used by adaptive testing."""
+    affected_ids = (
+      self._lecture_document_ids(previous_record)
+      | self._lecture_document_ids(current_record)
+    )
+    source_question_ids = {
+      str(record.get('question_id') or '').strip()
+      for record in (previous_record, current_record)
+      if isinstance(record, dict) and str(record.get('question_id') or '').strip()
+    }
+    current_question_id = str(current_record.get('question_id') or '').strip()
+    current_course_id = str(current_record.get('course_id') or '').strip()
+    current_lecture_ids = self._lecture_document_ids(current_record)
+
+    for lecture_document_id in affected_ids:
+      path = self.lecture_document_index_dir / f'{_safe_name(lecture_document_id)}.json'
+      existing = _read_json(path, {})
+      existing_course_id = str(existing.get('course_id') or '') if isinstance(existing, dict) else ''
+      question_ids = {
+        str(value or '').strip()
+        for value in existing.get('question_ids', [])
+        if str(value or '').strip()
+      } if isinstance(existing, dict) else set()
+      question_ids.difference_update(source_question_ids)
+
+      if lecture_document_id in current_lecture_ids and current_question_id:
+        if existing_course_id and current_course_id and existing_course_id != current_course_id:
+          question_ids.clear()
+        question_ids.add(current_question_id)
+
+      if not question_ids:
+        if path.is_file():
+          path.unlink()
+        continue
+      course_id = current_course_id or existing_course_id or str(previous_record.get('course_id') or '')
+      _write_json(path, {
+        'course_id': course_id,
+        'lecture_document_id': lecture_document_id,
+        'question_ids': sorted(question_ids),
         'updated_at': time.time(),
       })
 
@@ -1537,4 +1595,3 @@ class QuestionRelationPipeline:
         'content': payload.get('content'),
       },
     }
-

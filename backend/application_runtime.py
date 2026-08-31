@@ -96,6 +96,10 @@ class ApplicationRuntime:
       resume_assessments=resume_assessment_preparations,
     )
     try:
+      relations.rebuild_lecture_document_indexes()
+    except Exception as exc:
+      print(f'Lecture relation index repair deferred: {exc}')
+    try:
       documents.vector_store.migrate_legacy_collections(
         [QDRANT_COLLECTION, QUESTION_COLLECTION]
       )

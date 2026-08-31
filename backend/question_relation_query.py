@@ -27,12 +27,14 @@ class FileQuestionRelationQuery:
     *,
     relations_dir: Path,
     lecture_page_index_dir: Path,
+    lecture_document_index_dir: Path,
     question_reverse_index_dir: Path,
     question_documents_root: Path,
     lecture_documents_root: Path,
   ) -> None:
     self.relations_dir = relations_dir
     self.lecture_page_index_dir = lecture_page_index_dir
+    self.lecture_document_index_dir = lecture_document_index_dir
     self.question_reverse_index_dir = question_reverse_index_dir
     self.question_documents_root = question_documents_root
     self.lecture_documents_root = lecture_documents_root
@@ -90,7 +92,11 @@ class FileQuestionRelationQuery:
     if question_ids is not None and not selected:
       return []
     targets = []
-    paths = sorted(self.relations_dir.glob('*.json')) if self.relations_dir.is_dir() else []
+    paths = (
+      [self.relations_dir / f'{safe_storage_name(question_id)}.json' for question_id in sorted(selected)]
+      if question_ids is not None
+      else sorted(self.relations_dir.glob('*.json')) if self.relations_dir.is_dir() else []
+    )
     for path in paths:
       record = read_json_file(path, {})
       if not isinstance(record, dict) or record.get('status') != 'completed':
@@ -167,7 +173,7 @@ class FileQuestionRelationQuery:
     }
     questions: dict[str, dict[str, Any]] = {}
     if valid_pages and self.relations_dir.is_dir():
-      for path in self.relations_dir.glob('*.json'):
+      for path in self._lecture_relation_paths(course_id, lecture_document_id):
         record = read_json_file(path, {})
         if not isinstance(record, dict) or str(record.get('course_id') or '') != course_id:
           continue
@@ -218,6 +224,27 @@ class FileQuestionRelationQuery:
       'lecture_document_id': lecture_document_id,
       'questions': result,
     }
+
+  def _lecture_relation_paths(self, course_id: str, lecture_document_id: str) -> list[Path]:
+    """Resolve only the relation records referenced by a lecture index when available."""
+    index = read_json_file(
+      self.lecture_document_index_dir / f'{safe_storage_name(lecture_document_id)}.json',
+      None,
+    )
+    if (
+      isinstance(index, dict)
+      and str(index.get('course_id') or '') == course_id
+      and str(index.get('lecture_document_id') or '') == lecture_document_id
+      and isinstance(index.get('question_ids'), list)
+    ):
+      return [
+        self.relations_dir / f'{safe_storage_name(question_id)}.json'
+        for question_id in sorted({
+          str(value or '').strip() for value in index['question_ids'] if str(value or '').strip()
+        })
+      ]
+    # Compatibility for relation data written before lecture-document indexes existed.
+    return sorted(self.relations_dir.glob('*.json'))
 
   def _lecture_pages(self, document_id: str) -> list[dict[str, Any]]:
     pages = read_json_file(
