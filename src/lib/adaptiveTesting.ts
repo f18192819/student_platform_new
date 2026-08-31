@@ -170,6 +170,18 @@ export type AdaptiveTestPayload = {
   }
 }
 
+export class AdaptiveTestApiError extends Error {
+  readonly code: string
+  readonly status: number
+
+  constructor(message: string, status: number, code = '') {
+    super(message)
+    this.name = 'AdaptiveTestApiError'
+    this.status = status
+    this.code = code
+  }
+}
+
 async function readPayload(response: Response): Promise<AdaptiveTestPayload> {
   if (!response.ok) {
     let message = `请求失败 (HTTP ${response.status})`
@@ -181,7 +193,11 @@ async function readPayload(response: Response): Promise<AdaptiveTestPayload> {
     } catch {
       // Keep the HTTP fallback when a provider returns a non-JSON error.
     }
-    throw new Error(message)
+    throw new AdaptiveTestApiError(
+      message,
+      response.status,
+      response.headers.get('X-Error-Code') ?? '',
+    )
   }
   return await response.json() as AdaptiveTestPayload
 }

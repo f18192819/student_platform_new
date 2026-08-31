@@ -325,6 +325,55 @@ class LearningStateStore:
         ),
       )
 
+  def get_session_assessment_spec(
+    self,
+    course_id: str,
+    session_id: str,
+    question_id: str,
+  ) -> dict[str, Any] | None:
+    with self._connect(course_id) as connection:
+      row = connection.execute(
+        '''
+        SELECT spec_json FROM adaptive_session_assessment_specs
+        WHERE session_id = ? AND question_id = ?
+        ''',
+        (session_id, question_id),
+      ).fetchone()
+    if not row:
+      return None
+    try:
+      payload = json.loads(row['spec_json'])
+    except (TypeError, ValueError):
+      return None
+    return payload if isinstance(payload, dict) else None
+
+  def save_session_assessment_spec(
+    self,
+    course_id: str,
+    session_id: str,
+    question_id: str,
+    spec: dict[str, Any],
+  ) -> None:
+    timestamp = _now()
+    with self._connect(course_id) as connection:
+      connection.execute(
+        '''
+        INSERT INTO adaptive_session_assessment_specs (
+          session_id, question_id, spec_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, question_id) DO UPDATE SET
+          spec_json = excluded.spec_json,
+          updated_at = excluded.updated_at
+        ''',
+        (
+          session_id,
+          question_id,
+          json.dumps(spec, ensure_ascii=False),
+          timestamp,
+          timestamp,
+        ),
+      )
+
   def delete_assessment_spec(self, course_id: str, question_id: str) -> None:
     with self._connect(course_id) as connection:
       connection.execute(
@@ -717,6 +766,17 @@ class LearningStateStore:
       );
       CREATE INDEX IF NOT EXISTS idx_test_sessions_lecture
         ON adaptive_test_sessions(course_id, lecture_document_id, status);
+      CREATE TABLE IF NOT EXISTS adaptive_session_assessment_specs (
+        session_id TEXT NOT NULL,
+        question_id TEXT NOT NULL,
+        spec_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, question_id),
+        FOREIGN KEY(session_id) REFERENCES adaptive_test_sessions(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_assessment_question
+        ON adaptive_session_assessment_specs(question_id);
       CREATE TABLE IF NOT EXISTS assessment_specs (
         question_id TEXT PRIMARY KEY,
         source_document_id TEXT NOT NULL DEFAULT '',
@@ -962,4 +1022,3 @@ class LearningStateStore:
       created_at=str(row['created_at']),
       updated_at=str(row['updated_at']),
     )
-

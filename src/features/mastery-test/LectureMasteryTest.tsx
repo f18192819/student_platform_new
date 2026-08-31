@@ -11,6 +11,7 @@ import {
   retryAdaptiveTestPreparation,
   startAdaptiveTest,
   submitAdaptiveAnswer,
+  AdaptiveTestApiError,
   type AdaptiveTestAnswer,
   type AdaptiveTestQuestion,
   type AdaptiveTestQuestionImage,
@@ -19,7 +20,7 @@ import {
   type AssessmentResponse,
 } from '../../lib/adaptiveTesting'
 import { resolveBackendApiUrl } from '../../lib/apiConfig'
-import { prepareMineruMarkdownMath } from '../../lib/latexMarkdown'
+import { prepareAssessmentMarkdownMath } from '../../lib/latexMarkdown'
 
 function percentage(value: number) {
   return `${Math.round(value * 100)}%`
@@ -67,7 +68,7 @@ function SourceText({ children }: { children: string }) {
   return (
     <div className="mastery-test__source-text">
       <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
-        {prepareMineruMarkdownMath(children)}
+        {prepareAssessmentMarkdownMath(children)}
       </ReactMarkdown>
     </div>
   )
@@ -192,9 +193,19 @@ export function LectureMasteryTest({
         ...(payload.questions ?? []).map((question) => question.question_id),
         ...(payload.current_question ? [payload.current_question.question_id] : []),
       ])
+      const questionById = new Map(
+        [
+          ...(payload.questions ?? []),
+          ...(payload.current_question ? [payload.current_question] : []),
+        ].map((question) => [question.question_id, question]),
+      )
       const next: DraftResponses = {}
       for (const [questionId, value] of Object.entries({ ...stored, ...current })) {
-        if (unlockedIds.has(questionId)) next[questionId] = value
+        if (!unlockedIds.has(questionId)) continue
+        const validPartIds = new Set(assessmentParts(questionById.get(questionId)).map((part) => part.id))
+        next[questionId] = Object.fromEntries(
+          Object.entries(value).filter(([partId]) => validPartIds.has(partId)),
+        )
       }
       for (const saved of payload.answers ?? []) {
         if (next[saved.question_id] === undefined) {
@@ -283,7 +294,55 @@ export function LectureMasteryTest({
       setSelectedQuestionId(selectedQuestion.question_id)
       setShowResults(false)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '答案评分失败，请稍后重试。')
+      const message = reason instanceof Error ? reason.message : '答案评分失败，请稍后重试。'
+      const assessmentChanged = (reason instanceof AdaptiveTestApiError
+        && reason.code === 'assessment_spec_conflict')
+        || message.includes('unknown assessment part')
+        || message.includes('作答结构已更新')
+      if (assessmentChanged) {
+        try {
+          const refreshed = await getActiveAdaptiveTest(courseId, lectureDocumentId)
+          if (refreshed) {
+            setPayload(refreshed)
+            setSelectedQuestionId(selectedQuestion.question_id)
+            const refreshedQuestion = refreshed.questions.find(
+              (question) => question.question_id === selectedQuestion.question_id,
+            ) ?? (refreshed.current_question?.question_id === selectedQuestion.question_id
+              ? refreshed.current_question
+              : undefined)
+            const refreshedPartIds = assessmentParts(refreshedQuestion).map((part) => part.id)
+            const submittedPartIds = responses.map((response) => response.part_id)
+            const canRetry = refreshedQuestion
+              && refreshedPartIds.length === submittedPartIds.length
+              && refreshedPartIds.every((partId) => submittedPartIds.includes(partId))
+            if (canRetry) {
+              const retried = await submitAdaptiveAnswer(
+                refreshed.session.id,
+                selectedQuestion.question_id,
+                responses,
+                Math.max(0, Date.now() - questionStartedAt.current),
+                hasStructuredAssessment ? undefined : partValues[LEGACY_ASSESSMENT_PART.id]?.trim(),
+              )
+              setPayload(retried)
+              setDraftAnswers((current) => ({
+                ...current,
+                [selectedQuestion.question_id]: retried.saved_answer
+                  ? savedResponseMap(retried.saved_answer, assessmentParts(refreshedQuestion))
+                  : partValues,
+              }))
+              setError('')
+            } else {
+              setError('题目作答结构已更新，请确认当前各小问答案后重新提交。')
+            }
+          } else {
+            setError(message)
+          }
+        } catch {
+          setError(message)
+        }
+      } else {
+        setError(message)
+      }
     } finally {
       setIsLoading(false)
     }
