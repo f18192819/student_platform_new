@@ -225,13 +225,20 @@ class AdaptiveTestingService:
       if not is_revision and (session.status != 'active' or question_id != session.current_question_id):
         raise HTTPException(status_code=409, detail='Only the current adaptive question can be answered for the first time.')
 
-      assessment_spec = self._cached_assessment_spec(session.course_id, candidate)
-      if assessment_spec is None and previous_event is not None:
-        assessment_spec = self._historical_assessment_spec(
+      preferred_assessment = (
+        self._revision_assessment_spec(
           session.course_id,
           candidate,
           previous_event,
         )
+        if previous_event is not None
+        else self._cached_assessment_spec(session.course_id, candidate)
+      )
+      assessment_spec = self._session_assessment_spec(
+        session,
+        candidate,
+        preferred=preferred_assessment,
+      )
       if assessment_spec is None:
         raise HTTPException(status_code=409, detail='本题作答结构尚未准备完成，请稍后重试。')
       candidate['reference_answer'] = assessment_spec.reference_answer
@@ -367,6 +374,71 @@ class AdaptiveTestingService:
       course_id=course_id,
       question_id=str(candidate.get('question_id') or ''),
     )
+
+  def _revision_assessment_spec(
+    self,
+    course_id: str,
+    candidate: dict[str, Any],
+    event: LearningEvent,
+  ) -> AssessmentSpec | None:
+    historical = self._historical_assessment_spec(course_id, candidate, event)
+    current = self._cached_assessment_spec(course_id, candidate)
+    if (
+      historical is not None
+      and current is not None
+      and current.reference_answer_updated_at
+      and current.reference_answer_updated_at != historical.reference_answer_updated_at
+    ):
+      return current
+    return historical or current
+
+  def _session_assessment_spec(
+    self,
+    session: AdaptiveTestSession,
+    candidate: dict[str, Any],
+    *,
+    preferred: AssessmentSpec | None = None,
+  ) -> AssessmentSpec | None:
+    """Bind the exact private grading spec shown in one test session."""
+    question_id = str(candidate.get('question_id') or '').strip()
+    if not question_id:
+      return None
+    saved = self.store.get_session_assessment_spec(
+      session.course_id,
+      session.id,
+      question_id,
+    )
+    if saved:
+      try:
+        bound = AssessmentSpec.model_validate(saved)
+        # A user correction is the only supported reason to replace a spec that
+        # has already been shown. Background policy/cache refreshes must not
+        # change part ids while a test session is active.
+        if (
+          preferred is not None
+          and preferred.reference_answer_updated_at
+          and preferred.reference_answer_updated_at != bound.reference_answer_updated_at
+        ):
+          self.store.save_session_assessment_spec(
+            session.course_id,
+            session.id,
+            question_id,
+            preferred.model_dump(),
+          )
+          return preferred
+        return bound
+      except ValidationError:
+        pass
+    assessment = preferred or self._cached_assessment_spec(session.course_id, candidate)
+    if assessment is None:
+      return None
+    self.store.save_session_assessment_spec(
+      session.course_id,
+      session.id,
+      question_id,
+      assessment.model_dump(),
+    )
+    return assessment
 
   def _assessment_identity(
     self,
@@ -590,9 +662,7 @@ class AdaptiveTestingService:
           max(1, len(session.candidate_question_ids)),
         )
         session.current_question_id = None
-      current_ready = bool(
-        current and self._cached_assessment_spec(session.course_id, current) is not None
-      )
+      current_ready = bool(current and self._session_assessment_spec(session, current) is not None)
       if not current_ready:
         session.current_question_id = self._select_next(session, candidates)
         self.repositories.sessions.save(session)
@@ -614,10 +684,14 @@ class AdaptiveTestingService:
       if candidate is None:
         continue
       event = events_by_question.get(question_id)
-      assessment = (
-        self._historical_assessment_spec(session.course_id, candidate, event)
-        if event is not None
-        else self._cached_assessment_spec(session.course_id, candidate)
+      preferred = (
+        self._revision_assessment_spec(session.course_id, candidate, event)
+        if event is not None else self._cached_assessment_spec(session.course_id, candidate)
+      )
+      assessment = self._session_assessment_spec(
+        session,
+        candidate,
+        preferred=preferred,
       )
       if assessment is not None:
         assessments_by_question[question_id] = assessment
@@ -631,13 +705,11 @@ class AdaptiveTestingService:
       'current_question': self._public_question(
         candidate_by_id[session.current_question_id],
         session.course_id,
+        assessments_by_question[session.current_question_id],
       )
       if (
         session.current_question_id in candidate_by_id
-        and self._cached_assessment_spec(
-          session.course_id,
-          candidate_by_id[session.current_question_id],
-        ) is not None
+        and session.current_question_id in assessments_by_question
       ) else None,
       'questions': [
         self._public_question(
@@ -865,4 +937,3 @@ async def correct_adaptive_test_reference_answer(
 @adaptive_testing_router.delete('/{session_id}')
 async def cancel_adaptive_test(session_id: str) -> dict[str, Any]:
   return await asyncio.to_thread(_get_service().cancel, session_id)
-

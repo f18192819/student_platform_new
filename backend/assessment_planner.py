@@ -13,11 +13,19 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .learning_state import LearningStateStore, QuestionReferenceAnswer
+from .math_markdown import normalize_math_markdown
 from .provider_transport import ProviderTransportError, StructuredChatClient
 from .runtime_config import load_api_config
 
 DEFAULT_NUMERIC_TOLERANCE = 1e-6
-ASSESSMENT_POLICY_VERSION = 'objective-answer-choice-v7'
+ASSESSMENT_POLICY_VERSION = 'latex-math-display-v8'
+
+_LATEX_OUTPUT_RULES = (
+  'Every mathematical expression in every prompt, answer, reference excerpt, and distractor must use '
+  'renderable Markdown LaTeX. Use $...$ for inline math and $$...$$ for display math. Use LaTeX commands '
+  'such as \\frac, \\omega, \\cos, \\vec, subscripts with braces, and \\mathrm for units. Never return '
+  'plain pseudo-math such as E_P = V0 cos(ωt)/(2d). JSON backslashes must be escaped correctly. '
+)
 _NUMBER = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$')
 _FRACTION = re.compile(r'^([+-]?\d+)\s*/\s*([+-]?\d+)$')
 _LATEX_FRACTION = re.compile(r'^\\frac\s*\{([+-]?\d+)\}\s*\{([+-]?\d+)\}$')
@@ -423,7 +431,7 @@ class AssessmentPlanner:
     messages = [
         {
           'role': 'system',
-          'content': (
+          'content': _LATEX_OUTPUT_RULES + (
             '你是严谨的课程题目解答器。原题没有参考答案或现有答案只覆盖部分子问，请独立完成整道题。'
             '必须先枚举题干要求回答的全部独立任务，再逐项给出答案，不能只做最后一问，不能遗漏并列对象或物理量。'
             '数学表达式使用可渲染的 LaTeX；数值保留单位和必要精度；解释题给出关键推理。'
@@ -479,7 +487,7 @@ class AssessmentPlanner:
     messages = [
         {
           'role': 'system',
-          'content': (
+          'content': _LATEX_OUTPUT_RULES + (
             '你是课程测验的题目任务分析器。此步骤只盘点原题要求学生回答的全部独立任务，不生成选项。'
             '先通读完整题干和参考答案，再给出准确的 task_count 和一一对应的 tasks，不能只提取最后一问。'
             '题干中每个编号子问、并列动词、不同对象、不同物理量都要逐项检查。比如“求 P、Q 两点的 E 和 B，判断 E、B 是否连续，'
@@ -620,7 +628,7 @@ class AssessmentPlanner:
     messages = [
         {
           'role': 'system',
-          'content': (
+          'content': _LATEX_OUTPUT_RULES + (
             '你负责为同一道课程题的多个客观作答任务批量生成错误选项。每个输入 task_id 必须原样返回且只能返回一次，'
             '每项必须给出恰好三个互不重复的 distractors，不得遗漏任务，不要输出正确答案。'
             'expression 优先模拟正负号、分母、指数、漏项、系数、转置/逆矩阵、求导或积分等典型错误；'
@@ -685,7 +693,7 @@ class AssessmentPlanner:
     messages = [
         {
           'role': 'system',
-          'content': (
+          'content': _LATEX_OUTPUT_RULES + (
             '你只负责为课程测验中的正确答案生成三个错误干扰项。不要输出正确答案。'
             '三个干扰项必须互不重复、不能与正确答案数学等价，并保持相同的表达形式和难度。'
             '当 answer_kind=expression 时，优先模拟典型学生错误：正负号错误、分母错误、指数错误、漏项、系数错误、'
@@ -751,6 +759,7 @@ class AssessmentPlanner:
           1.0,
           reference_answer,
           self._request_distractors(reference_answer, prompt, 'expression'),
+          expression=True,
         )
         if choice is None:
           raise HTTPException(status_code=502, detail='表达式选项生成失败，请重试。')
@@ -773,15 +782,16 @@ class AssessmentPlanner:
         materialized.append(AssessmentPart(
           id=part_id,
           type='numeric',
-          prompt=item.prompt,
+          prompt=normalize_math_markdown(item.prompt),
           weight=item.weight,
           expected_value=str(numeric),
           tolerance=DEFAULT_NUMERIC_TOLERANCE,
           reference_answer=reference,
         ))
         continue
+      is_expression = self._looks_like_expression(reference)
       if (
-        self._looks_like_expression(reference)
+        is_expression
         or item.type == 'choice'
         or self._prompt_requires_objective_answer(item.prompt)
       ):
@@ -804,6 +814,7 @@ class AssessmentPlanner:
           item.weight,
           reference,
           distractors,
+          expression=is_expression,
         )
         if choice:
           materialized.append(choice)
@@ -842,7 +853,7 @@ class AssessmentPlanner:
     return AssessmentPart(
       id=part_id,
       type='text',
-      prompt=prompt or '简要说明你的结论或思路。',
+      prompt=normalize_math_markdown(prompt) or '简要说明你的结论或思路。',
       weight=weight,
       reference_answer=reference,
     )
@@ -855,21 +866,30 @@ class AssessmentPlanner:
     weight: float,
     reference: str,
     distractor_values: list[str],
+    *,
+    expression: bool = False,
   ) -> AssessmentPart | None:
     distractors = cls._valid_distractors(reference, distractor_values)
     if len(distractors) != 3:
       return None
-    contents = [reference, *distractors]
+    contents = [(True, reference), *((False, value) for value in distractors)]
     random.SystemRandom().shuffle(contents)
     options = [
-      AssessmentOption(id=chr(65 + option_index), content=content)
-      for option_index, content in enumerate(contents)
+      AssessmentOption(
+        id=chr(65 + option_index),
+        content=normalize_math_markdown(content, force_expression=expression),
+      )
+      for option_index, (_is_correct, content) in enumerate(contents)
     ]
-    correct_option_id = next(option.id for option in options if option.content == reference)
+    correct_option_id = next(
+      chr(65 + option_index)
+      for option_index, (is_correct, _content) in enumerate(contents)
+      if is_correct
+    )
     return AssessmentPart(
       id=part_id,
       type='choice',
-      prompt=prompt or '请选择正确的表达式。',
+      prompt=normalize_math_markdown(prompt) or '请选择正确的表达式。',
       weight=weight,
       options=options,
       correct_option_id=correct_option_id,

@@ -156,12 +156,17 @@ class StructuredPartGrader:
       for response in responses
       if str(response.get('value') or '').strip()
     }
+    known_ids = {part.id for part in assessment_spec.parts}
+    if set(response_by_id) - known_ids:
+      raise HTTPException(
+        status_code=409,
+        detail='作答结构已更新，请同步题目后重新提交。',
+        headers={'X-Error-Code': 'assessment_spec_conflict'},
+      )
     required_ids = {part.id for part in assessment_spec.parts if part.required}
     if not required_ids.issubset(response_by_id):
       missing = ', '.join(sorted(required_ids - set(response_by_id)))
-      raise HTTPException(status_code=422, detail=f'Required assessment parts are missing: {missing}')
-    if set(response_by_id) - {part.id for part in assessment_spec.parts}:
-      raise HTTPException(status_code=422, detail='The submission contains an unknown assessment part.')
+      raise HTTPException(status_code=422, detail=f'还有必答部分未完成：{missing}')
 
     part_results = [
       self.grade_part(candidate, part, response_by_id.get(part.id, ''))
