@@ -22,6 +22,7 @@ class PipelineRuntime(Protocol):
   def require_question_relations(self): ...
   def require_chat_retriever(self): ...
   def require_pipeline_coordinator(self): ...
+  def require_user_answer_store(self): ...
   async def run_pipeline_task(self, function, *args, **kwargs): ...
   def schedule_question_pipeline_resume(self) -> asyncio.Task: ...
 
@@ -47,6 +48,10 @@ class PipelineApiService:
   @property
   def coordinator(self):
     return self.runtime.require_pipeline_coordinator()
+
+  @property
+  def user_answers(self):
+    return self.runtime.require_user_answer_store()
 
   async def process_document(
     self,
@@ -170,6 +175,7 @@ class PipelineApiService:
     )
     if result.get('deleted'):
       await asyncio.to_thread(delete_learning_document, course_id, document_id)
+      await asyncio.to_thread(self.user_answers.delete_document, course_id, document_id)
     return result
 
   async def question_status(self, document_id: str) -> dict[str, Any]:

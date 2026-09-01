@@ -13,6 +13,7 @@ import { ChatPanel } from '../features/pdf-workspace/components/ChatPanel'
 import { PageLecturePlayer } from '../features/pdf-workspace/components/PageLecturePlayer'
 import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/RelatedMaterialsPanel'
 import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
+import { QuestionAnswerViewer } from '../features/question-answer/QuestionAnswerViewer'
 import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageLecturePlayback'
 import { useReaderPanelResize } from '../features/pdf-workspace/hooks/useReaderPanelResize'
 import { useRelatedMaterials } from '../features/pdf-workspace/hooks/useRelatedMaterials'
@@ -2507,45 +2508,52 @@ export function PdfWorkspacePage() {
               onOpenPage={handleVisiblePageChange}
             />
           ) : null}
-          <PdfPreviewCanvas
-            fileName={currentViewerName}
-            pdfController={currentViewerController}
-            imageUrl={currentViewerImageUrl}
-            currentPage={currentPage}
-            pageCount={currentViewerPageCount}
-            zoom={zoom}
-            zoomLabel={zoomLabel}
-            canGoPrev={canGoPrev}
-            canGoNext={canGoNext}
-            onPrevPage={handlePrevPage}
-            onNextPage={handleNextPage}
-            onZoomOut={() => handleZoom(zoom - 0.12)}
-            onZoomIn={() => handleZoom(zoom + 0.12)}
-            onFitWidth={() => handleZoom(1)}
-            onOpenPdf={() => pdfInputRef.current?.click()}
-            onVisiblePageChange={handleVisiblePageChange}
-            onInspectPageDoubts={handleInspectPageDoubts}
-            onInspectPageLectureSegments={handleInspectPageLectureSegments}
-            onPlayPageLectureSegments={handlePlayPageLectureSegments}
-            playingLecturePage={pageLecturePlayback.playingPage}
-            showLectureControls={isLectureViewer}
-            onInspectPageQuestions={isLectureViewer ? handleInspectPageQuestions : () => {}}
-            isCaptureMode={isCaptureMode}
-            selectedHomeworkQuestion={viewerSource.kind === 'homework' ? selectedHomeworkQuestion : null}
-            structuredBlocks={currentViewerStructuredBlocks}
-            lectureSegmentsByPage={lectureSegmentsByPage}
-            homeworkKnowledgeLinks={isLectureViewer ? allHomeworkKnowledgeLinks : []}
-            onOpenKnowledgeLink={handleOpenKnowledgeLink}
-            onOpenLecturePageQuestions={isLectureViewer ? handleOpenLecturePageQuestions : undefined}
-            visibleQuestions={viewerSource.kind === 'homework' ? selectedHomework?.questions ?? [] : []}
-            onVisibleQuestionChange={
-              viewerSource.kind === 'homework' ? handleVisibleHomeworkQuestionChange : undefined
-            }
-            onCaptureSelection={handleCaptureSelection}
-            onTextSelection={handleTextSelection}
-            referencedBlockIds={referencedBlockIds}
-            onRemoveBlockReference={removeBlockReference}
-          />
+          <QuestionAnswerViewer
+            courseId={viewerSource.kind === 'homework' ? activeKnowledgeCourseId : null}
+            sourceDocumentId={viewerSource.kind === 'homework' ? selectedHomework?.id ?? null : null}
+            questionId={viewerSource.kind === 'homework' ? selectedHomeworkQuestion?.id ?? null : null}
+            sourceType={currentFolderType}
+          >
+            <PdfPreviewCanvas
+              fileName={currentViewerName}
+              pdfController={currentViewerController}
+              imageUrl={currentViewerImageUrl}
+              currentPage={currentPage}
+              pageCount={currentViewerPageCount}
+              zoom={zoom}
+              zoomLabel={zoomLabel}
+              canGoPrev={canGoPrev}
+              canGoNext={canGoNext}
+              onPrevPage={handlePrevPage}
+              onNextPage={handleNextPage}
+              onZoomOut={() => handleZoom(zoom - 0.12)}
+              onZoomIn={() => handleZoom(zoom + 0.12)}
+              onFitWidth={() => handleZoom(1)}
+              onOpenPdf={() => pdfInputRef.current?.click()}
+              onVisiblePageChange={handleVisiblePageChange}
+              onInspectPageDoubts={handleInspectPageDoubts}
+              onInspectPageLectureSegments={handleInspectPageLectureSegments}
+              onPlayPageLectureSegments={handlePlayPageLectureSegments}
+              playingLecturePage={pageLecturePlayback.playingPage}
+              showLectureControls={isLectureViewer}
+              onInspectPageQuestions={isLectureViewer ? handleInspectPageQuestions : () => {}}
+              isCaptureMode={isCaptureMode}
+              selectedHomeworkQuestion={viewerSource.kind === 'homework' ? selectedHomeworkQuestion : null}
+              structuredBlocks={currentViewerStructuredBlocks}
+              lectureSegmentsByPage={lectureSegmentsByPage}
+              homeworkKnowledgeLinks={isLectureViewer ? allHomeworkKnowledgeLinks : []}
+              onOpenKnowledgeLink={handleOpenKnowledgeLink}
+              onOpenLecturePageQuestions={isLectureViewer ? handleOpenLecturePageQuestions : undefined}
+              visibleQuestions={viewerSource.kind === 'homework' ? selectedHomework?.questions ?? [] : []}
+              onVisibleQuestionChange={
+                viewerSource.kind === 'homework' ? handleVisibleHomeworkQuestionChange : undefined
+              }
+              onCaptureSelection={handleCaptureSelection}
+              onTextSelection={handleTextSelection}
+              referencedBlockIds={referencedBlockIds}
+              onRemoveBlockReference={removeBlockReference}
+            />
+          </QuestionAnswerViewer>
         </div>
 
         <button

@@ -35,6 +35,7 @@ class KnowledgeLibraryService:
 
   def __init__(self, runtime: ApplicationRuntime) -> None:
     self.runtime = runtime
+    self.user_answers = runtime.require_user_answer_store()
 
   def delete_file(self, file_id: str) -> dict[str, Any]:
     library = read_knowledge_library()
@@ -55,6 +56,9 @@ class KnowledgeLibraryService:
     )
     if result.get('deleted'):
       delete_learning_document(str((deleted_file or {}).get('courseId') or ''), file_id)
+      course_id = str((deleted_file or {}).get('courseId') or '')
+      for document_id in result.get('removedHomeworkDocumentIds') or []:
+        self.user_answers.delete_document(course_id, str(document_id))
       mark_deleted_synced_courseware(deleted_file)
     return result
 
@@ -75,6 +79,7 @@ class KnowledgeLibraryService:
     )
     if result.get('deleted'):
       delete_learning_course(course_id)
+      self.user_answers.delete_course(course_id)
       for file_record in course_files:
         mark_deleted_synced_courseware(file_record)
     return result

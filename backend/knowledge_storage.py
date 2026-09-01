@@ -594,6 +594,10 @@ def delete_knowledge_lecture(
       'deleted': True,
       'library': next_library,
       'removedHomeworkDocuments': len(related_documents),
+      'removedHomeworkDocumentIds': [
+        str(document.get('id') or '') for document in related_documents
+        if str(document.get('id') or '')
+      ],
     }
 
 

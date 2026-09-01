@@ -28,17 +28,32 @@ class FakeCoordinator:
     self.calls.append(('coordinator.delete_course', course_id))
 
 
+class FakeUserAnswers:
+  def __init__(self, calls):
+    self.calls = calls
+
+  def delete_document(self, course_id, document_id):
+    self.calls.append(('answers.delete_document', course_id, document_id))
+
+  def delete_course(self, course_id):
+    self.calls.append(('answers.delete_course', course_id))
+
+
 class FakeRuntime:
   def __init__(self, calls=None):
     self.calls = calls if calls is not None else []
     self.documents = FakeDocumentPipeline(self.calls)
     self.coordinator = FakeCoordinator(self.calls)
+    self.user_answers = FakeUserAnswers(self.calls)
 
   def require_document_pipeline(self):
     return self.documents
 
   def require_pipeline_coordinator(self):
     return self.coordinator
+
+  def require_user_answer_store(self):
+    return self.user_answers
 
 
 class KnowledgeRouterTest(unittest.TestCase):

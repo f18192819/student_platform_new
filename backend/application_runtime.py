@@ -15,12 +15,14 @@ from .document_pipeline import DocumentPipeline, QDRANT_COLLECTION, local_mineru
 from .pipeline_orchestration import PipelineCoordinator
 from .question_pipeline import QUESTION_COLLECTION, QuestionPipeline
 from .question_relations import QuestionRelationPipeline
+from .user_answers import UserAnswerStore
 
 
 class ApplicationRuntime:
   """Owns process-scoped providers, workers, and application lifecycle."""
 
   def __init__(self) -> None:
+    self.user_answer_store = UserAnswerStore()
     self.document_pipeline: DocumentPipeline | None = None
     self.question_pipeline: QuestionPipeline | None = None
     self.question_relations: QuestionRelationPipeline | None = None
@@ -56,6 +58,9 @@ class ApplicationRuntime:
     if self.pipeline_coordinator is None:
       raise RuntimeError('Pipeline coordinator is not initialized.')
     return self.pipeline_coordinator
+
+  def require_user_answer_store(self) -> UserAnswerStore:
+    return self.user_answer_store
 
   def start(self) -> None:
     if self.document_pipeline is not None:

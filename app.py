@@ -17,6 +17,7 @@ from backend.media_router import (
 from backend.pipeline_router import create_pipeline_router
 from backend.provider_router import provider_router
 from backend.tsinghua_sync import tsinghua_router
+from backend.user_answer_router import create_user_answer_router
 
 
 application_runtime = ApplicationRuntime()
@@ -25,6 +26,7 @@ backend_router = APIRouter()
 backend_router.include_router(tsinghua_router)
 backend_router.include_router(adaptive_testing_router)
 backend_router.include_router(provider_router)
+backend_router.include_router(create_user_answer_router(application_runtime.require_user_answer_store()))
 backend_router.include_router(create_knowledge_router(application_runtime))
 backend_router.include_router(create_pipeline_router(application_runtime))
 backend_router.include_router(create_media_router(application_runtime))
@@ -45,4 +47,3 @@ __all__ = [
   'mount_student_learning_platform_demo_frontend',
   'transcribe_audio_file_with_chunking',
 ]
-
