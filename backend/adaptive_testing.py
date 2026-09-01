@@ -539,15 +539,21 @@ class AdaptiveTestingService:
       session.course_id,
       session.lecture_document_id,
     )
+    question_history = self.repositories.events.question_history_for_lecture(
+      session.course_id,
+      session.lecture_document_id,
+    )
     session_events = self.repositories.events.for_session(session.course_id, session.id)
     if pending_event is not None:
       lecture_events.append(pending_event)
       session_events.append(pending_event)
+      question_history.setdefault(pending_event.question_id, []).append(pending_event)
     ranked = self.selection_strategy.rank(
       session,
       candidates,
       lecture_events,
       session_events,
+      question_history,
     )
     for candidate in ranked:
       if self._cached_assessment_spec(session.course_id, candidate) is not None:

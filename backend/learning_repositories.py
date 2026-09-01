@@ -16,6 +16,11 @@ class SessionRepository(Protocol):
 class EventRepository(Protocol):
   def for_session(self, course_id: str, session_id: str) -> list[LearningEvent]: ...
   def for_lecture(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]: ...
+  def question_history_for_lecture(
+    self,
+    course_id: str,
+    lecture_document_id: str,
+  ) -> dict[str, list[LearningEvent]]: ...
 
 
 class LearningProgressRepository(Protocol):
@@ -48,6 +53,16 @@ class StoreEventRepository:
 
   def for_lecture(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]:
     return self._store.effective_lecture_events(course_id, lecture_document_id)
+
+  def question_history_for_lecture(
+    self,
+    course_id: str,
+    lecture_document_id: str,
+  ) -> dict[str, list[LearningEvent]]:
+    history: dict[str, list[LearningEvent]] = {}
+    for event in self._store.effective_lecture_events(course_id, lecture_document_id):
+      history.setdefault(event.question_id, []).append(event)
+    return history
 
 
 class StoreLearningProgressRepository:

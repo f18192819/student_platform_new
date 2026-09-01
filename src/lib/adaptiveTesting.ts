@@ -132,10 +132,23 @@ export type AdaptiveTestResult = {
   questions_answered: number
   questions_correct: number
   concept_mastery: ConceptMastery[]
+  question_mastery?: QuestionMastery[]
   weak_concepts: ConceptMastery[]
   wrong_questions: WrongQuestion[]
   recommended_pages: RecommendedLecturePage[]
   mastery_scope: 'lecture_history'
+}
+
+export type QuestionMastery = {
+  question_id: string
+  attempts: number
+  correct_count: number
+  average_score: number
+  mastery: number
+  confidence: number
+  last_answered_at: string | null
+  last_score: number | null
+  consecutive_correct: number
 }
 
 export type AdaptiveTestPayload = {
