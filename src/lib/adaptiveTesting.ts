@@ -197,7 +197,7 @@ export class AdaptiveTestApiError extends Error {
 
 async function readPayload(response: Response): Promise<AdaptiveTestPayload> {
   if (!response.ok) {
-    let message = `请求失败 (HTTP ${response.status})`
+    let message = `璇锋眰澶辫触 (HTTP ${response.status})`
     try {
       const payload = await response.json() as { detail?: string }
       if (payload.detail) {
@@ -245,7 +245,7 @@ export async function getActiveAdaptiveTest(
     { signal },
   )
   if (!response.ok) {
-    throw new Error(`读取测试进度失败 (HTTP ${response.status})`)
+    throw new Error(`璇诲彇娴嬭瘯杩涘害澶辫触 (HTTP ${response.status})`)
   }
   const payload = await response.json() as { session: AdaptiveTestSession | null } | AdaptiveTestPayload
   return payload.session ? payload as AdaptiveTestPayload : null
@@ -302,3 +302,4 @@ export async function cancelAdaptiveTest(sessionId: string) {
     { method: 'DELETE' },
   ))
 }
+

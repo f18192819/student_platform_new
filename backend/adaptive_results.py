@@ -102,3 +102,4 @@ class AdaptiveTestResultAssembler:
       int(item['page_number']),
     ))
     return ranked[:10]
+

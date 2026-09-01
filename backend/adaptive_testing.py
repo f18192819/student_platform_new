@@ -35,7 +35,7 @@ from .question_pipeline import resolve_question_image_asset
 adaptive_testing_router = APIRouter(prefix='/api/adaptive-tests', tags=['adaptive-testing'])
 LOGGER = logging.getLogger(__name__)
 _REFERENCE_MARKER = re.compile(
-  r'(?im)^\s*(?:\d{2,8}\s*)?(?:参考答案|标准答案|解答|答案|解析|solution|answer)\s*[:：]\s*'
+  r'(?im)^\s*(?:\d{2,8}\s*)?(?:鍙傝€冪瓟妗坾鏍囧噯绛旀|瑙ｇ瓟|绛旀|瑙ｆ瀽|solution|answer)\s*[:锛歖\s*'
 )
 _SEGMENT_ID_LINE = re.compile(r'(?m)^\s*\d{3,8}\s*$')
 class StartAdaptiveTestRequest(BaseModel):
@@ -99,7 +99,7 @@ def split_question_material(question: dict[str, Any]) -> tuple[str, str, str]:
   )
   if explicit_answer:
     question_type = str(analysis.get('question_type') or '').casefold()
-    is_objective = bool(re.search(r'选择|判断|填空|单选|多选|true|false|choice', question_type))
+    is_objective = bool(re.search(r'閫夋嫨|鍒ゆ柇|濉┖|鍗曢€墊澶氶€墊true|false|choice', question_type))
     method = 'exact_answer' if is_objective and len(explicit_answer) <= 200 else 'llm_reference'
     return content, explicit_answer, method
 
@@ -240,7 +240,7 @@ class AdaptiveTestingService:
         preferred=preferred_assessment,
       )
       if assessment_spec is None:
-        raise HTTPException(status_code=409, detail='本题作答结构尚未准备完成，请稍后重试。')
+        raise HTTPException(status_code=409, detail='鏈浣滅瓟缁撴瀯灏氭湭鍑嗗瀹屾垚锛岃绋嶅悗閲嶈瘯銆?)
       candidate['reference_answer'] = assessment_spec.reference_answer
       grading, structured_responses, response_text = self.part_grader.grade(
         candidate,
@@ -306,7 +306,7 @@ class AdaptiveTestingService:
         for event in self.repositories.events.for_session(session.course_id, session.id)
       }
       if question_id not in answered_ids:
-        raise HTTPException(status_code=409, detail='提交本题答案后才能修正参考答案。')
+        raise HTTPException(status_code=409, detail='鎻愪氦鏈绛旀鍚庢墠鑳戒慨姝ｅ弬鑰冪瓟妗堛€?)
 
       candidates, _ = self._candidates(session.course_id, session.lecture_document_id)
       candidate = next(
@@ -314,7 +314,7 @@ class AdaptiveTestingService:
         None,
       )
       if candidate is None:
-        raise HTTPException(status_code=404, detail='没有找到该题目的原始数据。')
+        raise HTTPException(status_code=404, detail='娌℃湁鎵惧埌璇ラ鐩殑鍘熷鏁版嵁銆?)
 
       saved = self.assessment_planner.save_user_correction(
         course_id=session.course_id,
@@ -765,7 +765,7 @@ class AdaptiveTestingService:
   ) -> dict[str, Any]:
     assessment = assessment or self._cached_assessment_spec(course_id, candidate)
     if assessment is None:
-      raise HTTPException(status_code=409, detail='本题作答结构正在准备中，请稍后刷新。')
+      raise HTTPException(status_code=409, detail='鏈浣滅瓟缁撴瀯姝ｅ湪鍑嗗涓紝璇风◢鍚庡埛鏂般€?)
     candidate['reference_answer'] = assessment.reference_answer
     return {
       'question_id': str(candidate.get('question_id') or ''),
@@ -943,3 +943,4 @@ async def correct_adaptive_test_reference_answer(
 @adaptive_testing_router.delete('/{session_id}')
 async def cancel_adaptive_test(session_id: str) -> dict[str, Any]:
   return await asyncio.to_thread(_get_service().cancel, session_id)
+

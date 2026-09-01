@@ -86,3 +86,4 @@ class LearningStateRepositories:
       events=StoreEventRepository(store),
       progress=StoreLearningProgressRepository(store),
     )
+

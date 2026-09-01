@@ -120,3 +120,4 @@ class RuleBasedQuestionSelectionStrategy:
       return score + controlled_jitter, controlled_jitter, question_id
 
     return sorted(remaining, key=priority, reverse=True)
+
