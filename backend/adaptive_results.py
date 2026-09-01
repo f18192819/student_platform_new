@@ -8,6 +8,7 @@ from .learning_state import (
   aggregate_mastery,
   project_concept_mastery,
 )
+from .learning_projections import project_question_mastery
 
 
 class AdaptiveTestResultAssembler:
@@ -24,6 +25,10 @@ class AdaptiveTestResultAssembler:
       concept for candidate in candidates for concept in candidate['knowledge_points']
     ))
     concepts = project_concept_mastery(lecture_events, all_concepts)
+    question_mastery = project_question_mastery(
+      lecture_events,
+      [str(candidate['question_id']) for candidate in candidates],
+    )
     overall, confidence = aggregate_mastery(concepts)
     weak = [
       concept for concept in concepts if concept.mastery < 0.7 or concept.evidence_count == 0
@@ -54,6 +59,7 @@ class AdaptiveTestResultAssembler:
       'questions_answered': len(session_events),
       'questions_correct': sum(1 for event in session_events if event.correct),
       'concept_mastery': [item.model_dump() for item in concepts],
+      'question_mastery': [item.model_dump() for item in question_mastery],
       'weak_concepts': [item.model_dump() for item in weak],
       'wrong_questions': wrong_questions,
       'recommended_pages': self.recommended_pages(candidates, weak),
@@ -96,3 +102,4 @@ class AdaptiveTestResultAssembler:
       int(item['page_number']),
     ))
     return ranked[:10]
+
