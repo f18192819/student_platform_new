@@ -269,9 +269,23 @@ class AdaptiveComponentTest(unittest.TestCase):
       id='new-session', course_id='c1', lecture_document_id='lecture-1', target_question_count=3,
     )
     history = {
-      'q1': [event(question_id='q1', correct=True, score=1.0, test_session_id='old-1')],
-      'q2': [event(question_id='q2', correct=True, score=1.0, test_session_id='old-2')],
-      'q3': [event(question_id='q3', correct=True, score=1.0, test_session_id=f'old-{i}') for i in range(6)],
+      'q1': [event(
+        question_id='q1', correct=True, score=1.0, test_session_id='old-1',
+        created_at='2026-01-01T00:00:00Z',
+      )],
+      'q2': [event(
+        question_id='q2', correct=True, score=1.0, test_session_id='old-2',
+        created_at='2026-01-01T00:00:00Z',
+      )],
+      'q3': [event(
+        question_id='q3', correct=True, score=1.0, test_session_id=f'old-{i}',
+        created_at='2026-01-01T00:00:00Z',
+      ) for i in range(6)],
+      # Keep recent-exposure logic out of this exposure-only assertion.
+      'unrelated': [event(
+        question_id='unrelated', correct=True, score=1.0, test_session_id='latest-session',
+        created_at='2026-01-02T00:00:00Z',
+      )],
     }
 
     ranked = strategy.rank(
