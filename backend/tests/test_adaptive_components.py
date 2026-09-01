@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import random
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -11,14 +12,20 @@ from backend.adaptive_results import AdaptiveTestResultAssembler
 from backend.adaptive_selection import RuleBasedQuestionSelectionStrategy
 from backend.adaptive_testing import AdaptiveTestingService
 from backend.assessment_planner import AssessmentOption, AssessmentPart, AssessmentSpec
+from backend.learning_projections import (
+  QuestionMastery,
+  project_question_mastery,
+  question_retry_bonus,
+)
 from backend.learning_state import AdaptiveTestSession, LearningEvent, LearningStateStore
 
 
-def event(*, question_id='q0', concepts=None, correct=False, score=0.0, difficulty=2):
+def event(*, question_id='q0', concepts=None, correct=False, score=0.0, difficulty=2,
+          test_session_id='session-1', created_at=None, course_id='c1'):
   return LearningEvent(
-    course_id='c1',
+    course_id=course_id,
     lecture_document_id='lecture-1',
-    test_session_id='session-1',
+    test_session_id=test_session_id,
     question_id=question_id,
     source_type='homework',
     source_document_id='homework-1',
@@ -27,7 +34,17 @@ def event(*, question_id='q0', concepts=None, correct=False, score=0.0, difficul
     correct=correct,
     score=score,
     grading_method='test',
+    created_at=created_at or LearningEvent.model_fields['created_at'].default_factory(),
   )
+
+
+def candidate(question_id: str) -> dict:
+  return {
+    'question_id': question_id,
+    'knowledge_points': ['concept-a'],
+    'difficulty': 2,
+    'relation_score': 0.5,
+  }
 
 
 class FakeSubjectiveGrader:
@@ -154,6 +171,8 @@ class AdaptiveComponentTest(unittest.TestCase):
 
     self.assertEqual([7], [item['page_number'] for item in result['recommended_pages']])
     self.assertEqual(1, result['questions_answered'])
+    self.assertEqual(0.0, result['overall_mastery'])
+    self.assertEqual(1, result['question_mastery'][0]['attempts'])
 
   def test_session_keeps_the_assessment_spec_that_was_shown(self):
     with tempfile.TemporaryDirectory() as temporary_directory:
@@ -226,6 +245,148 @@ class AdaptiveComponentTest(unittest.TestCase):
 
       self.assertEqual('corrected-part', replaced.parts[0].id)
 
+  def test_question_mastery_is_projected_from_effective_events(self):
+    events = [
+      event(question_id='q1', correct=False, score=0.0, created_at='2026-01-01T00:00:00Z'),
+      event(question_id='q1', correct=True, score=1.0, created_at='2026-01-02T00:00:00Z'),
+      event(question_id='q2', correct=True, score=1.0, created_at='2026-01-03T00:00:00Z'),
+    ]
+
+    projections = project_question_mastery(events, ['q1', 'q2', 'unseen'])
+    by_id = {item.question_id: item for item in projections}
+
+    self.assertIsInstance(by_id['q1'], QuestionMastery)
+    self.assertEqual(2, by_id['q1'].attempts)
+    self.assertEqual(1, by_id['q1'].correct_count)
+    self.assertEqual(1, by_id['q1'].consecutive_correct)
+    self.assertEqual(1, by_id['q2'].attempts)
+    self.assertEqual(0, by_id['unseen'].attempts)
+    self.assertEqual(0.0, by_id['unseen'].confidence)
+
+  def test_low_exposure_questions_beat_high_exposure_at_equal_mastery(self):
+    strategy = RuleBasedQuestionSelectionStrategy(rng=random.Random(1))
+    session = AdaptiveTestSession(
+      id='new-session', course_id='c1', lecture_document_id='lecture-1', target_question_count=3,
+    )
+    history = {
+      'q1': [event(question_id='q1', correct=True, score=1.0, test_session_id='old-1')],
+      'q2': [event(question_id='q2', correct=True, score=1.0, test_session_id='old-2')],
+      'q3': [event(question_id='q3', correct=True, score=1.0, test_session_id=f'old-{i}') for i in range(6)],
+    }
+
+    ranked = strategy.rank(
+      session, [candidate('q1'), candidate('q2'), candidate('q3')],
+      [item for events in history.values() for item in events], [], history,
+    )
+
+    self.assertNotEqual('q3', ranked[0]['question_id'])
+    self.assertNotEqual('q3', ranked[1]['question_id'])
+
+  def test_wrong_question_stays_prioritized_even_when_exposure_is_high(self):
+    strategy = RuleBasedQuestionSelectionStrategy(rng=random.Random(2))
+    session = AdaptiveTestSession(
+      id='new-session', course_id='c1', lecture_document_id='lecture-1', target_question_count=2,
+    )
+    history = {
+      'stable': [event(question_id='stable', correct=True, score=1.0, test_session_id='old') for _ in range(3)],
+      'wrong': [event(question_id='wrong', correct=False, score=0.0, test_session_id='old') for _ in range(6)],
+    }
+    ranked = strategy.rank(
+      session, [candidate('stable'), candidate('wrong')],
+      [item for events in history.values() for item in events], [], history,
+    )
+
+    self.assertEqual('wrong', ranked[0]['question_id'])
+
+  def test_wrong_question_bonus_fades_after_consecutive_correct_answers(self):
+    wrong = event(
+      question_id='q1', correct=False, score=0.0, created_at='2026-01-01T00:00:00Z',
+    )
+    correct = [
+      event(
+        question_id='q1', correct=True, score=1.0,
+        test_session_id=f'correct-{index}', created_at=f'2026-01-0{index + 2}T00:00:00Z',
+      )
+      for index in range(3)
+    ]
+
+    bonuses = [question_retry_bonus([wrong, *correct[:count]]) for count in range(4)]
+
+    self.assertEqual([2.4, 1.6, 0.8, 0.0], bonuses)
+
+  def test_equal_priority_questions_use_controlled_randomness(self):
+    strategy = RuleBasedQuestionSelectionStrategy(rng=random.Random(4))
+    session = AdaptiveTestSession(
+      id='new-session', course_id='c1', lecture_document_id='lecture-1', target_question_count=2,
+    )
+    candidates = [candidate('q1'), candidate('q2'), candidate('q3')]
+
+    orderings = {
+      tuple(item['question_id'] for item in strategy.rank(session, candidates, [], []))
+      for _ in range(12)
+    }
+
+    self.assertGreater(len(orderings), 1)
+
+  def test_questions_from_previous_session_receive_recent_exposure_penalty(self):
+    strategy = RuleBasedQuestionSelectionStrategy(rng=random.Random(6))
+    session = AdaptiveTestSession(
+      id='new-session', course_id='c1', lecture_document_id='lecture-1', target_question_count=2,
+    )
+    history = {
+      'recent': [event(
+        question_id='recent', correct=True, score=1.0, test_session_id='latest-session',
+        created_at='2026-01-03T00:00:00Z',
+      )],
+      'older': [event(
+        question_id='older', correct=True, score=1.0, test_session_id='older-session',
+        created_at='2026-01-01T00:00:00Z',
+      )],
+    }
+
+    ranked = strategy.rank(
+      session, [candidate('recent'), candidate('older')],
+      [item for events in history.values() for item in events], [], history,
+    )
+
+    self.assertEqual('older', ranked[0]['question_id'])
+
+  def test_revision_events_are_not_counted_twice_by_projection(self):
+    original = event(question_id='q1', correct=False, score=0.0, created_at='2026-01-01T00:00:00Z')
+    revision = event(
+      question_id='q1', correct=True, score=1.0, created_at='2026-01-02T00:00:00Z',
+    ).model_copy(update={
+      'test_session_id': original.test_session_id,
+      'revision': 2,
+      'supersedes_event_id': original.id,
+    })
+    effective = LearningStateStore._latest_revisions([original, revision])
+
+    projection = project_question_mastery(effective, ['q1'])[0]
+
+    self.assertEqual(1, projection.attempts)
+    self.assertEqual(1, projection.correct_count)
+
+  def test_question_history_repository_is_course_and_lecture_scoped(self):
+    with tempfile.TemporaryDirectory() as temporary_directory:
+      store = LearningStateStore(Path(temporary_directory))
+      first = AdaptiveTestSession(
+        id='s1', course_id='c1', lecture_document_id='lecture-1', target_question_count=1,
+      )
+      second = AdaptiveTestSession(
+        id='s2', course_id='c2', lecture_document_id='lecture-1', target_question_count=1,
+      )
+      store.create_session(first)
+      store.create_session(second)
+      store.record_answer(event(question_id='q1', test_session_id='s1'), first)
+      store.record_answer(event(question_id='q2', test_session_id='s2', course_id='c2'), second)
+      from backend.learning_repositories import StoreEventRepository
+
+      history = StoreEventRepository(store).question_history_for_lecture('c1', 'lecture-1')
+
+      self.assertEqual(['q1'], list(history))
+
 
 if __name__ == '__main__':
   unittest.main()
+
