@@ -92,7 +92,10 @@ class RuleBasedQuestionSelectionStrategy:
       question_projection = question_projections[question_id]
       question_mastery = question_projection.mastery
       last_event = question_events[-1] if question_events else None
-      low_exposure_bonus = 2.6 / math.sqrt(attempts + 1)
+      # Exposure balancing is a first-class tie breaker: a well-practised
+      # question should not displace multiple equally mastered low-exposure
+      # questions merely because of small jitter or relation differences.
+      low_exposure_bonus = 4.0 / math.sqrt(attempts + 1)
       question_mastery_gap_bonus = 2.0 * (1.0 - question_mastery)
       wrong_question_bonus = question_retry_bonus(question_events)
       recent_exposure_penalty = (
