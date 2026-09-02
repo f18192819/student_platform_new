@@ -24,7 +24,7 @@ const emptyTsinghuaConfig: TsinghuaSyncConfig = {
   autoLoginEnabled: true,
 }
 
-type ModelProviderSlot = 'text' | 'doubt' | 'embedding' | 'rerank' | 'asr'
+type ModelProviderSlot = 'text' | 'doubt' | 'ocr' | 'embedding' | 'rerank' | 'asr'
 type ModelDiscoveryState = {
   models: string[]
   loading: boolean
@@ -34,6 +34,7 @@ type ModelDiscoveryState = {
 const emptyModelDiscoveryState = (): Record<ModelProviderSlot, ModelDiscoveryState> => ({
   text: { models: [], loading: false, message: '' },
   doubt: { models: [], loading: false, message: '' },
+  ocr: { models: [], loading: false, message: '' },
   embedding: { models: [], loading: false, message: '' },
   rerank: { models: [], loading: false, message: '' },
   asr: { models: [], loading: false, message: '' },
@@ -129,6 +130,7 @@ export function ApiConfigPage() {
     if (slot === 'embedding') return [form.embeddingBaseUrl, form.embeddingApiKey] as const
     if (slot === 'rerank') return [form.rerankBaseUrl, form.rerankApiKey] as const
     if (slot === 'asr') return [form.asrBaseUrl, form.asrApiKey] as const
+    if (slot === 'ocr') return [form.ocrBaseUrl, form.ocrApiKey] as const
     return [form.baseUrl, form.apiKey] as const
   }
 
@@ -161,6 +163,9 @@ export function ApiConfigPage() {
       }
       if (slot === 'doubt') {
         return { ...current, doubtModels: merge(current.doubtModels), doubtModel: selected }
+      }
+      if (slot === 'ocr') {
+        return { ...current, ocrModels: merge(current.ocrModels), ocrModel: selected }
       }
       if (slot === 'embedding') {
         return { ...current, embeddingModels: merge(current.embeddingModels), embeddingModel: selected }
@@ -249,6 +254,31 @@ export function ApiConfigPage() {
     }))
   }
 
+  const updateOcrModel = (index: number, value: string) => {
+    setForm((current) => ({
+      ...current,
+      ocrModels: current.ocrModels.map((model, modelIndex) =>
+        modelIndex === index ? value : model,
+      ),
+    }))
+  }
+
+  const addOcrModel = () => {
+    setForm((current) => ({ ...current, ocrModels: [...current.ocrModels, ''] }))
+  }
+
+  const removeOcrModel = (index: number) => {
+    setForm((current) => {
+      const nextModels = current.ocrModels.filter((_, modelIndex) => modelIndex !== index)
+      const fallbackModel = nextModels.find((model) => model.trim()) ?? ''
+      return {
+        ...current,
+        ocrModels: nextModels.length ? nextModels : [''],
+        ocrModel: current.ocrModel === current.ocrModels[index] ? fallbackModel : current.ocrModel,
+      }
+    })
+  }
+
   const removeDoubtModel = (index: number) => {
     setForm((current) => {
       const nextModels = current.doubtModels.filter((_, modelIndex) => modelIndex !== index)
@@ -329,7 +359,6 @@ export function ApiConfigPage() {
         ...current,
         models: nextModels.length ? nextModels : [''],
         model: current.model === current.models[index] ? fallbackModel : current.model,
-        ocrModel: current.ocrModel === current.models[index] ? fallbackModel : current.ocrModel,
         homeworkSplitModel:
           current.homeworkSplitModel === current.models[index]
             ? fallbackModel || 'GLM-4.6V'
@@ -344,6 +373,9 @@ export function ApiConfigPage() {
     )
     const sanitizedDoubtModels = Array.from(
       new Set(form.doubtModels.map((model) => model.trim()).filter(Boolean)),
+    )
+    const sanitizedOcrModels = Array.from(
+      new Set(form.ocrModels.map((model) => model.trim()).filter(Boolean)),
     )
     const sanitizedEmbeddingModels = Array.from(
       new Set(form.embeddingModels.map((model) => model.trim()).filter(Boolean)),
@@ -361,7 +393,7 @@ export function ApiConfigPage() {
       ),
     )
 
-    if (!sanitizedModels.length || !sanitizedDoubtModels.length || !sanitizedEmbeddingModels.length || !sanitizedRerankModels.length) {
+    if (!sanitizedModels.length || !sanitizedDoubtModels.length || !sanitizedOcrModels.length || !sanitizedEmbeddingModels.length || !sanitizedRerankModels.length) {
       setStatus('文本、疑点回答、Embedding 和 Rerank 都请至少配置一个可用模型。')
       return
     }
@@ -370,7 +402,12 @@ export function ApiConfigPage() {
       ...form,
       models: sanitizedModels,
       model: sanitizedModels.includes(form.model.trim()) ? form.model.trim() : sanitizedModels[0],
-      ocrModel: sanitizedModels.includes(form.ocrModel.trim()) ? form.ocrModel.trim() : sanitizedModels[0],
+      ocrBaseUrl: form.ocrBaseUrl.trim(),
+      ocrApiKey: form.ocrApiKey.trim(),
+      ocrModels: sanitizedOcrModels,
+      ocrModel: sanitizedOcrModels.includes(form.ocrModel.trim())
+        ? form.ocrModel.trim()
+        : sanitizedOcrModels[0],
       doubtModels: sanitizedDoubtModels,
       doubtModel: sanitizedDoubtModels.includes(form.doubtModel.trim())
         ? form.doubtModel.trim()
@@ -430,6 +467,7 @@ export function ApiConfigPage() {
   const serviceReadiness = {
     text: Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.model.trim()),
     doubt: Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.doubtModel.trim()),
+    ocr: Boolean(form.ocrBaseUrl.trim() && form.ocrApiKey.trim() && form.ocrModel.trim()),
     knowledge: Boolean(
       form.embeddingBaseUrl.trim() &&
       form.embeddingApiKey.trim() &&
@@ -489,18 +527,23 @@ export function ApiConfigPage() {
               <span>疑点回答<small>阅读器 AI 对话</small></span>
               <ConfigStateBadge ready={serviceReadiness.doubt} />
             </a>
-            <a href="#api-knowledge">
+            <a href="#api-ocr">
               <b>03</b>
+              <span>答案视觉识别<small>手写 OCR 与 AI 批改</small></span>
+              <ConfigStateBadge ready={serviceReadiness.ocr} />
+            </a>
+            <a href="#api-knowledge">
+              <b>04</b>
               <span>知识库<small>Embedding 与 Rerank</small></span>
               <ConfigStateBadge ready={serviceReadiness.knowledge} />
             </a>
             <a href="#api-asr">
-              <b>04</b>
+              <b>05</b>
               <span>语音识别<small>课堂录音 ASR</small></span>
               <ConfigStateBadge ready={serviceReadiness.asr} />
             </a>
             <a href="#api-sync">
-              <b>05</b>
+              <b>06</b>
               <span>学堂同步<small>课程与课件自动同步</small></span>
               <ConfigStateBadge ready={serviceReadiness.sync} />
             </a>
@@ -597,15 +640,6 @@ export function ApiConfigPage() {
                       <option key={model} value={model}>{model}</option>
                     ))}
                   </select>
-                </label>
-                <label className="settings-field settings-field--compact">
-                  <span>答题 OCR / 视觉批改模型</span>
-                  <select value={form.ocrModel} onChange={(event) => updateField('ocrModel', event.target.value)}>
-                    {form.models.map((model) => model.trim()).filter(Boolean).map((model) => (
-                      <option key={model} value={model}>{model}</option>
-                    ))}
-                  </select>
-                  <small className="settings-field__hint">请选择支持图片输入的模型，用于识别手写答案和结构化批改。</small>
                 </label>
               </div>
             </div>
@@ -750,11 +784,102 @@ export function ApiConfigPage() {
             </details>
           </section>
 
+          <section className="api-config-section" id="api-ocr">
+            <header className="api-config-section__header">
+              <div className="api-config-section__identity">
+                <span className="api-config-section__number">03</span>
+                <div>
+                  <p className="api-config-section__eyebrow">ANSWER VISION</p>
+                  <h3>手写答案识别与批改</h3>
+                  <p>识别用户上传的手写图片或 PDF 页面，并返回结构化的批改结果。</p>
+                </div>
+              </div>
+              <ConfigStateBadge ready={serviceReadiness.ocr} />
+            </header>
+
+            <div className="api-config-subsection">
+              <div className="api-config-subsection__heading">
+                <h4>视觉模型服务</h4>
+                <p>可以使用独立的 OpenAI-compatible 服务；旧配置会自动沿用文本模型的连接信息。</p>
+              </div>
+              <div className="settings-form">
+                <label className="settings-field">
+                  <span>Base URL</span>
+                  <input
+                    type="text"
+                    value={form.ocrBaseUrl}
+                    onChange={(event) => updateField('ocrBaseUrl', event.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </label>
+                <label className="settings-field">
+                  <span>API Key</span>
+                  <input
+                    type="password"
+                    value={form.ocrApiKey}
+                    onChange={(event) => updateField('ocrApiKey', event.target.value)}
+                    placeholder="sk-..."
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="api-config-subsection">
+              <div className="api-config-subsection__heading">
+                <h4>OCR / 视觉模型</h4>
+                <p>模型必须支持图片输入。可读取服务模型列表，也可以手动填写模型名称。</p>
+              </div>
+              <div className="settings-form settings-form--models">
+                <div className="settings-field settings-field--full">
+                  <span>可用视觉模型</span>
+                  <div className="model-config-list">
+                    {form.ocrModels.map((model, index) => (
+                      <div key={index} className="model-config-row">
+                        <input
+                          aria-label={`OCR 视觉模型 ${index + 1}`}
+                          type="text"
+                          value={model}
+                          onChange={(event) => updateOcrModel(index, event.target.value)}
+                          placeholder="例如：GLM-4.6V"
+                        />
+                        <button
+                          type="button"
+                          className="ghost-button ghost-button--danger"
+                          onClick={() => removeOcrModel(index)}
+                          disabled={form.ocrModels.length === 1}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    ))}
+                    <div className="model-config-actions">
+                      <button type="button" className="ghost-button" onClick={addOcrModel}>手动添加</button>
+                      <ModelDiscoveryControl
+                        state={modelDiscovery.ocr}
+                        onFetch={() => void discoverModels('ocr')}
+                        onSelect={(model) => applyDiscoveredModel('ocr', model)}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <label className="settings-field settings-field--compact">
+                  <span>当前使用</span>
+                  <select value={form.ocrModel} onChange={(event) => updateField('ocrModel', event.target.value)}>
+                    {form.ocrModels.map((model) => model.trim()).filter(Boolean).map((model) => (
+                      <option key={model} value={model}>{model}</option>
+                    ))}
+                  </select>
+                  <small className="settings-field__hint">该模型用于手写 OCR、答案理解和结构化批改。</small>
+                </label>
+              </div>
+            </div>
+          </section>
+
           {/* KNOWLEDGE_GRAPH_PAUSED: Neo4j controls are intentionally hidden until graph work resumes. */}
           <section className="api-config-section" id="api-knowledge">
             <header className="api-config-section__header">
               <div className="api-config-section__identity">
-                <span className="api-config-section__number">03</span>
+                <span className="api-config-section__number">04</span>
                 <div>
                   <p className="api-config-section__eyebrow">KNOWLEDGE BASE</p>
                   <h3>知识库检索</h3>
@@ -904,7 +1029,7 @@ export function ApiConfigPage() {
           <section className="api-config-section" id="api-asr">
             <header className="api-config-section__header">
               <div className="api-config-section__identity">
-                <span className="api-config-section__number">04</span>
+                <span className="api-config-section__number">05</span>
                 <div>
                   <p className="api-config-section__eyebrow">AUDIO TRANSCRIPTION</p>
                   <h3>课堂录音识别</h3>
@@ -961,7 +1086,7 @@ export function ApiConfigPage() {
           <section className="api-config-section" id="api-sync">
             <header className="api-config-section__header">
               <div className="api-config-section__identity">
-                <span className="api-config-section__number">05</span>
+                <span className="api-config-section__number">06</span>
                 <div>
                   <p className="api-config-section__eyebrow">COURSE SYNC</p>
                   <h3>网络学堂同步</h3>

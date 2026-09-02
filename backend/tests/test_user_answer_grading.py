@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -9,15 +10,25 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import fitz
+from PIL import Image
 
 from backend.user_answer_grading import (
+  AnswerVisualRenderer,
+  KnowledgeQuestionContextProvider,
   UserAnswerGradingCoordinator,
+  UserAnswerGradingError,
   UserAnswerGradingService,
 )
 from backend.user_answers import UserAnswerStore
 
 
-PNG = b'\x89PNG\r\n\x1a\n' + b'handwritten-answer'
+def image_bytes(image_format: str = 'PNG') -> bytes:
+  output = io.BytesIO()
+  Image.new('RGB', (120, 80), 'white').save(output, format=image_format)
+  return output.getvalue()
+
+
+PNG = image_bytes()
 
 
 class Resolver:
@@ -92,6 +103,8 @@ class UserAnswerGradingTest(unittest.TestCase):
       'baseUrl': 'https://provider.example/v1',
       'apiKey': 'secret',
       'model': 'text-model',
+      'ocrBaseUrl': 'https://vision.example/v1',
+      'ocrApiKey': 'vision-secret',
       'ocrModel': 'vision-model',
     }
     answer = self._answer()
@@ -105,6 +118,8 @@ class UserAnswerGradingTest(unittest.TestCase):
     )
 
     self.assertEqual('vision-model', client.calls[0]['model'])
+    self.assertEqual('https://vision.example/v1', client.calls[0]['base_url'])
+    self.assertEqual('vision-secret', client.calls[0]['api_key'])
     self.assertTrue(any(
       item.get('type') == 'image_url'
       for item in client.calls[0]['messages'][1]['content']
@@ -134,6 +149,79 @@ class UserAnswerGradingTest(unittest.TestCase):
     ]
     self.assertEqual(1, len(image_items))
     self.assertTrue(image_items[0]['image_url']['url'].startswith('data:image/png;base64,'))
+
+  def test_pdf_over_page_limit_fails_attempt_instead_of_silently_truncating(self):
+    document = fitz.open()
+    for _ in range(17):
+      document.new_page()
+    answer = self._answer('long.pdf', 'application/pdf', document.tobytes())
+    document.close()
+    coordinator = UserAnswerGradingCoordinator(
+      self.store,
+      UserAnswerGradingService(self.store, ContextProvider(), ChatClient()),
+      max_workers=1,
+    )
+    try:
+      self.assertTrue(coordinator.queue(answer))
+      deadline = time.time() + 3
+      current = answer
+      while time.time() < deadline:
+        current = self.store.get_attempt('course-1', 'document-1', 'question-1', answer.id)
+        if current.processing_status == 'failed':
+          break
+        time.sleep(0.02)
+      self.assertEqual('failed', current.processing_status)
+      self.assertIn('最多支持 16 页答案', current.grading_error)
+    finally:
+      coordinator.shutdown()
+
+  def test_supported_question_image_formats_use_safe_derivatives_and_unknown_fails(self):
+    renderer = AnswerVisualRenderer()
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      sources = []
+      for suffix, image_format in (('.png', 'PNG'), ('.jpg', 'JPEG'), ('.webp', 'WEBP'), ('.gif', 'GIF')):
+        path = root / f'source{suffix}'
+        path.write_bytes(image_bytes(image_format))
+        sources.append(path)
+      originals = {path: path.read_bytes() for path in sources}
+      rendered = renderer.render_paths(sources, root / 'prepared')
+
+      self.assertEqual(4, len(rendered))
+      self.assertEqual(
+        ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+        [content_type for _, content_type in rendered],
+      )
+      self.assertTrue(all(path.parent == root / 'prepared' for path, _ in rendered))
+      self.assertEqual(originals, {path: path.read_bytes() for path in sources})
+      unsupported = root / 'source.bmp'
+      unsupported.write_bytes(image_bytes('BMP'))
+      with self.assertRaises(UserAnswerGradingError):
+        renderer.render_paths([unsupported], root / 'unknown')
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_provider_image_budget_fails_without_calling_provider_and_cleans_temp(self, load_config):
+    load_config.return_value = {'baseUrl': 'https://provider.example/v1', 'apiKey': 'x', 'ocrModel': 'm'}
+    answer = self._answer()
+    client = ChatClient()
+    created = []
+    original_mkdtemp = tempfile.mkdtemp
+
+    def tracked_mkdtemp(*args, **kwargs):
+      path = original_mkdtemp(*args, dir=self.temporary.name, **kwargs)
+      created.append(Path(path))
+      return path
+
+    with (
+      patch('backend.user_answer_grading.MAX_PROVIDER_TOTAL_BYTES', 1),
+      patch('backend.user_answer_grading.tempfile.mkdtemp', side_effect=tracked_mkdtemp),
+    ):
+      with self.assertRaises(UserAnswerGradingError):
+        UserAnswerGradingService(self.store, ContextProvider(), client).grade(answer)
+
+    self.assertEqual([], client.calls)
+    self.assertTrue(created)
+    self.assertTrue(all(not path.exists() for path in created))
 
   def test_multiple_attempts_and_grading_revisions_are_not_overwritten(self):
     first = self._answer()
@@ -193,6 +281,7 @@ class UserAnswerGradingTest(unittest.TestCase):
     coordinator = UserAnswerGradingCoordinator(self.store, FailingService(), max_workers=1)
     try:
       self.assertTrue(coordinator.queue(answer))
+      self.assertFalse(coordinator.queue(answer))
       deadline = time.time() + 2
       while time.time() < deadline:
         current = self.store.get_attempt('course-1', 'document-1', 'question-1', answer.id)
@@ -205,6 +294,83 @@ class UserAnswerGradingTest(unittest.TestCase):
       self.assertTrue(coordinator.queue(current))
     finally:
       coordinator.shutdown()
+
+  def test_restart_recovers_processing_attempt_and_deletion_prevents_worker_writeback(self):
+    answer = self._answer()
+    self.assertTrue(self.store.mark_processing(answer.course_id, answer.question_id, answer.id))
+    recovered = self.store.pending_attempts()
+    self.assertEqual([answer.id], [item.id for item in recovered])
+    self.assertEqual('pending', recovered[0].processing_status)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingService:
+      def grade(self, _attempt):
+        started.set()
+        release.wait(2)
+        payload = ChatClient().complete_json()
+        from backend.user_answers import AnswerUnderstanding, UserAnswerGrading
+        return (
+          AnswerUnderstanding.model_validate(payload['understanding']),
+          UserAnswerGrading.model_validate(payload['grading']),
+          'model',
+        )
+
+    coordinator = UserAnswerGradingCoordinator(self.store, BlockingService(), max_workers=1)
+    try:
+      self.assertTrue(coordinator.queue(recovered[0]))
+      self.assertTrue(started.wait(1))
+      self.assertTrue(self.store.delete('course-1', 'document-1', 'question-1'))
+      release.set()
+      coordinator.shutdown()
+      self.assertFalse(self.store._question_dir('course-1', 'question-1').exists())
+    finally:
+      release.set()
+      coordinator.shutdown()
+
+  @patch('backend.user_answer_grading.question_image_attachments', return_value=[])
+  @patch('backend.user_answer_grading.load_question_record')
+  @patch('backend.user_answer_grading.read_knowledge_library')
+  def test_reference_reliability_tracks_source_saved_and_missing(
+    self, read_library, load_record, _attachments,
+  ):
+    read_library.return_value = {'courses': [{
+      'id': 'course-1',
+      'homeworkFolders': [{'homeworkDocuments': [{
+        'id': 'document-1',
+        'questions': [{'id': 'question-1', 'title': 'Q', 'content': 'Prompt'}],
+      }]}],
+    }]}
+
+    class References:
+      saved = None
+
+      def get_question_reference_answer(self, _course_id, _question_id):
+        return self.saved
+
+    references = References()
+    provider = KnowledgeQuestionContextProvider(references)
+    load_record.return_value = {'id': 'question-1', 'content': 'Prompt', 'reference_answer': '42'}
+    source = provider.resolve('course-1', 'document-1', 'question-1')
+    self.assertEqual((1.0, False, 'source'), (
+      source['reference_confidence'], source['reference_needs_review'], source['reference_source'],
+    ))
+
+    references.saved = SimpleNamespace(
+      answer_text='AI answer', confidence=0.61, needs_review=True, answer_source='ai_generated',
+    )
+    saved = provider.resolve('course-1', 'document-1', 'question-1')
+    self.assertEqual((0.61, True, 'ai_generated'), (
+      saved['reference_confidence'], saved['reference_needs_review'], saved['reference_source'],
+    ))
+
+    references.saved = None
+    load_record.return_value = {'id': 'question-1', 'content': 'Prompt'}
+    missing = provider.resolve('course-1', 'document-1', 'question-1')
+    self.assertEqual((0.0, True, 'missing'), (
+      missing['reference_confidence'], missing['reference_needs_review'], missing['reference_source'],
+    ))
 
 
 if __name__ == '__main__':

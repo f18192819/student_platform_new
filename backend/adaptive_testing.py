@@ -557,7 +557,7 @@ class AdaptiveTestingService:
     )
     for candidate in ranked:
       if self._cached_assessment_spec(session.course_id, candidate) is not None:
-        self._prefetch_assessments(session.course_id, ranked, exclude={str(candidate['question_id'])})
+        self._prefetch_assessments(session, ranked, exclude={str(candidate['question_id'])})
         LOGGER.info(
           'adaptive.select.duration session=%s duration_ms=%.1f selected=%s',
           session.id,
@@ -565,7 +565,7 @@ class AdaptiveTestingService:
           candidate['question_id'],
         )
         return str(candidate['question_id'])
-    self._prefetch_assessments(session.course_id, ranked)
+    self._prefetch_assessments(session, ranked)
     LOGGER.info(
       'adaptive.select.duration session=%s duration_ms=%.1f selected=none',
       session.id,
@@ -575,21 +575,31 @@ class AdaptiveTestingService:
 
   def _prefetch_assessments(
     self,
-    course_id: str,
+    session: AdaptiveTestSession,
     candidates: list[dict[str, Any]],
     exclude: set[str] | None = None,
   ) -> None:
-    excluded = exclude or set()
-    scheduled = 0
+    excluded = (exclude or set()) | set(session.asked_question_ids)
+    remaining_target = max(0, session.target_question_count - len(session.asked_question_ids))
+    statuses: list[tuple[dict[str, Any], str]] = []
     for candidate in candidates:
       if str(candidate.get('question_id') or '') in excluded:
         continue
-      status = self.assessment_preparation.status(course_id, candidate)
-      if status.state in {'ready', 'failed'}:
+      state = self.assessment_preparation.status(session.course_id, candidate).state
+      if state not in {'failed', 'needs_review'}:
+        statuses.append((candidate, state))
+
+    desired_buffer = min(len(statuses), remaining_target + 3)
+    provisioned = sum(1 for _, state in statuses if state in {'ready', 'preparing'})
+    if provisioned >= desired_buffer:
+      return
+
+    for candidate, state in statuses:
+      if state != 'idle':
         continue
-      self.assessment_preparation.schedule(course_id, candidate)
-      scheduled += 1
-      if scheduled >= 3:
+      self.assessment_preparation.schedule(session.course_id, candidate)
+      provisioned += 1
+      if provisioned >= desired_buffer:
         break
 
   def _refresh_candidate_pool(

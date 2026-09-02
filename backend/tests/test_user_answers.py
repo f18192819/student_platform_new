@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.user_answer_router import create_user_answer_router
-from backend.user_answers import UserAnswerStore
+from backend.user_answers import UserAnswerCorruptionError, UserAnswerStore
 from backend.pipeline_router import PipelineApiService
 
 
@@ -106,6 +107,64 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertTrue(self.store.delete('course-1', 'homework-1', 'q1'))
     self.assertIsNone(self.store.get('course-1', 'homework-1', 'q1'))
 
+  def test_missing_record_is_empty_but_corrupt_record_blocks_reads_and_reupload(self):
+    self.assertIsNone(self.store.get('course-1', 'homework-1', 'q1'))
+    record_path = self.store._record_path('course-1', 'q1')
+    record_path.parent.mkdir(parents=True)
+    damaged = b'{not-valid-json'
+    record_path.write_bytes(damaged)
+
+    with self.assertRaises(UserAnswerCorruptionError):
+      self.store.get('course-1', 'homework-1', 'q1')
+    with self.assertRaises(UserAnswerCorruptionError):
+      self.store.replace(
+        'course-1', 'homework-1', 'q1', 'homework',
+        [upload('replacement.png', 'image/png', PNG)],
+      )
+
+    self.assertEqual(damaged, record_path.read_bytes())
+    self.assertFalse((record_path.parent / 'attempts').exists())
+
+  def test_record_writes_are_atomic_and_keep_last_valid_backup(self):
+    first = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework',
+      [upload('first.png', 'image/png', PNG)],
+    )
+    self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework',
+      [upload('second.png', 'image/png', PNG)],
+    )
+    record_path = self.store._record_path('course-1', 'q1')
+    backup = json.loads(record_path.with_name('record.json.bak').read_text(encoding='utf-8'))
+
+    self.assertEqual(first.id, backup['current_attempt_id'])
+    self.assertFalse(any(record_path.parent.glob('*.tmp')))
+
+  def test_failed_metadata_commit_removes_staged_attempt_and_preserves_record(self):
+    first = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework',
+      [upload('first.png', 'image/png', PNG)],
+    )
+    record_path = self.store._record_path('course-1', 'q1')
+    original = record_path.read_bytes()
+    real_write = __import__('backend.user_answers', fromlist=['write_json_atomic']).write_json_atomic
+
+    def fail_main(path, value):
+      if path == record_path:
+        raise OSError('disk full')
+      return real_write(path, value)
+
+    with patch('backend.user_answers.write_json_atomic', side_effect=fail_main):
+      with self.assertRaises(OSError):
+        self.store.replace(
+          'course-1', 'homework-1', 'q1', 'homework',
+          [upload('second.png', 'image/png', PNG)],
+        )
+
+    self.assertEqual(original, record_path.read_bytes())
+    attempt_dirs = [item.name for item in (record_path.parent / 'attempts').iterdir()]
+    self.assertEqual([first.id], attempt_dirs)
+
   def test_source_document_and_course_cleanup_remove_assets(self):
     self.store.replace(
       'course-1', 'homework-1', 'q1', 'homework',
@@ -148,6 +207,11 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertEqual([answer['id']], queued)
     self.assertEqual(answer['id'], client.get(base).json()['answer']['id'])
     self.assertEqual(answer['id'], client.get(f'{base}/attempts').json()['attempts'][0]['id'])
+    summary = client.get(f'{base}/attempts').json()['attempts'][0]
+    self.assertEqual(2, summary['asset_count'])
+    self.assertNotIn('assets', summary)
+    detail = client.get(f"{base}/attempts/{answer['id']}").json()['answer']
+    self.assertEqual(2, len(detail['assets']))
 
     asset_response = client.get(f"{base}/assets/{answer['assets'][0]['id']}")
     self.assertEqual(PNG, asset_response.content)

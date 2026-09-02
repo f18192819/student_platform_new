@@ -5,6 +5,7 @@ import {
   type UserQuestionAnswer,
 } from '../../lib/userAnswers'
 import { useQuestionAnswer } from './useQuestionAnswer'
+import { userAnswerGradingLabel } from './questionAnswerState'
 
 const ACCEPTED_ANSWERS = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
 
@@ -30,7 +31,7 @@ function GradingPanel({ attempt, onRetry }: {
     <section className="question-answer-grading">
       <header>
         <div><small>批改结果</small><strong>{Math.round(grading.score * 100)}%</strong></div>
-        <span>{grading.correct ? '基本正确' : grading.needs_review ? '需要人工确认' : '仍需改进'}</span>
+        <span>{userAnswerGradingLabel(grading)}</span>
       </header>
       {grading.needs_review ? (
         <p className="question-answer-grading__review">AI 对该答案的判断把握较低，请结合原答案核对，不将其视为确定结论。</p>
@@ -73,7 +74,7 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
   const identity: QuestionAnswerIdentity = {
     courseId: courseId ?? '', sourceDocumentId: sourceDocumentId ?? '', questionId: questionId ?? '',
   }
-  const { attempts, isLoading, isSaving, error, upload, retry, remove } = useQuestionAnswer({
+  const { attempts, details, isLoading, isSaving, error, loadAttempt, upload, retry, remove } = useQuestionAnswer({
     enabled, identity, sourceType,
   })
   const [activeTab, setActiveTab] = useState<'question' | 'answer'>('question')
@@ -88,8 +89,18 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
     setPreviewImage(null)
   }, [identityKey])
 
+  const selectedSummary = attempts.find((attempt) => attempt.id === selectedAttemptId) ?? attempts[0] ?? null
+  const selected = selectedSummary ? details[selectedSummary.id] ?? null : null
+
+  useEffect(() => {
+    if (activeTab !== 'answer' || !selectedSummary) return
+    const cached = details[selectedSummary.id]
+    void loadAttempt(selectedSummary.id, Boolean(cached && cached.updated_at !== selectedSummary.updated_at))
+    // The summary timestamp is the cache version; the hook guards stale identity responses.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, identityKey, selectedSummary?.id, selectedSummary?.updated_at])
+
   if (!enabled) return children
-  const selected = attempts.find((attempt) => attempt.id === selectedAttemptId) ?? attempts[0] ?? null
   const orderedAssets = [...(selected?.assets ?? [])].sort((left, right) => left.order - right.order)
   const openUpload = () => uploadInputRef.current?.click()
 
@@ -114,7 +125,9 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
 
       {activeTab === 'question' ? children : (
         <div className="question-answer-viewer__answer" role="tabpanel">
-          {isLoading ? <div className="question-answer-viewer__empty">正在读取我的答案…</div> : selected ? (
+          {isLoading ? <div className="question-answer-viewer__empty">正在读取我的答案…</div> : selectedSummary && !selected ? (
+            <div className="question-answer-viewer__empty">正在读取本次作答详情…</div>
+          ) : selected ? (
             <>
               <div className="question-answer-viewer__actions">
                 <div><strong>第 {selected.attempt_number} 次作答</strong><span>{new Date(selected.created_at).toLocaleString()} · {orderedAssets.length} 个文件</span></div>
@@ -138,7 +151,7 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
               {attempts.length > 1 ? (
                 <section className="question-answer-history"><h3>历史作答记录</h3><div>{attempts.map((attempt) => (
                   <button key={attempt.id} type="button" className={attempt.id === selected.id ? 'is-active' : ''} onClick={() => setSelectedAttemptId(attempt.id)}>
-                    <strong>Attempt {attempt.attempt_number}</strong><span>{attempt.grading ? `${Math.round(attempt.grading.score * 100)}%` : attempt.processing_status}</span><small>{new Date(attempt.created_at).toLocaleString()}</small>
+                    <strong>Attempt {attempt.attempt_number}</strong><span>{attempt.score != null ? `${Math.round(attempt.score * 100)}%` : attempt.processing_status}</span><small>{new Date(attempt.created_at).toLocaleString()}</small>
                   </button>
                 ))}</div></section>
               ) : null}

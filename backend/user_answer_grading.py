@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Protocol
 
+from PIL import Image, ImageOps
+
 from .knowledge_storage import read_knowledge_library
 from .learning_state import LearningStateStore
 from .provider_transport import MultimodalChatClient, ProviderTransportError
@@ -21,6 +23,7 @@ from .runtime_config import load_api_config
 from .user_answers import (
   AnswerUnderstanding,
   UserAnswerGrading,
+  UserAnswerNotFound,
   UserAnswerStore,
   UserQuestionAnswer,
 )
@@ -28,6 +31,19 @@ from .user_answers import (
 
 GRADING_VERSION = 'user-answer-grading-v1'
 MAX_PDF_PAGES = 16
+MAX_PROVIDER_IMAGE_EDGE = 2400
+MAX_PROVIDER_IMAGE_PIXELS = 5_000_000
+MAX_SOURCE_IMAGE_PIXELS = 40_000_000
+MAX_PROVIDER_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_PROVIDER_TOTAL_BYTES = 24 * 1024 * 1024
+
+IMAGE_CONTENT_TYPES = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+}
 
 
 class UserAnswerGradingError(RuntimeError):
@@ -71,27 +87,48 @@ class KnowledgeQuestionContextProvider:
                 ]
               except Exception:  # noqa: BLE001 - a missing source visual must not lose the user answer.
                 question_images = []
-              reference = saved.answer_text if saved else str(
-                question.get('reference_answer')
+              source_reference = str(
+                source_question.get('reference_answer')
+                or source_question.get('standard_answer')
+                or source_question.get('answer')
+                or question.get('reference_answer')
                 or question.get('standard_answer')
                 or question.get('answer')
                 or '',
               ).strip()
+              reference = saved.answer_text if saved else source_reference
               return {
                 'title': str(question.get('title') or ''),
                 'content': str(question.get('content') or ''),
                 'analysis': question.get('analysis') if isinstance(question.get('analysis'), dict) else {},
                 'reference_answer': reference,
-                'reference_confidence': saved.confidence if saved else 0.0,
-                'reference_needs_review': saved.needs_review if saved else not bool(reference),
+                'reference_confidence': saved.confidence if saved else (1.0 if source_reference else 0.0),
+                'reference_needs_review': saved.needs_review if saved else not bool(source_reference),
+                'reference_source': saved.answer_source if saved else ('source' if source_reference else 'missing'),
                 'question_images': question_images,
               }
     raise UserAnswerGradingError('Question context is no longer available.')
 
 
-def _data_url(path: Path, content_type: str) -> str:
-  encoded = base64.b64encode(path.read_bytes()).decode('ascii')
-  return f'data:{content_type};base64,{encoded}'
+def _image_content_type(path: Path) -> str:
+  content_type = IMAGE_CONTENT_TYPES.get(path.suffix.lower())
+  if content_type is None:
+    raise UserAnswerGradingError(f'Unsupported question image format: {path.suffix or "unknown"}.')
+  return content_type
+
+
+def _data_url(path: Path, content_type: str, remaining_bytes: int) -> tuple[str, int]:
+  byte_size = path.stat().st_size
+  if byte_size > MAX_PROVIDER_IMAGE_BYTES:
+    raise UserAnswerGradingError('A prepared image is too large for grading. Please reduce its resolution.')
+  if byte_size > remaining_bytes:
+    raise UserAnswerGradingError('The answer images exceed the grading request size limit.')
+  with path.open('rb') as source:
+    content = source.read(MAX_PROVIDER_IMAGE_BYTES + 1)
+  if len(content) != byte_size or len(content) > MAX_PROVIDER_IMAGE_BYTES:
+    raise UserAnswerGradingError('Unable to safely read a prepared grading image.')
+  encoded = base64.b64encode(content).decode('ascii')
+  return f'data:{content_type};base64,{encoded}', byte_size
 
 
 class AnswerVisualRenderer:
@@ -108,10 +145,57 @@ class AnswerVisualRenderer:
         attempt.id,
       )
       if asset.kind == 'image':
-        rendered.append((path, asset.content_type))
+        rendered.append(self._render_image(path, target / 'images' / f'{asset.order:03d}-{asset.id}'))
         continue
       rendered.extend(self._render_pdf(path, target / asset.id))
     return rendered
+
+  def render_paths(self, paths: list[Path], target: Path) -> list[tuple[Path, str]]:
+    return [
+      self._render_image(path, target / f'{index:03d}-{path.stem}')
+      for index, path in enumerate(paths)
+    ]
+
+  @staticmethod
+  def _render_image(path: Path, target: Path) -> tuple[Path, str]:
+    content_type = _image_content_type(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+      with Image.open(path) as source:
+        source.seek(0)
+        image = ImageOps.exif_transpose(source).copy()
+      width, height = image.size
+      if width <= 0 or height <= 0 or width * height > MAX_SOURCE_IMAGE_PIXELS:
+        raise UserAnswerGradingError('An image is too large to process safely.')
+      scale = min(
+        1.0,
+        MAX_PROVIDER_IMAGE_EDGE / max(width, height),
+        (MAX_PROVIDER_IMAGE_PIXELS / (width * height)) ** 0.5,
+      )
+      if scale < 1.0:
+        image = image.resize(
+          (max(1, round(width * scale)), max(1, round(height * scale))),
+          Image.Resampling.LANCZOS,
+        )
+      if content_type == 'image/png':
+        output = target.with_suffix('.png')
+        image.save(output, format='PNG', optimize=True)
+        return output, 'image/png'
+      if content_type == 'image/webp':
+        output = target.with_suffix('.webp')
+        image.save(output, format='WEBP', quality=92, method=6)
+        return output, 'image/webp'
+      if content_type == 'image/gif':
+        output = target.with_suffix('.gif')
+        image.convert('P', palette=Image.Palette.ADAPTIVE).save(output, format='GIF')
+        return output, 'image/gif'
+      output = target.with_suffix('.jpg')
+      image.convert('RGB').save(output, format='JPEG', quality=92, optimize=True, subsampling=0)
+      return output, 'image/jpeg'
+    except UserAnswerGradingError:
+      raise
+    except Exception as exc:
+      raise UserAnswerGradingError(f'Unable to prepare image {path.name}: {exc}') from exc
 
   @staticmethod
   def _render_pdf(path: Path, target: Path) -> list[tuple[Path, str]]:
@@ -123,12 +207,21 @@ class AnswerVisualRenderer:
     pages: list[tuple[Path, str]] = []
     try:
       with fitz.open(path) as document:
+        if document.page_count > MAX_PDF_PAGES:
+          raise UserAnswerGradingError(
+            f'当前答案共 {document.page_count} 页，最多支持 {MAX_PDF_PAGES} 页答案，请拆分后重新上传。',
+          )
         for index, page in enumerate(document):
-          if index >= MAX_PDF_PAGES:
-            break
-          output = target / f'page-{index + 1}.png'
-          page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False).save(output)
-          pages.append((output, 'image/png'))
+          raw_output = target / f'.raw-page-{index + 1}.png'
+          page.get_pixmap(matrix=fitz.Matrix(1.7, 1.7), alpha=False).save(raw_output)
+          try:
+            pages.append(AnswerVisualRenderer._render_image(
+              raw_output, target / f'page-{index + 1}',
+            ))
+          finally:
+            raw_output.unlink(missing_ok=True)
+    except UserAnswerGradingError:
+      raise
     except Exception as exc:
       raise UserAnswerGradingError(f'Unable to render answer PDF: {exc}') from exc
     if not pages:
@@ -179,21 +272,28 @@ class UserAnswerGradingService:
           ),
         }, ensure_ascii=False),
       }]
-      for question_image in context.get('question_images') or []:
-        suffix = question_image.suffix.lower()
-        content_type = 'image/png' if suffix == '.png' else 'image/jpeg'
+      question_images = self.renderer.render_paths(
+        list(context.get('question_images') or []), temporary / 'question-images',
+      )
+      remaining_bytes = MAX_PROVIDER_TOTAL_BYTES
+      for question_image, content_type in question_images:
+        url, byte_size = _data_url(question_image, content_type, remaining_bytes)
+        remaining_bytes -= byte_size
         user_content.append({
           'type': 'image_url',
-          'image_url': {'url': _data_url(question_image, content_type), 'detail': 'high'},
+          'image_url': {'url': url, 'detail': 'high'},
         })
       user_content.append({'type': 'text', 'text': 'Student answer images begin below.'})
-      user_content.extend({
-        'type': 'image_url',
-        'image_url': {'url': _data_url(path, content_type), 'detail': 'high'},
-      } for path, content_type in images)
+      for path, content_type in images:
+        url, byte_size = _data_url(path, content_type, remaining_bytes)
+        remaining_bytes -= byte_size
+        user_content.append({
+          'type': 'image_url',
+          'image_url': {'url': url, 'detail': 'high'},
+        })
       payload = self.chat_client.complete_json(
-        base_url=str(config.get('baseUrl') or ''),
-        api_key=str(config.get('apiKey') or ''),
+        base_url=str(config.get('ocrBaseUrl') or config.get('baseUrl') or ''),
+        api_key=str(config.get('ocrApiKey') or config.get('apiKey') or ''),
         model=model,
         messages=[
           {
@@ -290,7 +390,11 @@ class UserAnswerGradingCoordinator:
     try:
       if not self.store.mark_processing(attempt.course_id, attempt.question_id, attempt.id):
         return
+      if not self.store.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+        return
       understanding, grading, model = self.service.grade(attempt)
+      if not self.store.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+        return
       self.store.save_grading(
         attempt.course_id,
         attempt.question_id,
@@ -300,8 +404,11 @@ class UserAnswerGradingCoordinator:
         model=model,
         version=GRADING_VERSION,
       )
+    except UserAnswerNotFound:
+      return
     except Exception as exc:  # noqa: BLE001 - persist every provider/render failure for retry.
-      self.store.mark_failed(attempt.course_id, attempt.question_id, attempt.id, str(exc))
+      if self.store.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+        self.store.mark_failed(attempt.course_id, attempt.question_id, attempt.id, str(exc))
     finally:
       with self._lock:
         self._in_flight.discard(key)

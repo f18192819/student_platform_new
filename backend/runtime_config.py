@@ -71,13 +71,17 @@ def normalize_api_config(payload: dict[str, Any]) -> dict[str, Any]:
   embedding_models, embedding_model = model_group('embeddingModels', 'embeddingModel', 'GLM-Embedding-3')
   rerank_models, rerank_model = model_group('rerankModels', 'rerankModel', 'GLM-Rerank')
   doubt_models, doubt_model = model_group('doubtModels', 'doubtModel', model or 'GLM-4.6V')
+  ocr_models, ocr_model = model_group('ocrModels', 'ocrModel', model or 'GLM-4.6V')
 
   return {
     'baseUrl': _string(payload.get('baseUrl')),
     'apiKey': _string(payload.get('apiKey')),
     'model': model,
     'models': models,
-    'ocrModel': _string(payload.get('ocrModel'), model),
+    'ocrBaseUrl': _string(payload.get('ocrBaseUrl'), _string(payload.get('baseUrl'))),
+    'ocrApiKey': _string(payload.get('ocrApiKey'), _string(payload.get('apiKey'))),
+    'ocrModel': ocr_model,
+    'ocrModels': ocr_models,
     'doubtModel': doubt_model,
     'doubtModels': doubt_models,
     'contextWindowOverrides': _context_window_overrides(payload.get('contextWindowOverrides')),

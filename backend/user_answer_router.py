@@ -6,6 +6,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .user_answers import (
+  UserAnswerCorruptionError,
   UserAnswerError,
   UserAnswerNotFound,
   UserAnswerStore,
@@ -25,6 +26,8 @@ def create_user_answer_router(
       return HTTPException(status_code=404, detail=str(error))
     if isinstance(error, UserAnswerValidationError):
       return HTTPException(status_code=422, detail=str(error))
+    if isinstance(error, UserAnswerCorruptionError):
+      return HTTPException(status_code=500, detail=str(error))
     return HTTPException(status_code=500, detail='Unable to process user answer.')
 
   @router.get('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}')
@@ -90,7 +93,7 @@ def create_user_answer_router(
   async def list_attempts(course_id: str, source_document_id: str, question_id: str) -> dict:
     try:
       attempts = await asyncio.to_thread(
-        store.list_attempts, course_id, source_document_id, question_id,
+        store.list_attempt_summaries, course_id, source_document_id, question_id,
       )
       return {'attempts': [attempt.model_dump() for attempt in attempts]}
     except UserAnswerError as error:

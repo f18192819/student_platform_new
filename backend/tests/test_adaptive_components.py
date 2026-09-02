@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 
@@ -72,6 +73,54 @@ class FakeSubjectiveGrader:
 
 
 class AdaptiveComponentTest(unittest.TestCase):
+  @staticmethod
+  def _prefetch_service(states: dict[str, str]):
+    scheduled = []
+
+    class Preparation:
+      def status(self, _course_id, item):
+        return SimpleNamespace(state=states.get(item['question_id'], 'idle'))
+
+      def schedule(self, _course_id, item):
+        question_id = item['question_id']
+        scheduled.append(question_id)
+        states[question_id] = 'preparing'
+
+    service = AdaptiveTestingService.__new__(AdaptiveTestingService)
+    service.assessment_preparation = Preparation()
+    return service, scheduled
+
+  def test_prefetch_uses_remaining_target_buffer_instead_of_fixed_three(self):
+    service, scheduled = self._prefetch_service({})
+    session = AdaptiveTestSession(
+      id='session', course_id='c1', lecture_document_id='lecture-1', target_question_count=7,
+    )
+
+    service._prefetch_assessments(session, [candidate(f'q{index}') for index in range(12)])
+
+    self.assertEqual(10, len(scheduled))
+
+  def test_prefetch_does_not_queue_when_ready_pool_is_sufficient(self):
+    states = {f'q{index}': 'ready' for index in range(6)}
+    service, scheduled = self._prefetch_service(states)
+    session = AdaptiveTestSession(
+      id='session', course_id='c1', lecture_document_id='lecture-1', target_question_count=3,
+    )
+
+    service._prefetch_assessments(session, [candidate(f'q{index}') for index in range(8)])
+
+    self.assertEqual([], scheduled)
+
+  def test_prefetch_small_target_only_adds_small_buffer(self):
+    service, scheduled = self._prefetch_service({})
+    session = AdaptiveTestSession(
+      id='session', course_id='c1', lecture_document_id='lecture-1', target_question_count=2,
+    )
+
+    service._prefetch_assessments(session, [candidate(f'q{index}') for index in range(20)])
+
+    self.assertEqual(5, len(scheduled))
+
   def test_selection_prioritizes_wrong_concept_and_skips_asked_question(self):
     session = AdaptiveTestSession(
       id='session-1',

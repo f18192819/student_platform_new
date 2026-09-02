@@ -244,7 +244,10 @@ export type ApiConfig = {
   apiKey: string
   model: string
   models: string[]
+  ocrBaseUrl: string
+  ocrApiKey: string
   ocrModel: string
+  ocrModels: string[]
   doubtModel: string
   doubtModels: string[]
   contextWindowOverrides: Record<string, number>

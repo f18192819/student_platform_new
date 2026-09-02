@@ -62,6 +62,19 @@ export type UserQuestionAnswer = {
   grading_error: string
 }
 
+export type UserAnswerAttemptSummary = {
+  id: string
+  attempt_number: number
+  created_at: string
+  updated_at: string
+  processing_status: UserQuestionAnswer['processing_status']
+  score: number | null
+  correct: boolean | null
+  needs_review: boolean
+  asset_count: number
+  grading_model: string
+}
+
 export type QuestionAnswerIdentity = {
   courseId: string
   sourceDocumentId: string
@@ -84,8 +97,22 @@ async function responseError(response: Response) {
 export async function loadUserQuestionAnswerAttempts(identity: QuestionAnswerIdentity, signal?: AbortSignal) {
   const response = await fetch(`${answerPath(identity)}/attempts`, { signal })
   if (!response.ok) throw new Error(await responseError(response))
-  const payload = await response.json() as { attempts: UserQuestionAnswer[] }
+  const payload = await response.json() as { attempts: UserAnswerAttemptSummary[] }
   return payload.attempts
+}
+
+export async function loadUserQuestionAnswerAttempt(
+  identity: QuestionAnswerIdentity,
+  attemptId: string,
+  signal?: AbortSignal,
+) {
+  const response = await fetch(
+    `${answerPath(identity)}/attempts/${encodeURIComponent(attemptId)}`,
+    { signal },
+  )
+  if (!response.ok) throw new Error(await responseError(response))
+  const payload = await response.json() as { answer: UserQuestionAnswer }
+  return payload.answer
 }
 
 export async function uploadUserQuestionAnswer(

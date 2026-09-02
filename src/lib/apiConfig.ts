@@ -8,7 +8,10 @@ export const defaultApiConfig: ApiConfig = {
   apiKey: '',
   model: 'GLM-4.6V',
   models: ['GLM-4.6V'],
+  ocrBaseUrl: 'https://llmapi.paratera.com/v1',
+  ocrApiKey: '',
   ocrModel: 'GLM-4.6V',
+  ocrModels: ['GLM-4.6V'],
   doubtModel: 'GLM-4.6V',
   doubtModels: ['GLM-4.6V'],
   contextWindowOverrides: {},
@@ -77,6 +80,7 @@ function normalizeCompactionThreshold(value: unknown) {
 
 function normalizeApiConfig(input: Partial<ApiConfig>): ApiConfig {
   const textModels = normalizeModels(input.models, input.model, defaultApiConfig.model)
+  const ocrModels = normalizeModels(input.ocrModels, input.ocrModel, textModels.model)
   const doubtModels = normalizeModels(input.doubtModels, input.doubtModel, textModels.model)
   const embeddingModels = normalizeModels(input.embeddingModels, input.embeddingModel, defaultApiConfig.embeddingModel)
   const rerankModels = normalizeModels(input.rerankModels, input.rerankModel, defaultApiConfig.rerankModel)
@@ -85,7 +89,10 @@ function normalizeApiConfig(input: Partial<ApiConfig>): ApiConfig {
     apiKey: input.apiKey ?? '',
     model: textModels.model,
     models: textModels.models,
-    ocrModel: input.ocrModel?.trim() || textModels.model,
+    ocrBaseUrl: input.ocrBaseUrl ?? input.baseUrl ?? '',
+    ocrApiKey: input.ocrApiKey ?? input.apiKey ?? '',
+    ocrModel: ocrModels.model,
+    ocrModels: ocrModels.models,
     doubtModel: doubtModels.model,
     doubtModels: doubtModels.models,
     contextWindowOverrides: normalizeContextWindowOverrides(input.contextWindowOverrides),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from typing import BinaryIO, Literal, Protocol
 from pydantic import BaseModel, Field
 
 from .config import PROJECT_ROOT
-from .document_pipeline import read_json_file, safe_storage_name, write_json_atomic
+from .document_pipeline import safe_storage_name, write_json_atomic
 from .knowledge_storage import read_knowledge_library
 
 
@@ -30,6 +31,23 @@ class UserAnswerNotFound(UserAnswerError):
 
 class UserAnswerValidationError(UserAnswerError):
   pass
+
+
+class UserAnswerCorruptionError(UserAnswerError):
+  """Raised when durable answer metadata exists but cannot be trusted."""
+
+
+class UserAnswerAttemptSummary(BaseModel):
+  id: str
+  attempt_number: int
+  created_at: str
+  updated_at: str
+  processing_status: str
+  score: float | None = None
+  correct: bool | None = None
+  needs_review: bool = False
+  asset_count: int = 0
+  grading_model: str = ''
 
 
 class UserAnswerAsset(BaseModel):
@@ -209,11 +227,49 @@ class UserAnswerStore:
     return self._question_dir(course_id, question_id) / 'record.json'
 
   def _read_record(self, course_id: str, question_id: str) -> UserQuestionAnswerRecord:
-    payload = read_json_file(self._record_path(course_id, question_id), {})
-    try:
-      return UserQuestionAnswerRecord.model_validate(payload)
-    except Exception:
+    path = self._record_path(course_id, question_id)
+    if not path.is_file():
       return UserQuestionAnswerRecord()
+    try:
+      payload = json.loads(path.read_text(encoding='utf-8'))
+      return UserQuestionAnswerRecord.model_validate(payload)
+    except Exception as exc:
+      raise UserAnswerCorruptionError(
+        f'User answer metadata is damaged ({path.name}). Restore record.json.bak before retrying.',
+      ) from exc
+
+  @staticmethod
+  def _backup_path(path: Path) -> Path:
+    return path.with_name(f'{path.name}.bak')
+
+  def _write_record(self, course_id: str, question_id: str, record: UserQuestionAnswerRecord) -> None:
+    path = self._record_path(course_id, question_id)
+    if path.is_file():
+      try:
+        existing = json.loads(path.read_text(encoding='utf-8'))
+        UserQuestionAnswerRecord.model_validate(existing)
+      except Exception as exc:
+        raise UserAnswerCorruptionError(
+          f'User answer metadata is damaged ({path.name}). Restore record.json.bak before retrying.',
+        ) from exc
+      write_json_atomic(self._backup_path(path), existing)
+    write_json_atomic(path, record.model_dump())
+
+  @staticmethod
+  def _summary(attempt: UserQuestionAnswer) -> UserAnswerAttemptSummary:
+    grading = attempt.grading
+    return UserAnswerAttemptSummary(
+      id=attempt.id,
+      attempt_number=attempt.attempt_number,
+      created_at=attempt.created_at,
+      updated_at=attempt.updated_at,
+      processing_status=attempt.processing_status,
+      score=grading.score if grading else None,
+      correct=grading.correct if grading else None,
+      needs_review=grading.needs_review if grading else attempt.processing_status == 'needs_review',
+      asset_count=len(attempt.assets),
+      grading_model=attempt.grading_model,
+    )
 
   @staticmethod
   def _current(record: UserQuestionAnswerRecord) -> UserQuestionAnswer | None:
@@ -248,6 +304,17 @@ class UserAnswerStore:
         item for item in reversed(self._read_record(course_id, question_id).attempts)
         if item.course_id == course_id and item.source_document_id == source_document_id
       ]
+
+  def list_attempt_summaries(
+    self,
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+  ) -> list[UserAnswerAttemptSummary]:
+    return [
+      self._summary(attempt)
+      for attempt in self.list_attempts(course_id, source_document_id, question_id)
+    ]
 
   def get_attempt(
     self,
@@ -290,6 +357,7 @@ class UserAnswerStore:
       assets_dir = staging_dir / 'assets'
       assets: list[UserAnswerAsset] = []
       total_bytes = 0
+      metadata_committed = False
       try:
         assets_dir.mkdir(parents=True, exist_ok=False)
         for order, upload in enumerate(uploads):
@@ -335,11 +403,12 @@ class UserAnswerStore:
         )
         record.attempts.append(answer)
         record.current_attempt_id = answer.id
-        write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+        self._write_record(course_id, question_id, record)
+        metadata_committed = True
         return answer
       except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
-        if attempt_dir.is_dir() and not any(item.id == answer_id for item in record.attempts):
+        if attempt_dir.is_dir() and not metadata_committed:
           shutil.rmtree(attempt_dir, ignore_errors=True)
         raise
 
@@ -375,8 +444,13 @@ class UserAnswerStore:
       attempt.processing_status = 'processing'
       attempt.grading_error = ''
       attempt.updated_at = _now()
-      write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+      self._write_record(course_id, question_id, record)
       return True
+
+  def attempt_exists(self, course_id: str, question_id: str, attempt_id: str) -> bool:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      return any(item.id == attempt_id for item in record.attempts)
 
   def save_grading(
     self,
@@ -412,7 +486,7 @@ class UserAnswerStore:
       attempt.grading_error = ''
       attempt.processing_status = 'needs_review' if grading.needs_review else 'completed'
       attempt.updated_at = timestamp
-      write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+      self._write_record(course_id, question_id, record)
       return attempt
 
   def mark_failed(self, course_id: str, question_id: str, attempt_id: str, error: str) -> None:
@@ -424,7 +498,7 @@ class UserAnswerStore:
       attempt.processing_status = 'failed'
       attempt.grading_error = str(error or 'Answer grading failed.')[:1000]
       attempt.updated_at = _now()
-      write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+      self._write_record(course_id, question_id, record)
 
   def pending_attempts(self) -> list[UserQuestionAnswer]:
     attempts: list[UserQuestionAnswer] = []
@@ -437,7 +511,7 @@ class UserAnswerStore:
               if attempt.processing_status == 'processing':
                 attempt.processing_status = 'pending'
                 attempt.grading_error = 'Interrupted by backend restart; queued again.'
-                write_json_atomic(self._record_path(course_dir.name, question_dir.name), record.model_dump())
+                self._write_record(course_dir.name, question_dir.name, record)
               attempts.append(attempt)
     return attempts
 
