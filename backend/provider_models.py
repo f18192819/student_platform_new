@@ -22,7 +22,51 @@ def _models_url(base_url: str) -> str:
   return f'{root}/models'
 
 
-def _extract_model_ids(payload: Any) -> list[str]:
+def _string_values(value: Any) -> list[str]:
+  if isinstance(value, str):
+    values = [value]
+  elif isinstance(value, (list, tuple, set)):
+    values = [item for item in value if isinstance(item, str)]
+  elif isinstance(value, dict):
+    values = [str(key) for key, enabled in value.items() if enabled is True]
+  else:
+    values = []
+  return sorted({item.strip().lower() for item in values if item.strip()})
+
+
+def _model_metadata(item: dict[str, Any]) -> dict[str, Any]:
+  capabilities = set(_string_values(item.get('capabilities')))
+  capabilities.update(_string_values(item.get('supported_endpoints')))
+  capabilities.update(_string_values(item.get('mode')))
+  capabilities.update(_string_values(item.get('type')))
+
+  input_modalities = set(_string_values(item.get('input_modalities')))
+  output_modalities = set(_string_values(item.get('output_modalities')))
+  modalities = item.get('modalities')
+  if isinstance(modalities, dict):
+    input_modalities.update(_string_values(modalities.get('input')))
+    output_modalities.update(_string_values(modalities.get('output')))
+  elif modalities is not None:
+    input_modalities.update(_string_values(modalities))
+
+  supported = item.get('supported_modalities')
+  if isinstance(supported, dict):
+    input_modalities.update(_string_values(supported.get('input')))
+    output_modalities.update(_string_values(supported.get('output')))
+  elif supported is not None:
+    input_modalities.update(_string_values(supported))
+
+  metadata: dict[str, Any] = {}
+  if capabilities:
+    metadata['capabilities'] = sorted(capabilities)
+  if input_modalities:
+    metadata['input_modalities'] = sorted(input_modalities)
+  if output_modalities:
+    metadata['output_modalities'] = sorted(output_modalities)
+  return metadata
+
+
+def _extract_models(payload: Any) -> list[dict[str, Any]]:
   if isinstance(payload, list):
     candidates = payload
   elif isinstance(payload, dict):
@@ -39,17 +83,22 @@ def _extract_model_ids(payload: Any) -> list[str]:
   if not isinstance(candidates, list):
     return []
 
-  model_ids: set[str] = set()
+  models: dict[str, dict[str, Any]] = {}
   for item in candidates:
     if isinstance(item, str):
       model_id = item.strip()
+      metadata: dict[str, Any] = {}
     elif isinstance(item, dict):
       model_id = str(item.get('id') or item.get('model') or item.get('name') or '').strip()
+      metadata = _model_metadata(item)
     else:
       model_id = ''
     if model_id:
-      model_ids.add(model_id)
-  return sorted(model_ids, key=str.casefold)
+      existing = models.setdefault(model_id, {'id': model_id})
+      for field in ('capabilities', 'input_modalities', 'output_modalities'):
+        if field in metadata:
+          existing[field] = sorted(set(existing.get(field) or []) | set(metadata[field]))
+  return sorted(models.values(), key=lambda item: str(item['id']).casefold())
 
 
 def fetch_provider_models(*, base_url: str, api_key: str = '') -> dict[str, Any]:
@@ -69,9 +118,16 @@ def fetch_provider_models(*, base_url: str, api_key: str = '') -> dict[str, Any]
       detail=f'模型服务返回 HTTP {response.status_code}：{detail or response.reason}',
     )
   try:
-    models = _extract_model_ids(response.json())
+    models = _extract_models(response.json())
   except ValueError as exc:
     raise HTTPException(status_code=502, detail='模型服务没有返回有效 JSON。') from exc
   if not models:
     raise HTTPException(status_code=502, detail='模型服务响应中没有可选择的模型。')
-  return {'models': models, 'count': len(models), 'source_url': url}
+  # Keep the legacy string list so an older cached frontend can still render
+  # models while the richer DTO is used by capability-aware clients.
+  return {
+    'models': [str(model['id']) for model in models],
+    'discovered_models': models,
+    'count': len(models),
+    'source_url': url,
+  }

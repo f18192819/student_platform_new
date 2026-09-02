@@ -3,6 +3,15 @@ import type { ApiConfig } from '../types'
 export type TokenizerFamily = 'cl100k' | 'deepseek'
 export type ModelCapabilitySource = 'override' | 'runtime-registry' | 'bundled-registry' | 'fallback'
 export type ContextTask = 'chat' | 'summary' | 'pipeline'
+export type ModelUsageCapability = 'chat' | 'vision' | 'embedding' | 'rerank' | 'asr'
+export type ModelProviderSlot = 'text' | 'doubt' | 'ocr' | 'embedding' | 'rerank' | 'asr'
+
+export type DiscoveredModel = {
+  id: string
+  capabilities?: string[]
+  input_modalities?: string[]
+  output_modalities?: string[]
+}
 
 export type ModelCapability = {
   modelId: string
@@ -25,8 +34,15 @@ export type ModelContextBudget = ModelCapability & {
 }
 
 type RegistryCapability = {
-  contextWindow: number
-  maxOutputTokens: number
+  contextWindow?: number
+  maxOutputTokens?: number
+  capabilities: Set<ModelUsageCapability>
+}
+
+type SerializedRegistryCapability = {
+  contextWindow?: number
+  maxOutputTokens?: number
+  capabilities?: ModelUsageCapability[]
 }
 
 type ModelsDevPayload = Record<
@@ -39,6 +55,10 @@ type ModelsDevPayload = Record<
         limit?: {
           context?: number
           output?: number
+        }
+        modalities?: {
+          input?: string[]
+          output?: string[]
         }
       }
     >
@@ -63,31 +83,39 @@ const SOFT_TARGET_ANCHORS = [
 // Keep a small offline registry for the models used by this project. The
 // runtime models.dev registry can enrich this list without making startup
 // dependent on an external service.
+function registryCapability(
+  contextWindow: number,
+  maxOutputTokens: number,
+  capabilities: ModelUsageCapability[] = ['chat'],
+): RegistryCapability {
+  return { contextWindow, maxOutputTokens, capabilities: new Set(capabilities) }
+}
+
 const BUNDLED_REGISTRY: Record<string, RegistryCapability> = {
-  'deepseek-v4-flash': { contextWindow: 1_048_576, maxOutputTokens: 393_216 },
-  'deepseek-v4-pro': { contextWindow: 1_048_576, maxOutputTokens: 393_216 },
-  'deepseek-v3.2': { contextWindow: 131_072, maxOutputTokens: 32_768 },
-  'deepseek-v3.1': { contextWindow: 131_072, maxOutputTokens: 32_768 },
-  'deepseek-v3': { contextWindow: 131_072, maxOutputTokens: 32_768 },
-  'deepseek-r1': { contextWindow: 131_072, maxOutputTokens: 32_768 },
-  'minimax-m3': { contextWindow: 1_048_576, maxOutputTokens: 131_072 },
-  'minimax-m2.7': { contextWindow: 204_800, maxOutputTokens: 131_072 },
-  'minimax-m2.5': { contextWindow: 204_800, maxOutputTokens: 131_072 },
-  'minimax-m2': { contextWindow: 204_800, maxOutputTokens: 131_072 },
-  'minimax-text-01': { contextWindow: 1_000_192, maxOutputTokens: 65_536 },
-  'glm-4.7': { contextWindow: 204_800, maxOutputTokens: 131_072 },
-  'glm-4.6v': { contextWindow: 131_072, maxOutputTokens: 32_768 },
-  'glm-4.6': { contextWindow: 204_800, maxOutputTokens: 131_072 },
-  'glm-4.5v': { contextWindow: 65_536, maxOutputTokens: 16_384 },
-  'glm-4.5': { contextWindow: 131_072, maxOutputTokens: 98_304 },
-  'glm-4-long': { contextWindow: 1_000_000, maxOutputTokens: 128_000 },
-  'gpt-5': { contextWindow: 400_000, maxOutputTokens: 128_000 },
-  'gpt-4.1': { contextWindow: 1_047_576, maxOutputTokens: 32_768 },
-  'gpt-4o': { contextWindow: 128_000, maxOutputTokens: 16_384 },
-  'claude-opus-4': { contextWindow: 200_000, maxOutputTokens: 64_000 },
-  'claude-sonnet-4': { contextWindow: 200_000, maxOutputTokens: 64_000 },
-  'gemini-3': { contextWindow: 1_048_576, maxOutputTokens: 65_536 },
-  'gemini-2.5': { contextWindow: 1_048_576, maxOutputTokens: 65_536 },
+  'deepseek-v4-flash': registryCapability(1_048_576, 393_216),
+  'deepseek-v4-pro': registryCapability(1_048_576, 393_216),
+  'deepseek-v3.2': registryCapability(131_072, 32_768),
+  'deepseek-v3.1': registryCapability(131_072, 32_768),
+  'deepseek-v3': registryCapability(131_072, 32_768),
+  'deepseek-r1': registryCapability(131_072, 32_768),
+  'minimax-m3': registryCapability(1_048_576, 131_072),
+  'minimax-m2.7': registryCapability(204_800, 131_072),
+  'minimax-m2.5': registryCapability(204_800, 131_072),
+  'minimax-m2': registryCapability(204_800, 131_072),
+  'minimax-text-01': registryCapability(1_000_192, 65_536),
+  'glm-4.7': registryCapability(204_800, 131_072),
+  'glm-4.6v': registryCapability(131_072, 32_768, ['chat', 'vision']),
+  'glm-4.6': registryCapability(204_800, 131_072),
+  'glm-4.5v': registryCapability(65_536, 16_384, ['chat', 'vision']),
+  'glm-4.5': registryCapability(131_072, 98_304),
+  'glm-4-long': registryCapability(1_000_000, 128_000),
+  'gpt-5': registryCapability(400_000, 128_000),
+  'gpt-4.1': registryCapability(1_047_576, 32_768),
+  'gpt-4o': registryCapability(128_000, 16_384, ['chat', 'vision']),
+  'claude-opus-4': registryCapability(200_000, 64_000),
+  'claude-sonnet-4': registryCapability(200_000, 64_000),
+  'gemini-3': registryCapability(1_048_576, 65_536),
+  'gemini-2.5': registryCapability(1_048_576, 65_536),
 }
 
 let runtimeRegistry: Record<string, RegistryCapability> = {}
@@ -99,6 +127,21 @@ function normalizeModelId(modelId: string) {
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+function normalizedValues(values: unknown): string[] {
+  return Array.isArray(values)
+    ? values.filter((value): value is string => typeof value === 'string').map((value) => value.trim().toLowerCase()).filter(Boolean)
+    : []
+}
+
+function capabilitiesFromModalities(input: unknown, output: unknown) {
+  const inputModalities = new Set(normalizedValues(input))
+  const outputModalities = new Set(normalizedValues(output))
+  const capabilities = new Set<ModelUsageCapability>()
+  if (inputModalities.has('image')) capabilities.add('vision')
+  if (inputModalities.has('text') && outputModalities.has('text')) capabilities.add('chat')
+  return capabilities
 }
 
 function findByExactOrPrefix(
@@ -130,25 +173,56 @@ function getTokenizerFamily(modelId: string): TokenizerFamily {
   return normalizeModelId(modelId).includes('deepseek') ? 'deepseek' : 'cl100k'
 }
 
-function transformModelsDevPayload(payload: ModelsDevPayload) {
+export function transformModelsDevPayload(payload: ModelsDevPayload) {
   const transformed: Record<string, RegistryCapability> = {}
   for (const provider of Object.values(payload)) {
     for (const [key, model] of Object.entries(provider.models ?? {})) {
       const modelId = normalizeModelId(model.id || key)
       const contextWindow = model.limit?.context
-      if (!modelId || !isPositiveInteger(contextWindow)) continue
-      const maxOutputTokens = isPositiveInteger(model.limit?.output)
-        ? model.limit.output
-        : DEFAULT_MAX_OUTPUT
+      const maxOutputTokens = model.limit?.output
+      const capabilities = capabilitiesFromModalities(
+        model.modalities?.input,
+        model.modalities?.output,
+      )
+      if (!modelId || (!isPositiveInteger(contextWindow) && capabilities.size === 0)) continue
       const existing = transformed[modelId]
-      // A custom gateway may expose a smaller window than the original vendor.
-      // When providers disagree, use the conservative value.
-      if (!existing || contextWindow < existing.contextWindow) {
-        transformed[modelId] = { contextWindow, maxOutputTokens }
+      const knownContexts = [existing?.contextWindow, contextWindow].filter(isPositiveInteger)
+      const knownOutputs = [existing?.maxOutputTokens, maxOutputTokens].filter(isPositiveInteger)
+      transformed[modelId] = {
+        contextWindow: knownContexts.length ? Math.min(...knownContexts) : undefined,
+        maxOutputTokens: knownOutputs.length ? Math.min(...knownOutputs) : undefined,
+        capabilities: new Set([...(existing?.capabilities ?? []), ...capabilities]),
       }
     }
   }
   return transformed
+}
+
+function serializeRegistry(registry: Record<string, RegistryCapability>) {
+  return Object.fromEntries(Object.entries(registry).map(([modelId, capability]) => [modelId, {
+    contextWindow: capability.contextWindow,
+    maxOutputTokens: capability.maxOutputTokens,
+    capabilities: [...capability.capabilities],
+  } satisfies SerializedRegistryCapability]))
+}
+
+function deserializeRegistry(value: unknown): Record<string, RegistryCapability> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const registry: Record<string, RegistryCapability> = {}
+  for (const [modelId, rawCapability] of Object.entries(value)) {
+    if (!rawCapability || typeof rawCapability !== 'object' || Array.isArray(rawCapability)) continue
+    const serialized = rawCapability as SerializedRegistryCapability
+    registry[modelId] = {
+      contextWindow: isPositiveInteger(serialized.contextWindow) ? serialized.contextWindow : undefined,
+      maxOutputTokens: isPositiveInteger(serialized.maxOutputTokens) ? serialized.maxOutputTokens : undefined,
+      capabilities: new Set(
+        normalizedValues(serialized.capabilities).filter(
+          (item): item is ModelUsageCapability => ['chat', 'vision', 'embedding', 'rerank', 'asr'].includes(item),
+        ),
+      ),
+    }
+  }
+  return registry
 }
 
 function loadCachedRegistry() {
@@ -158,11 +232,12 @@ function loadCachedRegistry() {
     if (!raw) return null
     const parsed = JSON.parse(raw) as {
       timestamp?: number
-      registry?: Record<string, RegistryCapability>
+      registry?: Record<string, SerializedRegistryCapability>
     }
-    if (!parsed.registry || typeof parsed.timestamp !== 'number') return null
-    runtimeRegistry = parsed.registry
-    return { timestamp: parsed.timestamp, registry: parsed.registry }
+    const registry = deserializeRegistry(parsed.registry)
+    if (!registry || typeof parsed.timestamp !== 'number') return null
+    runtimeRegistry = registry
+    return { timestamp: parsed.timestamp, registry }
   } catch {
     return null
   }
@@ -188,7 +263,7 @@ export function prefetchModelCapabilities() {
       runtimeRegistry = registry
       window.localStorage.setItem(
         REGISTRY_CACHE_KEY,
-        JSON.stringify({ timestamp: Date.now(), registry }),
+        JSON.stringify({ timestamp: Date.now(), registry: serializeRegistry(registry) }),
       )
     } catch {
       // The bundled registry and manual overrides keep context management usable offline.
@@ -199,6 +274,97 @@ export function prefetchModelCapabilities() {
   })()
 
   return prefetchPromise
+}
+
+const SLOT_CAPABILITY: Record<ModelProviderSlot, ModelUsageCapability> = {
+  text: 'chat',
+  doubt: 'chat',
+  ocr: 'vision',
+  embedding: 'embedding',
+  rerank: 'rerank',
+  asr: 'asr',
+}
+
+function addCapabilitiesFromLabels(
+  target: Set<ModelUsageCapability>,
+  values: unknown,
+) {
+  for (const value of normalizedValues(values)) {
+    if (/(^|[/.:-])(embedding|embeddings|embed)([/.:-]|$)/.test(value)) target.add('embedding')
+    if (/(^|[/.:-])(rerank|reranker)([/.:-]|$)/.test(value)) target.add('rerank')
+    if (/(^|[/.:-])(asr|whisper|paraformer|transcription|speech-to-text)([/.:-]|$)/.test(value)) target.add('asr')
+    if (/(^|[/.:-])(vision|image|multimodal)([/.:-]|$)/.test(value)) target.add('vision')
+    if (value === 'chat' || value.includes('chat/completions') || value.includes('text-generation')) {
+      target.add('chat')
+    }
+  }
+}
+
+function providerUsageCapabilities(model: DiscoveredModel) {
+  const hasMetadata = model.capabilities !== undefined
+    || model.input_modalities !== undefined
+    || model.output_modalities !== undefined
+  const capabilities = new Set<ModelUsageCapability>()
+  addCapabilitiesFromLabels(capabilities, model.capabilities)
+  const modalities = capabilitiesFromModalities(model.input_modalities, model.output_modalities)
+  modalities.forEach((capability) => capabilities.add(capability))
+  return { hasMetadata, capabilities }
+}
+
+function heuristicUsageCapabilities(modelId: string) {
+  const normalized = normalizeModelId(modelId)
+  const capabilities = new Set<ModelUsageCapability>()
+  if (/(^|[-_.:/])(embedding|embed)([-_.:/]|$)/.test(normalized)) {
+    capabilities.add('embedding')
+    return capabilities
+  }
+  if (/(^|[-_.:/])(rerank|reranker)([-_.:/]|$)/.test(normalized)) {
+    capabilities.add('rerank')
+    return capabilities
+  }
+  if (/(^|[-_.:/])(whisper|paraformer|speech-to-text|transcription|asr)([-_.:/]|$)/.test(normalized)) {
+    capabilities.add('asr')
+    return capabilities
+  }
+  if (
+    /(^|[-_.:/])(vision|multimodal|ocr)([-_.:/]|$)/.test(normalized)
+    || /(?:^|[-_])vl(?:$|[-_.:/])/.test(normalized)
+    || normalized.includes('qwen-vl')
+    || normalized.includes('internvl')
+    || normalized.includes('pixtral')
+    || normalized === 'glm-4.6v'
+    || normalized === 'glm-4.5v'
+  ) {
+    capabilities.add('vision')
+  }
+  return capabilities
+}
+
+export function resolveModelUsageCapabilities(model: DiscoveredModel | string) {
+  const discovered = typeof model === 'string' ? { id: model } : model
+  const provider = providerUsageCapabilities(discovered)
+  if (provider.hasMetadata) return provider.capabilities
+
+  const runtime = findByExactOrPrefix(discovered.id, runtimeRegistry)
+  if (runtime?.capabilities.size) return new Set(runtime.capabilities)
+  const bundled = findByExactOrPrefix(discovered.id, BUNDLED_REGISTRY)
+  if (bundled?.capabilities.size) return new Set(bundled.capabilities)
+  return heuristicUsageCapabilities(discovered.id)
+}
+
+export function filterModelsForSlot(models: DiscoveredModel[], slot: ModelProviderSlot) {
+  const required = SLOT_CAPABILITY[slot]
+  return models.filter((model) => resolveModelUsageCapabilities(model).has(required))
+}
+
+export function partitionModelsForSlot(models: DiscoveredModel[], slot: ModelProviderSlot) {
+  const recommended = filterModelsForSlot(models, slot)
+  const recommendedIds = new Set(recommended.map((model) => model.id))
+  return {
+    recommended,
+    unknown: models.filter((model) => !recommendedIds.has(model.id)),
+    total: models.length,
+  }
 }
 
 export function resolveModelCapability(config: ApiConfig, modelId: string): ModelCapability {

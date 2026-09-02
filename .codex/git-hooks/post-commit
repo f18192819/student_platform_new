@@ -1,0 +1,8 @@
+#!/bin/sh
+# Installed through core.hooksPath. Push failures never undo local commits.
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if command -v py >/dev/null 2>&1; then
+  py -3 "$HOOK_DIR/../hooks/push_after_commit.py"
+else
+  python3 "$HOOK_DIR/../hooks/push_after_commit.py"
+fi

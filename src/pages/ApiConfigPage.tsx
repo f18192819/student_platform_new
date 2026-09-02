@@ -8,8 +8,11 @@ import {
 } from '../lib/apiConfig'
 import {
   formatTokenCount,
+  partitionModelsForSlot,
+  prefetchModelCapabilities,
   resolveModelCapability,
   resolveModelContextBudget,
+  type ModelProviderSlot,
 } from '../lib/modelCapabilities'
 import {
   loadTsinghuaSyncConfig,
@@ -24,27 +27,39 @@ const emptyTsinghuaConfig: TsinghuaSyncConfig = {
   autoLoginEnabled: true,
 }
 
-type ModelProviderSlot = 'text' | 'doubt' | 'ocr' | 'embedding' | 'rerank' | 'asr'
 type ModelDiscoveryState = {
   models: string[]
+  otherModels: string[]
+  total: number
   loading: boolean
   message: string
 }
 
 const emptyModelDiscoveryState = (): Record<ModelProviderSlot, ModelDiscoveryState> => ({
-  text: { models: [], loading: false, message: '' },
-  doubt: { models: [], loading: false, message: '' },
-  ocr: { models: [], loading: false, message: '' },
-  embedding: { models: [], loading: false, message: '' },
-  rerank: { models: [], loading: false, message: '' },
-  asr: { models: [], loading: false, message: '' },
+  text: { models: [], otherModels: [], total: 0, loading: false, message: '' },
+  doubt: { models: [], otherModels: [], total: 0, loading: false, message: '' },
+  ocr: { models: [], otherModels: [], total: 0, loading: false, message: '' },
+  embedding: { models: [], otherModels: [], total: 0, loading: false, message: '' },
+  rerank: { models: [], otherModels: [], total: 0, loading: false, message: '' },
+  asr: { models: [], otherModels: [], total: 0, loading: false, message: '' },
 })
 
+const MODEL_SLOT_LABEL: Record<ModelProviderSlot, string> = {
+  text: '文本对话',
+  doubt: '疑点回答',
+  ocr: '视觉',
+  embedding: 'Embedding',
+  rerank: 'Rerank',
+  asr: 'ASR',
+}
+
 function ModelDiscoveryControl({
+  slot,
   state,
   onFetch,
   onSelect,
 }: {
+  slot: ModelProviderSlot
   state: ModelDiscoveryState
   onFetch: () => void
   onSelect: (model: string) => void
@@ -52,7 +67,7 @@ function ModelDiscoveryControl({
   return (
     <div className="model-discovery">
       <button type="button" className="ghost-button" onClick={onFetch} disabled={state.loading}>
-        {state.loading ? '正在获取…' : '获取模型列表'}
+        {state.loading ? '正在获取...' : '获取模型列表'}
       </button>
       {state.models.length ? (
         <select
@@ -62,9 +77,24 @@ function ModelDiscoveryControl({
             if (event.target.value) onSelect(event.target.value)
           }}
         >
-          <option value="">选择服务返回的模型（{state.models.length}）</option>
+          <option value="">适用于{MODEL_SLOT_LABEL[slot]}（{state.models.length}）</option>
           {state.models.map((model) => <option key={model} value={model}>{model}</option>)}
         </select>
+      ) : null}
+      {state.otherModels.length ? (
+        <details className="model-discovery__other">
+          <summary>其他 / 未识别模型（{state.otherModels.length}）</summary>
+          <select
+            value=""
+            aria-label="选择其他或未识别模型"
+            onChange={(event) => {
+              if (event.target.value) onSelect(event.target.value)
+            }}
+          >
+            <option value="">选择其他模型</option>
+            {state.otherModels.map((model) => <option key={model} value={model}>{model}</option>)}
+          </select>
+        </details>
       ) : null}
       {state.message ? (
         <small className="settings-field__hint" aria-live="polite">{state.message}</small>
@@ -139,10 +169,16 @@ export function ApiConfigPage() {
     updateModelDiscovery(slot, (current) => ({ ...current, loading: true, message: '' }))
     try {
       const models = await fetchProviderModels(baseUrl, apiKey)
+      await prefetchModelCapabilities()
+      const filtered = partitionModelsForSlot(models, slot)
       updateModelDiscovery(slot, () => ({
-        models,
+        models: filtered.recommended.map((model) => model.id),
+        otherModels: filtered.unknown.map((model) => model.id),
+        total: filtered.total,
         loading: false,
-        message: `已获取 ${models.length} 个模型，请从下拉框选择。`,
+        message: filtered.recommended.length
+          ? `已获取 ${filtered.total} 个模型，其中 ${filtered.recommended.length} 个识别为${MODEL_SLOT_LABEL[slot]}模型。`
+          : `已获取 ${filtered.total} 个模型，未自动识别到适用于${MODEL_SLOT_LABEL[slot]}的模型。你仍可展开其他模型或手动填写。`,
       }))
     } catch (error) {
       updateModelDiscovery(slot, (current) => ({
@@ -626,6 +662,7 @@ export function ApiConfigPage() {
                     <div className="model-config-actions">
                       <button type="button" className="ghost-button" onClick={addModel}>手动添加</button>
                       <ModelDiscoveryControl
+                        slot="text"
                         state={modelDiscovery.text}
                         onFetch={() => void discoverModels('text')}
                         onSelect={(model) => applyDiscoveredModel('text', model)}
@@ -724,6 +761,7 @@ export function ApiConfigPage() {
                     <div className="model-config-actions">
                       <button type="button" className="ghost-button" onClick={addDoubtModel}>手动添加</button>
                       <ModelDiscoveryControl
+                        slot="doubt"
                         state={modelDiscovery.doubt}
                         onFetch={() => void discoverModels('doubt')}
                         onSelect={(model) => applyDiscoveredModel('doubt', model)}
@@ -855,6 +893,7 @@ export function ApiConfigPage() {
                     <div className="model-config-actions">
                       <button type="button" className="ghost-button" onClick={addOcrModel}>手动添加</button>
                       <ModelDiscoveryControl
+                        slot="ocr"
                         state={modelDiscovery.ocr}
                         onFetch={() => void discoverModels('ocr')}
                         onSelect={(model) => applyDiscoveredModel('ocr', model)}
@@ -939,6 +978,7 @@ export function ApiConfigPage() {
                       <div className="model-config-actions">
                         <button type="button" className="ghost-button" onClick={addEmbeddingModel}>手动添加</button>
                         <ModelDiscoveryControl
+                          slot="embedding"
                           state={modelDiscovery.embedding}
                           onFetch={() => void discoverModels('embedding')}
                           onSelect={(model) => applyDiscoveredModel('embedding', model)}
@@ -1006,6 +1046,7 @@ export function ApiConfigPage() {
                       <div className="model-config-actions">
                         <button type="button" className="ghost-button" onClick={addRerankModel}>手动添加</button>
                         <ModelDiscoveryControl
+                          slot="rerank"
                           state={modelDiscovery.rerank}
                           onFetch={() => void discoverModels('rerank')}
                           onSelect={(model) => applyDiscoveredModel('rerank', model)}
@@ -1066,6 +1107,7 @@ export function ApiConfigPage() {
                   placeholder="whisper-1"
                 />
                 <ModelDiscoveryControl
+                  slot="asr"
                   state={modelDiscovery.asr}
                   onFetch={() => void discoverModels('asr')}
                   onSelect={(model) => applyDiscoveredModel('asr', model)}

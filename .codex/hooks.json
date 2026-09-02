@@ -1,0 +1,18 @@
+{
+  "description": "Auto commit and push after Codex finishes",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PWD/.codex/hooks/auto_push.py\"",
+            "commandWindows": "py -3 \"%CD%\\.codex\\hooks\\auto_push.py\"",
+            "timeout": 60,
+            "statusMessage": "Committing and pushing changes"
+          }
+        ]
+      }
+    ]
+  }
+}

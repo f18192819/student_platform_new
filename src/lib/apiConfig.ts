@@ -1,5 +1,9 @@
 import type { ApiConfig } from '../types'
-import { DEFAULT_COMPACTION_THRESHOLD, prefetchModelCapabilities } from './modelCapabilities'
+import {
+  DEFAULT_COMPACTION_THRESHOLD,
+  prefetchModelCapabilities,
+  type DiscoveredModel,
+} from './modelCapabilities'
 
 export const API_CONFIG_STORAGE_KEY = 'student-platform.api-config'
 
@@ -80,7 +84,7 @@ function normalizeCompactionThreshold(value: unknown) {
 
 function normalizeApiConfig(input: Partial<ApiConfig>): ApiConfig {
   const textModels = normalizeModels(input.models, input.model, defaultApiConfig.model)
-  const ocrModels = normalizeModels(input.ocrModels, input.ocrModel, textModels.model)
+  const ocrModels = normalizeModels(input.ocrModels, input.ocrModel, defaultApiConfig.ocrModel)
   const doubtModels = normalizeModels(input.doubtModels, input.doubtModel, textModels.model)
   const embeddingModels = normalizeModels(input.embeddingModels, input.embeddingModel, defaultApiConfig.embeddingModel)
   const rerankModels = normalizeModels(input.rerankModels, input.rerankModel, defaultApiConfig.rerankModel)
@@ -234,19 +238,61 @@ export async function fetchProviderModels(baseUrl: string, apiKey: string) {
   })
   const payload = (await response.json().catch(() => ({}))) as {
     models?: unknown
+    discovered_models?: unknown
     count?: number
     detail?: string
   }
   if (!response.ok) {
     throw new Error(payload.detail || `获取模型列表失败 (HTTP ${response.status})`)
   }
-  const models = Array.isArray(payload.models)
-    ? payload.models.filter((model): model is string => typeof model === 'string' && Boolean(model.trim()))
-    : []
+  const modelsById = new Map<string, DiscoveredModel>()
+  const discoveredModels = Array.isArray(payload.discovered_models)
+    ? payload.discovered_models
+    : payload.models
+  if (Array.isArray(discoveredModels)) {
+    for (const rawModel of discoveredModels) {
+      const model = typeof rawModel === 'string'
+        ? { id: rawModel.trim() }
+        : normalizeDiscoveredModel(rawModel)
+      if (!model?.id) continue
+      const existing = modelsById.get(model.id)
+      modelsById.set(model.id, existing ? mergeDiscoveredModels(existing, model) : model)
+    }
+  }
+  const models = [...modelsById.values()]
   if (!models.length) {
     throw new Error('模型服务没有返回可选择的模型。')
   }
-  return Array.from(new Set(models.map((model) => model.trim())))
+  return models
+}
+
+function normalizeDiscoveredModel(value: unknown): DiscoveredModel | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const item = value as Record<string, unknown>
+  const id = typeof item.id === 'string' ? item.id.trim() : ''
+  if (!id) return null
+  const stringArray = (raw: unknown) => Array.isArray(raw)
+    ? Array.from(new Set(raw.filter((entry): entry is string => typeof entry === 'string').map((entry) => entry.trim().toLowerCase()).filter(Boolean)))
+    : undefined
+  return {
+    id,
+    capabilities: stringArray(item.capabilities),
+    input_modalities: stringArray(item.input_modalities),
+    output_modalities: stringArray(item.output_modalities),
+  }
+}
+
+function mergeDiscoveredModels(left: DiscoveredModel, right: DiscoveredModel): DiscoveredModel {
+  const merge = (first?: string[], second?: string[]) => {
+    const values = Array.from(new Set([...(first ?? []), ...(second ?? [])]))
+    return values.length ? values : undefined
+  }
+  return {
+    id: left.id,
+    capabilities: merge(left.capabilities, right.capabilities),
+    input_modalities: merge(left.input_modalities, right.input_modalities),
+    output_modalities: merge(left.output_modalities, right.output_modalities),
+  }
 }
 
 export function hasUsableApiConfig(config: ApiConfig) {

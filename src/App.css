@@ -2528,6 +2528,27 @@
   grid-column: 1 / -1;
 }
 
+.model-discovery__other {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border: 1px solid #e3eaf2;
+  border-radius: 12px;
+  background: #fbfcfe;
+}
+
+.model-discovery__other summary {
+  padding: 9px 12px;
+  color: #66809d;
+  cursor: pointer;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.model-discovery__other select {
+  width: calc(100% - 20px);
+  margin: 0 10px 10px;
+}
+
 .settings-advanced {
   overflow: hidden;
   border: 1px solid #e3eaf2;

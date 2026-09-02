@@ -71,7 +71,7 @@ def normalize_api_config(payload: dict[str, Any]) -> dict[str, Any]:
   embedding_models, embedding_model = model_group('embeddingModels', 'embeddingModel', 'GLM-Embedding-3')
   rerank_models, rerank_model = model_group('rerankModels', 'rerankModel', 'GLM-Rerank')
   doubt_models, doubt_model = model_group('doubtModels', 'doubtModel', model or 'GLM-4.6V')
-  ocr_models, ocr_model = model_group('ocrModels', 'ocrModel', model or 'GLM-4.6V')
+  ocr_models, ocr_model = model_group('ocrModels', 'ocrModel', 'GLM-4.6V')
 
   return {
     'baseUrl': _string(payload.get('baseUrl')),

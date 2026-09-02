@@ -16,8 +16,8 @@ class RuntimeConfigTest(unittest.TestCase):
 
     self.assertEqual('https://text.example/v1', config['ocrBaseUrl'])
     self.assertEqual('text-secret', config['ocrApiKey'])
-    self.assertEqual('text-model', config['ocrModel'])
-    self.assertEqual(['text-model'], config['ocrModels'])
+    self.assertEqual('GLM-4.6V', config['ocrModel'])
+    self.assertEqual(['GLM-4.6V'], config['ocrModels'])
 
   def test_independent_ocr_provider_is_preserved(self):
     config = normalize_api_config({
