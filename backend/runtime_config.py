@@ -77,6 +77,7 @@ def normalize_api_config(payload: dict[str, Any]) -> dict[str, Any]:
     'apiKey': _string(payload.get('apiKey')),
     'model': model,
     'models': models,
+    'ocrModel': _string(payload.get('ocrModel'), model),
     'doubtModel': doubt_model,
     'doubtModels': doubt_models,
     'contextWindowOverrides': _context_window_overrides(payload.get('contextWindowOverrides')),

@@ -16,6 +16,7 @@ from .pipeline_orchestration import PipelineCoordinator
 from .question_pipeline import QUESTION_COLLECTION, QuestionPipeline
 from .question_relations import QuestionRelationPipeline
 from .user_answers import UserAnswerStore
+from .user_answer_grading import UserAnswerGradingCoordinator
 
 
 class ApplicationRuntime:
@@ -23,6 +24,7 @@ class ApplicationRuntime:
 
   def __init__(self) -> None:
     self.user_answer_store = UserAnswerStore()
+    self.user_answer_grading = UserAnswerGradingCoordinator(self.user_answer_store)
     self.document_pipeline: DocumentPipeline | None = None
     self.question_pipeline: QuestionPipeline | None = None
     self.question_relations: QuestionRelationPipeline | None = None
@@ -61,6 +63,9 @@ class ApplicationRuntime:
 
   def require_user_answer_store(self) -> UserAnswerStore:
     return self.user_answer_store
+
+  def require_user_answer_grading(self) -> UserAnswerGradingCoordinator:
+    return self.user_answer_grading
 
   def start(self) -> None:
     if self.document_pipeline is not None:
@@ -111,6 +116,7 @@ class ApplicationRuntime:
     except Exception as exc:
       print(f'Legacy Qdrant partition migration deferred: {exc}')
     local_mineru_service.start()
+    self.user_answer_grading.resume_pending()
 
   async def run_pipeline_task(self, function, *args, **kwargs):
     if self._pipeline_executor is None:
@@ -165,6 +171,7 @@ class ApplicationRuntime:
     self.chat_retriever = None
     self.pipeline_coordinator = None
     local_mineru_service.stop()
+    self.user_answer_grading.shutdown()
 
   @asynccontextmanager
   async def lifespan(self, _app):

@@ -127,8 +127,10 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertFalse((self.root / 'course-2').exists())
 
   def test_router_exposes_upload_read_asset_and_delete_contract(self):
+    queued = []
+    grading = SimpleNamespace(queue=lambda answer: queued.append(answer.id) or True)
     app = FastAPI()
-    app.include_router(create_user_answer_router(self.store))
+    app.include_router(create_user_answer_router(self.store, grading))
     client = TestClient(app)
     base = '/api/user-answers/courses/course-1/documents/homework-1/questions/q1'
 
@@ -143,10 +145,17 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertEqual(200, response.status_code)
     answer = response.json()['answer']
     self.assertEqual(['one.png', 'two.jpg'], [item['filename'] for item in answer['assets']])
+    self.assertEqual([answer['id']], queued)
     self.assertEqual(answer['id'], client.get(base).json()['answer']['id'])
+    self.assertEqual(answer['id'], client.get(f'{base}/attempts').json()['attempts'][0]['id'])
 
     asset_response = client.get(f"{base}/assets/{answer['assets'][0]['id']}")
     self.assertEqual(PNG, asset_response.content)
+    historical_asset = client.get(
+      f"{base}/attempts/{answer['id']}/assets/{answer['assets'][0]['id']}"
+    )
+    self.assertEqual(PNG, historical_asset.content)
+    self.assertTrue(client.post(f"{base}/attempts/{answer['id']}/grade").json()['queued'])
     self.assertTrue(client.delete(base).json()['deleted'])
     self.assertIsNone(client.get(base).json()['answer'])
 

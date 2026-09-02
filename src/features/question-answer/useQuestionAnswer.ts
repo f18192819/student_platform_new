@@ -1,45 +1,59 @@
 import { useEffect, useState } from 'react'
 import {
   deleteUserQuestionAnswer,
-  loadUserQuestionAnswer,
+  loadUserQuestionAnswerAttempts,
+  retryUserAnswerGrading,
   uploadUserQuestionAnswer,
   type QuestionAnswerIdentity,
   type UserQuestionAnswer,
 } from '../../lib/userAnswers'
 
-export function useQuestionAnswer({
-  enabled,
-  identity,
-  sourceType,
-}: {
+const ACTIVE_STATUSES = new Set(['pending', 'processing'])
+
+export function useQuestionAnswer({ enabled, identity, sourceType }: {
   enabled: boolean
   identity: QuestionAnswerIdentity
   sourceType: 'homework' | 'past-exam'
 }) {
-  const [answer, setAnswer] = useState<UserQuestionAnswer | null>(null)
+  const [attempts, setAttempts] = useState<UserQuestionAnswer[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [refreshTick, setRefreshTick] = useState(0)
   const { courseId, sourceDocumentId, questionId } = identity
 
   useEffect(() => {
-    setAnswer(null)
+    setAttempts([])
     setError(null)
     if (!enabled) return
     const controller = new AbortController()
-    setIsLoading(true)
-    void loadUserQuestionAnswer({ courseId, sourceDocumentId, questionId }, controller.signal)
-      .then(setAnswer)
-      .catch((reason: unknown) => {
+    let timer: number | undefined
+    const refresh = async (initial = false) => {
+      if (initial) setIsLoading(true)
+      try {
+        const next = await loadUserQuestionAnswerAttempts(
+          { courseId, sourceDocumentId, questionId }, controller.signal,
+        )
+        if (controller.signal.aborted) return
+        setAttempts(next)
+        setError(null)
+        if (next.some((attempt) => ACTIVE_STATUSES.has(attempt.processing_status))) {
+          timer = window.setTimeout(() => void refresh(), 1800)
+        }
+      } catch (reason) {
         if (!controller.signal.aborted) {
           setError(reason instanceof Error ? reason.message : '读取我的答案失败。')
         }
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setIsLoading(false)
-      })
-    return () => controller.abort()
-  }, [enabled, courseId, sourceDocumentId, questionId])
+      } finally {
+        if (initial && !controller.signal.aborted) setIsLoading(false)
+      }
+    }
+    void refresh(true)
+    return () => {
+      controller.abort()
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [enabled, courseId, sourceDocumentId, questionId, refreshTick])
 
   const upload = async (files: File[]) => {
     setIsSaving(true)
@@ -48,7 +62,8 @@ export function useQuestionAnswer({
       const next = await uploadUserQuestionAnswer(
         { courseId, sourceDocumentId, questionId }, sourceType, files,
       )
-      setAnswer(next)
+      setAttempts((current) => [next, ...current])
+      setRefreshTick((current) => current + 1)
       return next
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '上传答案失败。')
@@ -58,12 +73,27 @@ export function useQuestionAnswer({
     }
   }
 
+  const retry = async (attemptId: string) => {
+    setError(null)
+    try {
+      await retryUserAnswerGrading({ courseId, sourceDocumentId, questionId }, attemptId)
+      setAttempts((current) => current.map((attempt) => (
+        attempt.id === attemptId ? { ...attempt, processing_status: 'pending', grading_error: '' } : attempt
+      )))
+      setRefreshTick((current) => current + 1)
+      return true
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '重新批改失败。')
+      return false
+    }
+  }
+
   const remove = async () => {
     setIsSaving(true)
     setError(null)
     try {
       await deleteUserQuestionAnswer({ courseId, sourceDocumentId, questionId })
-      setAnswer(null)
+      setAttempts([])
       return true
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '删除答案失败。')
@@ -73,5 +103,5 @@ export function useQuestionAnswer({
     }
   }
 
-  return { answer, isLoading, isSaving, error, upload, remove }
+  return { attempts, answer: attempts[0] ?? null, isLoading, isSaving, error, upload, retry, remove }
 }

@@ -4,3 +4,4 @@ requests
 qdrant-client
 pydantic
 Pillow
+PyMuPDF

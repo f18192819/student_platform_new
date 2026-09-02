@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,60 @@ class UserAnswerAsset(BaseModel):
   byte_size: int = 0
 
 
+class AnswerUnderstanding(BaseModel):
+  transcription: str = ''
+  steps: list[str] = Field(default_factory=list)
+  final_answer: str = ''
+  uncertain_parts: list[str] = Field(default_factory=list)
+  confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+ErrorType = Literal[
+  'conceptual_error', 'formula_error', 'calculation_error', 'reasoning_error',
+  'missing_step', 'incomplete_answer', 'misread_question', 'unit_error',
+  'notation_error', 'no_error', 'uncertain',
+]
+
+
+class ErrorAnalysis(BaseModel):
+  type: ErrorType
+  location: str = ''
+  student_reasoning: str = ''
+  problem: str = ''
+  correction: str = ''
+  severity: Literal['low', 'medium', 'high'] = 'medium'
+
+
+class KnowledgePointEvidence(BaseModel):
+  name: str
+  status: Literal['strong', 'partial', 'weak', 'unknown']
+  evidence: str = ''
+
+
+class UserAnswerGrading(BaseModel):
+  score: float = Field(ge=0.0, le=1.0)
+  correct: bool
+  confidence: float = Field(ge=0.0, le=1.0)
+  needs_review: bool = False
+  summary: str = ''
+  feedback: str = ''
+  error_types: list[ErrorType] = Field(default_factory=list)
+  errors: list[ErrorAnalysis] = Field(default_factory=list)
+  knowledge_points: list[KnowledgePointEvidence] = Field(default_factory=list)
+  correct_parts: list[str] = Field(default_factory=list)
+  improvement_suggestions: list[str] = Field(default_factory=list)
+  is_wrong: bool = False
+
+
+class UserAnswerGradingRevision(BaseModel):
+  revision: int
+  understanding: AnswerUnderstanding
+  grading: UserAnswerGrading
+  model: str
+  version: str
+  graded_at: str
+
+
 class UserQuestionAnswer(BaseModel):
   id: str
   attempt_number: int = 1
@@ -51,11 +105,22 @@ class UserQuestionAnswer(BaseModel):
   assets: list[UserAnswerAsset] = Field(default_factory=list)
   created_at: str
   updated_at: str
-  grading: dict | None = None
+  processing_status: Literal['pending', 'processing', 'completed', 'failed', 'needs_review'] = 'pending'
+  grading: UserAnswerGrading | None = None
+  understanding: AnswerUnderstanding | None = None
+  grading_model: str = ''
+  grading_version: str = ''
+  graded_at: str = ''
+  grading_error: str = ''
+  grading_revisions: list[UserAnswerGradingRevision] = Field(default_factory=list)
+
+
+# Compatibility name retained for the first-stage frontend/API contract.
+UserAnswerAttempt = UserQuestionAnswer
 
 
 class UserQuestionAnswerRecord(BaseModel):
-  schema_version: int = 1
+  schema_version: int = 2
   current_attempt_id: str | None = None
   attempts: list[UserQuestionAnswer] = Field(default_factory=list)
 
@@ -169,6 +234,36 @@ class UserAnswerStore:
         return None
       return answer
 
+  def list_attempts(
+    self,
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+  ) -> list[UserQuestionAnswer]:
+    course_id = _normalized(course_id, 'course_id')
+    source_document_id = _normalized(source_document_id, 'source_document_id')
+    question_id = _normalized(question_id, 'question_id')
+    with self._lock:
+      return [
+        item for item in reversed(self._read_record(course_id, question_id).attempts)
+        if item.course_id == course_id and item.source_document_id == source_document_id
+      ]
+
+  def get_attempt(
+    self,
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    attempt_id: str,
+  ) -> UserQuestionAnswer | None:
+    return next(
+      (
+        item for item in self.list_attempts(course_id, source_document_id, question_id)
+        if item.id == attempt_id
+      ),
+      None,
+    )
+
   def replace(
     self,
     course_id: str,
@@ -248,8 +343,18 @@ class UserAnswerStore:
           shutil.rmtree(attempt_dir, ignore_errors=True)
         raise
 
-  def asset(self, course_id: str, source_document_id: str, question_id: str, asset_id: str) -> tuple[Path, UserAnswerAsset]:
-    answer = self.get(course_id, source_document_id, question_id)
+  def asset(
+    self,
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    asset_id: str,
+    attempt_id: str | None = None,
+  ) -> tuple[Path, UserAnswerAsset]:
+    answer = (
+      self.get_attempt(course_id, source_document_id, question_id, attempt_id)
+      if attempt_id else self.get(course_id, source_document_id, question_id)
+    )
     if answer is None:
       raise UserAnswerNotFound('User answer not found.')
     asset = next((item for item in answer.assets if item.id == asset_id), None)
@@ -260,6 +365,81 @@ class UserAnswerStore:
     if len(matches) != 1 or not matches[0].is_file():
       raise UserAnswerNotFound('Answer asset file not found.')
     return matches[0], asset
+
+  def mark_processing(self, course_id: str, question_id: str, attempt_id: str) -> bool:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None or attempt.processing_status == 'processing':
+        return False
+      attempt.processing_status = 'processing'
+      attempt.grading_error = ''
+      attempt.updated_at = _now()
+      write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+      return True
+
+  def save_grading(
+    self,
+    course_id: str,
+    question_id: str,
+    attempt_id: str,
+    *,
+    understanding: AnswerUnderstanding,
+    grading: UserAnswerGrading,
+    model: str,
+    version: str,
+  ) -> UserQuestionAnswer:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      timestamp = _now()
+      revision = UserAnswerGradingRevision(
+        revision=len(attempt.grading_revisions) + 1,
+        understanding=understanding,
+        grading=grading,
+        model=model,
+        version=version,
+        graded_at=timestamp,
+      )
+      attempt.grading_revisions.append(revision)
+      attempt.understanding = understanding
+      attempt.grading = grading
+      attempt.grading_model = model
+      attempt.grading_version = version
+      attempt.graded_at = timestamp
+      attempt.grading_error = ''
+      attempt.processing_status = 'needs_review' if grading.needs_review else 'completed'
+      attempt.updated_at = timestamp
+      write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+      return attempt
+
+  def mark_failed(self, course_id: str, question_id: str, attempt_id: str, error: str) -> None:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None:
+        return
+      attempt.processing_status = 'failed'
+      attempt.grading_error = str(error or 'Answer grading failed.')[:1000]
+      attempt.updated_at = _now()
+      write_json_atomic(self._record_path(course_id, question_id), record.model_dump())
+
+  def pending_attempts(self) -> list[UserQuestionAnswer]:
+    attempts: list[UserQuestionAnswer] = []
+    with self._lock:
+      for course_dir in self.root.iterdir() if self.root.is_dir() else []:
+        for question_dir in course_dir.iterdir() if course_dir.is_dir() else []:
+          record = self._read_record(course_dir.name, question_dir.name)
+          for attempt in record.attempts:
+            if attempt.processing_status in {'pending', 'processing'}:
+              if attempt.processing_status == 'processing':
+                attempt.processing_status = 'pending'
+                attempt.grading_error = 'Interrupted by backend restart; queued again.'
+                write_json_atomic(self._record_path(course_dir.name, question_dir.name), record.model_dump())
+              attempts.append(attempt)
+    return attempts
 
   def delete(self, course_id: str, source_document_id: str, question_id: str) -> bool:
     answer = self.get(course_id, source_document_id, question_id)

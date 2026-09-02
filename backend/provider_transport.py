@@ -70,7 +70,7 @@ class StructuredChatClient:
     base_url: str,
     api_key: str,
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     schema: dict[str, Any] | None,
     schema_name: str = 'structured_response',
     timeout: float = 120,
@@ -171,8 +171,40 @@ class StructuredChatClient:
     )
 
 
+class MultimodalChatClient(StructuredChatClient):
+  """Narrow transport for OpenAI-compatible image + structured JSON requests."""
+
+  def complete_json(
+    self,
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    schema: dict[str, Any] | None,
+    schema_name: str = 'multimodal_response',
+    timeout: float = 180,
+    temperature: float = 0,
+    extra_payload: dict[str, Any] | None = None,
+    allow_plain_fallback: bool = False,
+  ) -> dict[str, Any]:
+    return super().complete_json(
+      base_url=base_url,
+      api_key=api_key,
+      model=model,
+      messages=messages,
+      schema=schema,
+      schema_name=schema_name,
+      timeout=timeout,
+      temperature=temperature,
+      extra_payload=extra_payload,
+      allow_plain_fallback=allow_plain_fallback,
+    )
+
+
 __all__ = [
   'ProviderTransportError',
+  'MultimodalChatClient',
   'StructuredChatClient',
   'extract_json_object',
   'normalize_openai_api_root',

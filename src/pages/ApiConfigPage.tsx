@@ -329,6 +329,7 @@ export function ApiConfigPage() {
         ...current,
         models: nextModels.length ? nextModels : [''],
         model: current.model === current.models[index] ? fallbackModel : current.model,
+        ocrModel: current.ocrModel === current.models[index] ? fallbackModel : current.ocrModel,
         homeworkSplitModel:
           current.homeworkSplitModel === current.models[index]
             ? fallbackModel || 'GLM-4.6V'
@@ -369,6 +370,7 @@ export function ApiConfigPage() {
       ...form,
       models: sanitizedModels,
       model: sanitizedModels.includes(form.model.trim()) ? form.model.trim() : sanitizedModels[0],
+      ocrModel: sanitizedModels.includes(form.ocrModel.trim()) ? form.ocrModel.trim() : sanitizedModels[0],
       doubtModels: sanitizedDoubtModels,
       doubtModel: sanitizedDoubtModels.includes(form.doubtModel.trim())
         ? form.doubtModel.trim()
@@ -595,6 +597,15 @@ export function ApiConfigPage() {
                       <option key={model} value={model}>{model}</option>
                     ))}
                   </select>
+                </label>
+                <label className="settings-field settings-field--compact">
+                  <span>答题 OCR / 视觉批改模型</span>
+                  <select value={form.ocrModel} onChange={(event) => updateField('ocrModel', event.target.value)}>
+                    {form.models.map((model) => model.trim()).filter(Boolean).map((model) => (
+                      <option key={model} value={model}>{model}</option>
+                    ))}
+                  </select>
+                  <small className="settings-field__hint">请选择支持图片输入的模型，用于识别手写答案和结构化批改。</small>
                 </label>
               </div>
             </div>

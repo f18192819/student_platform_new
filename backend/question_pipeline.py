@@ -178,6 +178,24 @@ def resolve_question_image_asset(document_id: str, image_id: str) -> Path:
   return candidate
 
 
+def load_question_record(document_id: str, question_id: str) -> dict[str, Any] | None:
+  """Public read interface for consumers that need immutable question source metadata."""
+  path = _question_document_directory(document_id) / 'questions.json'
+  if not path.is_file():
+    return None
+  try:
+    questions = json.loads(path.read_text(encoding='utf-8'))
+  except (OSError, json.JSONDecodeError):
+    return None
+  return next(
+    (
+      item for item in questions
+      if isinstance(item, dict) and str(item.get('question_id') or '') == question_id
+    ),
+    None,
+  )
+
+
 def build_question_retrieval_text(question: dict[str, Any]) -> str:
   """Build the bounded semantic text shared by indexing and relation retrieval."""
   analysis = question.get('analysis') or {}

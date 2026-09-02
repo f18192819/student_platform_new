@@ -26,7 +26,10 @@ backend_router = APIRouter()
 backend_router.include_router(tsinghua_router)
 backend_router.include_router(adaptive_testing_router)
 backend_router.include_router(provider_router)
-backend_router.include_router(create_user_answer_router(application_runtime.require_user_answer_store()))
+backend_router.include_router(create_user_answer_router(
+  application_runtime.require_user_answer_store(),
+  application_runtime.require_user_answer_grading(),
+))
 backend_router.include_router(create_knowledge_router(application_runtime))
 backend_router.include_router(create_pipeline_router(application_runtime))
 backend_router.include_router(create_media_router(application_runtime))

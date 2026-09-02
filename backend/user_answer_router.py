@@ -11,9 +11,13 @@ from .user_answers import (
   UserAnswerStore,
   UserAnswerValidationError,
 )
+from .user_answer_grading import UserAnswerGradingCoordinator
 
 
-def create_user_answer_router(store: UserAnswerStore) -> APIRouter:
+def create_user_answer_router(
+  store: UserAnswerStore,
+  grading: UserAnswerGradingCoordinator | None = None,
+) -> APIRouter:
   router = APIRouter(prefix='/api/user-answers', tags=['user-question-answers'])
 
   def translate(error: UserAnswerError) -> HTTPException:
@@ -48,6 +52,8 @@ def create_user_answer_router(store: UserAnswerStore) -> APIRouter:
         source_type,
         files,
       )
+      if grading is not None:
+        grading.queue(answer)
       return {'answer': answer.model_dump()}
     except UserAnswerError as error:
       raise translate(error) from error
@@ -70,6 +76,79 @@ def create_user_answer_router(store: UserAnswerStore) -> APIRouter:
     try:
       path, asset = await asyncio.to_thread(
         store.asset, course_id, source_document_id, question_id, asset_id,
+      )
+      return FileResponse(
+        path,
+        media_type=asset.content_type,
+        filename=asset.filename,
+        content_disposition_type='inline',
+      )
+    except UserAnswerError as error:
+      raise translate(error) from error
+
+  @router.get('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}/attempts')
+  async def list_attempts(course_id: str, source_document_id: str, question_id: str) -> dict:
+    try:
+      attempts = await asyncio.to_thread(
+        store.list_attempts, course_id, source_document_id, question_id,
+      )
+      return {'attempts': [attempt.model_dump() for attempt in attempts]}
+    except UserAnswerError as error:
+      raise translate(error) from error
+
+  @router.get('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}/attempts/{attempt_id}')
+  async def get_attempt(
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    attempt_id: str,
+  ) -> dict:
+    try:
+      attempt = await asyncio.to_thread(
+        store.get_attempt, course_id, source_document_id, question_id, attempt_id,
+      )
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      return {'answer': attempt.model_dump()}
+    except UserAnswerError as error:
+      raise translate(error) from error
+
+  @router.post('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}/attempts/{attempt_id}/grade')
+  async def retry_grading(
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    attempt_id: str,
+  ) -> dict:
+    try:
+      attempt = await asyncio.to_thread(
+        store.get_attempt, course_id, source_document_id, question_id, attempt_id,
+      )
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      if grading is None:
+        raise UserAnswerValidationError('Answer grading is not configured.')
+      queued = grading.queue(attempt)
+      return {'queued': queued, 'answer': attempt.model_dump()}
+    except UserAnswerError as error:
+      raise translate(error) from error
+
+  @router.get('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}/attempts/{attempt_id}/assets/{asset_id}')
+  async def get_attempt_asset(
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    attempt_id: str,
+    asset_id: str,
+  ) -> FileResponse:
+    try:
+      path, asset = await asyncio.to_thread(
+        store.asset,
+        course_id,
+        source_document_id,
+        question_id,
+        asset_id,
+        attempt_id,
       )
       return FileResponse(
         path,
