@@ -2310,7 +2310,10 @@ export function PdfWorkspacePage() {
       }))
 
     let memoryContextSession = baseChatSession
-    if (shouldCompactDoubtChatSession(baseChatSession, apiConfig, apiConfig.doubtModel)) {
+    if (
+      apiConfig.doubtProvider === 'api' &&
+      shouldCompactDoubtChatSession(baseChatSession, apiConfig, apiConfig.doubtModel)
+    ) {
       try {
         const memorySummary = await summarizeChatMemoryWithConfiguredApi(
           buildDoubtChatContext(baseChatSession, Number.MAX_SAFE_INTEGER),

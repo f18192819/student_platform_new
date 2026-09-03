@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import threading
 import time
@@ -12,6 +13,9 @@ from unittest.mock import patch
 import fitz
 from PIL import Image
 
+from backend.ocr_transport import clear_ocr_transport_cache
+from backend.provider_transport import ProviderTransportError
+from backend.student_answer_reconstruction import StudentAnswerMineruResult
 from backend.user_answer_grading import (
   AnswerVisualRenderer,
   KnowledgeQuestionContextProvider,
@@ -48,6 +52,68 @@ class ContextProvider:
     }
 
 
+class DocumentContextProvider(ContextProvider):
+  def resolve_document(self, _course_id, _source_document_id):
+    return [
+      {
+        'question_id': 'question-1',
+        'question_index': 1,
+        'title': 'Question 1',
+        'content': 'Calculate x.',
+        'analysis': {},
+        'reference_answer': '$x=1$',
+        'reference_confidence': 1.0,
+        'reference_needs_review': False,
+      },
+      {
+        'question_id': 'question-2',
+        'question_index': 2,
+        'title': 'Question 2',
+        'content': 'Calculate y.',
+        'analysis': {},
+        'reference_answer': '$y=2$',
+        'reference_confidence': 1.0,
+        'reference_needs_review': False,
+      },
+    ]
+
+
+class DocumentChatClient:
+  def __init__(self):
+    self.calls = []
+
+  def complete_json(self, **kwargs):
+    self.calls.append(kwargs)
+    if kwargs['schema_name'] == 'student_answer_reconstruction':
+      return {
+        'questions': [
+          {
+            'question_id': 'question-1', 'transcription': '$x=1$', 'steps': [],
+            'final_answer': '$x=1$', 'blocks': [], 'confidence': 0.95, 'uncertain_parts': [],
+          },
+          {
+            'question_id': 'question-2', 'transcription': '$y=2$', 'steps': [],
+            'final_answer': '$y=2$', 'blocks': [], 'confidence': 0.94, 'uncertain_parts': [],
+          },
+        ],
+        'unassigned_blocks': [],
+      }
+    return {
+      'score': 1.0,
+      'correct': True,
+      'confidence': 0.95,
+      'needs_review': False,
+      'summary': 'Correct.',
+      'feedback': 'Well done.',
+      'error_types': ['no_error'],
+      'errors': [],
+      'knowledge_points': [],
+      'correct_parts': ['Answer'],
+      'improvement_suggestions': [],
+      'is_wrong': False,
+    }
+
+
 class ChatClient:
   def __init__(self):
     self.calls = []
@@ -79,16 +145,66 @@ class ChatClient:
     }
 
 
+class OcrClient:
+  def __init__(self, pages=None):
+    self.calls = []
+    self.pages = iter(pages or ['recognized answer'])
+
+  def transcribe(self, **kwargs):
+    self.calls.append(kwargs)
+    return next(self.pages)
+
+
+class WebBridgeClient:
+  def __init__(self, transcription='web page one\nweb page two'):
+    self.calls = []
+    self.chat_calls = []
+    self.transcription = transcription
+
+  def ocr(self, base_url, paths, *, prompt=''):
+    self.calls.append({
+      'base_url': base_url,
+      'names': [path.name for path in paths],
+      'prompt': prompt,
+    })
+    return self.transcription
+
+  def chat(self, base_url, prompt, *, timeout=180):
+    self.chat_calls.append({'base_url': base_url, 'prompt': prompt, 'timeout': timeout})
+    return json.dumps({
+      'score': 1.0,
+      'correct': True,
+      'confidence': 0.94,
+      'needs_review': False,
+      'summary': '网页批改正确。',
+      'feedback': '继续保持。',
+      'error_types': ['no_error'],
+      'errors': [],
+      'knowledge_points': [],
+      'correct_parts': ['答案'],
+      'improvement_suggestions': [],
+      'is_wrong': False,
+    }, ensure_ascii=False)
+
+
 def upload(filename: str, content_type: str, data: bytes):
   return SimpleNamespace(filename=filename, content_type=content_type, file=io.BytesIO(data))
 
 
 class UserAnswerGradingTest(unittest.TestCase):
   def setUp(self):
+    clear_ocr_transport_cache()
     self.temporary = tempfile.TemporaryDirectory()
     self.store = UserAnswerStore(Path(self.temporary.name) / 'courses', Resolver())
+    self.mineru_patch = patch(
+      'backend.student_answer_reconstruction.StudentAnswerMineruPreprocessor.process',
+      return_value=StudentAnswerMineruResult(error='MinerU unavailable in unit test'),
+    )
+    self.mineru_patch.start()
 
   def tearDown(self):
+    self.mineru_patch.stop()
+    clear_ocr_transport_cache()
     self.temporary.cleanup()
 
   def _answer(self, filename='answer.png', content_type='image/png', data=PNG):
@@ -96,6 +212,41 @@ class UserAnswerGradingTest(unittest.TestCase):
       'course-1', 'document-1', 'question-1', 'homework',
       [upload(filename, content_type, data)],
     )
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_document_answer_reconstructs_grades_and_persists_every_question(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://provider.example/v1',
+      'apiKey': 'secret',
+      'model': 'text-model',
+      'ocrModel': 'vision-model',
+    }
+    answer = self._answer()
+    client = DocumentChatClient()
+    service = UserAnswerGradingService(self.store, DocumentContextProvider(), client)
+
+    outcome = service.grade_document(answer)
+    saved = self.store.save_document_grading(
+      answer.course_id,
+      answer.question_id,
+      answer.id,
+      question_results=outcome.question_results,
+      model=outcome.model,
+      version='v1',
+    )
+
+    self.assertEqual(['question-1', 'question-2'], [item.question_id for item in saved.question_results])
+    self.assertEqual([1.0, 1.0], [item.grading.score for item in saved.question_results])
+    self.assertEqual(2, len([call for call in client.calls if call['schema_name'] == 'user_answer_grading']))
+    grading_prompts = [
+      call['messages'][-1]['content']
+      for call in client.calls if call['schema_name'] == 'user_answer_grading'
+    ]
+    self.assertIn('$x=1$', grading_prompts[0])
+    self.assertIn('$y=2$', grading_prompts[1])
+    reloaded = self.store.get_attempt('course-1', 'document-1', 'question-1', answer.id)
+    self.assertEqual(2, len(reloaded.question_results))
+    self.assertEqual('question-1', reloaded.question_id)
 
   @patch('backend.user_answer_grading.load_api_config')
   def test_image_grading_persists_structured_projection_and_uses_ocr_model(self, load_config):
@@ -122,8 +273,11 @@ class UserAnswerGradingTest(unittest.TestCase):
     self.assertEqual('vision-secret', client.calls[0]['api_key'])
     self.assertTrue(any(
       item.get('type') == 'image_url'
-      for item in client.calls[0]['messages'][1]['content']
+      for item in client.calls[0]['messages'][-1]['content']
     ))
+    api_prompt = client.calls[0]['messages'][-1]['content'][0]['text']
+    self.assertIn('You reconstruct handwritten mathematics', api_prompt)
+    self.assertIn('\n\nINPUT:\n', api_prompt)
     self.assertEqual('completed', saved.processing_status)
     self.assertEqual(1.0, saved.grading.score)
     self.assertEqual(1, len(saved.grading_revisions))
@@ -144,11 +298,264 @@ class UserAnswerGradingTest(unittest.TestCase):
     UserAnswerGradingService(self.store, ContextProvider(), client).grade(answer)
 
     image_items = [
-      item for item in client.calls[0]['messages'][1]['content']
+      item for item in client.calls[0]['messages'][-1]['content']
       if item.get('type') == 'image_url'
     ]
     self.assertEqual(1, len(image_items))
     self.assertTrue(image_items[0]['image_url']['url'].startswith('data:image/png;base64,'))
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_paddle_ocr_transcribes_images_in_order_then_uses_text_grader(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://text.example/v1',
+      'apiKey': 'text-secret',
+      'model': 'text-model',
+      'ocrBaseUrl': 'https://ocr.example/v1',
+      'ocrApiKey': 'ocr-secret',
+      'ocrModel': 'PaddleOCR-VL-1.5',
+    }
+    answer = self.store.replace(
+      'course-1', 'document-1', 'question-1', 'homework',
+      [
+        upload('page-1.png', 'image/png', PNG),
+        upload('page-2.png', 'image/png', PNG),
+      ],
+    )
+    vision = ChatClient()
+    ocr = OcrClient(['first page', 'second page'])
+    text_grader = ChatClient()
+
+    understanding, grading, model = UserAnswerGradingService(
+      self.store,
+      ContextProvider(),
+      vision,
+      ocr_client=ocr,
+      text_client=text_grader,
+    ).grade(answer)
+
+    self.assertEqual([], vision.calls)
+    self.assertEqual(2, len(ocr.calls))
+    self.assertEqual('PaddleOCR-VL-1.5', ocr.calls[0]['model'])
+    prompt = text_grader.calls[0]['messages'][-1]['content']
+    self.assertLess(prompt.index('first page'), prompt.index('second page'))
+    self.assertIn('You reconstruct handwritten mathematics', prompt)
+    self.assertIn('\n\nINPUT:\n', prompt)
+    self.assertEqual('text-model', model)
+    self.assertLess(
+      understanding.transcription.index('first page'),
+      understanding.transcription.index('second page'),
+    )
+    self.assertTrue(grading.correct)
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_paddle_ocr_preserves_rendered_pdf_page_order(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://text.example/v1',
+      'apiKey': 'text-secret',
+      'model': 'text-model',
+      'ocrBaseUrl': 'https://ocr.example/v1',
+      'ocrApiKey': 'ocr-secret',
+      'ocrModel': 'PaddleOCR-VL-1.5',
+    }
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), 'first')
+    document.new_page().insert_text((72, 72), 'second')
+    answer = self._answer('answer.pdf', 'application/pdf', document.tobytes())
+    document.close()
+    ocr = OcrClient(['pdf page one', 'pdf page two'])
+    text_grader = ChatClient()
+
+    UserAnswerGradingService(
+      self.store,
+      ContextProvider(),
+      ChatClient(),
+      ocr_client=ocr,
+      text_client=text_grader,
+    ).grade(answer)
+
+    self.assertEqual(2, len(ocr.calls))
+    prompt = text_grader.calls[0]['messages'][-1]['content']
+    self.assertLess(prompt.index('pdf page one'), prompt.index('pdf page two'))
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_web_mode_uses_bridge_for_reconstruction_and_grading_without_api(self, load_config):
+    load_config.return_value = {
+      'ocrProvider': 'deepseek-web',
+      'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
+    }
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), 'first')
+    document.new_page().insert_text((72, 72), 'second')
+    answer = self._answer('answer.pdf', 'application/pdf', document.tobytes())
+    document.close()
+    vision = ChatClient()
+    api_ocr = OcrClient()
+    web_ocr = WebBridgeClient()
+    text_grader = ChatClient()
+
+    understanding, grading, model = UserAnswerGradingService(
+      self.store,
+      ContextProvider(),
+      vision,
+      ocr_client=api_ocr,
+      text_client=text_grader,
+      web_bridge_client=web_ocr,
+    ).grade(answer)
+
+    self.assertEqual([], vision.calls)
+    self.assertEqual([], api_ocr.calls)
+    self.assertEqual(1, len(web_ocr.calls))
+    self.assertEqual('http://127.0.0.1:8765', web_ocr.calls[0]['base_url'])
+    self.assertEqual(2, len(web_ocr.calls[0]['names']))
+    self.assertIn('You reconstruct handwritten mathematics', web_ocr.calls[0]['prompt'])
+    self.assertIn('\n\nINPUT:\n', web_ocr.calls[0]['prompt'])
+    self.assertEqual([], text_grader.calls)
+    self.assertEqual(1, len(web_ocr.chat_calls))
+    self.assertIn('web page one', web_ocr.chat_calls[0]['prompt'])
+    self.assertIn('reference_answer', web_ocr.chat_calls[0]['prompt'])
+    self.assertEqual('web page one\nweb page two', understanding.transcription)
+    self.assertEqual('deepseek-web', model)
+    self.assertTrue(grading.correct)
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_protocol_error_falls_back_once_and_caches_ocr_transport(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://text.example/v1',
+      'apiKey': 'text-secret',
+      'model': 'text-model',
+      'ocrBaseUrl': 'https://ocr.example/v1',
+      'ocrApiKey': 'ocr-secret',
+      'ocrModel': 'ambiguous-vision-model',
+    }
+
+    class IncompatibleVision:
+      def __init__(self):
+        self.calls = []
+
+      def complete_json(self, **kwargs):
+        self.calls.append(kwargs)
+        raise ProviderTransportError(
+          'sequence item 1: expected str instance, list found',
+          status_code=500,
+          error_type='multimodal_protocol_error',
+        )
+
+    vision = IncompatibleVision()
+    ocr = OcrClient(['answer one', 'answer two'])
+    service = UserAnswerGradingService(
+      self.store,
+      ContextProvider(),
+      vision,
+      ocr_client=ocr,
+      text_client=ChatClient(),
+    )
+
+    service.grade(self._answer())
+    service.grade(self._answer())
+
+    self.assertEqual(1, len(vision.calls))
+    self.assertEqual(2, len(ocr.calls))
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_failed_protocol_fallback_returns_safe_message(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://text.example/v1',
+      'apiKey': 'text-secret',
+      'model': 'text-model',
+      'ocrBaseUrl': 'https://ocr.example/v1',
+      'ocrApiKey': 'ocr-secret',
+      'ocrModel': 'ambiguous-vision-model',
+    }
+
+    class IncompatibleVision:
+      def complete_json(self, **_kwargs):
+        raise ProviderTransportError(
+          'sequence item 1: expected str instance, list found',
+          status_code=500,
+          error_type='multimodal_protocol_error',
+        )
+
+    class MissingOcrEndpoint:
+      def transcribe(self, **_kwargs):
+        raise ProviderTransportError('not found', status_code=404, error_type='http_error')
+
+    with self.assertRaises(UserAnswerGradingError) as raised:
+      UserAnswerGradingService(
+        self.store,
+        ContextProvider(),
+        IncompatibleVision(),
+        ocr_client=MissingOcrEndpoint(),
+        text_client=ChatClient(),
+      ).grade(self._answer())
+
+    self.assertEqual(
+      '当前模型存在，但服务端没有提供兼容的 OCR / 视觉调用接口。请尝试其他 OCR 模型。',
+      str(raised.exception),
+    )
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_direct_ocr_protocol_failure_returns_safe_message(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://text.example/v1',
+      'apiKey': 'text-secret',
+      'model': 'text-model',
+      'ocrBaseUrl': 'https://ocr.example/v1',
+      'ocrApiKey': 'ocr-secret',
+      'ocrModel': 'PaddleOCR-VL-1.5',
+    }
+
+    class UnsupportedOcrProvider:
+      def transcribe(self, **_kwargs):
+        raise ProviderTransportError(
+          'OCR is not supported for provider: custom',
+          status_code=500,
+          error_type='http_error',
+        )
+
+    with self.assertRaises(UserAnswerGradingError) as raised:
+      UserAnswerGradingService(
+        self.store,
+        ContextProvider(),
+        ChatClient(),
+        ocr_client=UnsupportedOcrProvider(),
+        text_client=ChatClient(),
+      ).grade(self._answer())
+
+    self.assertEqual(
+      '当前模型存在，但服务端没有提供兼容的 OCR / 视觉调用接口。请尝试其他 OCR 模型。',
+      str(raised.exception),
+    )
+
+  @patch('backend.user_answer_grading.load_api_config')
+  def test_auth_rate_limit_and_timeout_do_not_fallback_to_ocr(self, load_config):
+    load_config.return_value = {
+      'baseUrl': 'https://text.example/v1',
+      'apiKey': 'text-secret',
+      'model': 'text-model',
+      'ocrBaseUrl': 'https://ocr.example/v1',
+      'ocrApiKey': 'ocr-secret',
+      'ocrModel': 'vision-model',
+    }
+
+    for error in (
+      ProviderTransportError('unauthorized', status_code=401, error_type='http_error'),
+      ProviderTransportError('rate limited', status_code=429, error_type='http_error'),
+      ProviderTransportError('timed out', error_type='network_error'),
+    ):
+      class FailingVision:
+        def complete_json(self, **_kwargs):
+          raise error
+
+      ocr = OcrClient()
+      with self.assertRaises(UserAnswerGradingError):
+        UserAnswerGradingService(
+          self.store,
+          ContextProvider(),
+          FailingVision(),
+          ocr_client=ocr,
+          text_client=ChatClient(),
+        ).grade(self._answer())
+      self.assertEqual([], ocr.calls)
 
   def test_pdf_over_page_limit_fails_attempt_instead_of_silently_truncating(self):
     document = fitz.open()

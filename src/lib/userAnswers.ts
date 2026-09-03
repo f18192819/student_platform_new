@@ -17,6 +17,26 @@ export type AnswerUnderstanding = {
   confidence: number
 }
 
+export type ReconstructedAnswerBlock = {
+  page: number
+  bbox: number[]
+  text: string
+  role: 'main_work' | 'scratch' | 'correction' | 'final_answer' | 'uncertain'
+}
+
+export type StudentAnswerReconstruction = {
+  questions: Array<{
+    question_id: string
+    transcription: string
+    steps: string[]
+    final_answer: string
+    blocks: ReconstructedAnswerBlock[]
+    confidence: number
+    uncertain_parts: string[]
+  }>
+  unassigned_blocks: ReconstructedAnswerBlock[]
+}
+
 export type UserAnswerGrading = {
   score: number
   correct: boolean
@@ -43,6 +63,15 @@ export type UserAnswerGrading = {
   is_wrong: boolean
 }
 
+export type UserAnswerQuestionResult = {
+  question_id: string
+  question_index: number
+  title: string
+  content: string
+  understanding: AnswerUnderstanding
+  grading: UserAnswerGrading
+}
+
 export type UserQuestionAnswer = {
   id: string
   attempt_number: number
@@ -53,13 +82,23 @@ export type UserQuestionAnswer = {
   assets: UserAnswerAsset[]
   created_at: string
   updated_at: string
-  processing_status: 'pending' | 'processing' | 'completed' | 'failed' | 'needs_review'
+  processing_status: 'pending' | 'processing' | 'mineru_processing' | 'reconstructing' | 'grading' | 'completed' | 'failed' | 'needs_review'
+  mineru_status: 'not_started' | 'processing' | 'completed' | 'failed'
+  mineru_markdown: string
+  mineru_layout: Record<string, unknown>
+  mineru_error: string
+  reconstruction: StudentAnswerReconstruction | null
+  reconstruction_model: string
+  reconstruction_version: string
+  reconstructed_at: string
+  reconstruction_error: string
   grading: UserAnswerGrading | null
   understanding: AnswerUnderstanding | null
   grading_model: string
   grading_version: string
   graded_at: string
   grading_error: string
+  question_results: UserAnswerQuestionResult[]
 }
 
 export type UserAnswerAttemptSummary = {

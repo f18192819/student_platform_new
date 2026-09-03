@@ -8,7 +8,10 @@ export type ModelProviderSlot = 'text' | 'doubt' | 'ocr' | 'embedding' | 'rerank
 
 export type DiscoveredModel = {
   id: string
+  mode?: string
+  type?: string
   capabilities?: string[]
+  supported_endpoints?: string[]
   input_modalities?: string[]
   output_modalities?: string[]
 }
@@ -293,7 +296,7 @@ function addCapabilitiesFromLabels(
     if (/(^|[/.:-])(embedding|embeddings|embed)([/.:-]|$)/.test(value)) target.add('embedding')
     if (/(^|[/.:-])(rerank|reranker)([/.:-]|$)/.test(value)) target.add('rerank')
     if (/(^|[/.:-])(asr|whisper|paraformer|transcription|speech-to-text)([/.:-]|$)/.test(value)) target.add('asr')
-    if (/(^|[/.:-])(vision|image|multimodal)([/.:-]|$)/.test(value)) target.add('vision')
+    if (/(^|[/.:-])(vision|image|multimodal|ocr)([/.:-]|$)/.test(value)) target.add('vision')
     if (value === 'chat' || value.includes('chat/completions') || value.includes('text-generation')) {
       target.add('chat')
     }
@@ -302,10 +305,15 @@ function addCapabilitiesFromLabels(
 
 function providerUsageCapabilities(model: DiscoveredModel) {
   const hasMetadata = model.capabilities !== undefined
+    || model.mode !== undefined
+    || model.type !== undefined
+    || model.supported_endpoints !== undefined
     || model.input_modalities !== undefined
     || model.output_modalities !== undefined
   const capabilities = new Set<ModelUsageCapability>()
   addCapabilitiesFromLabels(capabilities, model.capabilities)
+  addCapabilitiesFromLabels(capabilities, [model.mode, model.type])
+  addCapabilitiesFromLabels(capabilities, model.supported_endpoints)
   const modalities = capabilitiesFromModalities(model.input_modalities, model.output_modalities)
   modalities.forEach((capability) => capabilities.add(capability))
   return { hasMetadata, capabilities }

@@ -41,6 +41,10 @@ def _compaction_threshold(value: Any) -> float:
   return min(0.9, max(0.4, threshold))
 
 
+def _debug_provider(value: Any) -> str:
+  return 'deepseek-web' if _string(value) == 'deepseek-web' else 'api'
+
+
 def normalize_api_config(payload: dict[str, Any]) -> dict[str, Any]:
   raw_models = payload.get('models')
   models = (
@@ -82,8 +86,13 @@ def normalize_api_config(payload: dict[str, Any]) -> dict[str, Any]:
     'ocrApiKey': _string(payload.get('ocrApiKey'), _string(payload.get('apiKey'))),
     'ocrModel': ocr_model,
     'ocrModels': ocr_models,
+    'ocrProvider': _debug_provider(payload.get('ocrProvider')),
     'doubtModel': doubt_model,
     'doubtModels': doubt_models,
+    'doubtProvider': _debug_provider(payload.get('doubtProvider')),
+    'deepseekWebBridgeUrl': _string(
+      payload.get('deepseekWebBridgeUrl'), 'http://127.0.0.1:8765',
+    ),
     'contextWindowOverrides': _context_window_overrides(payload.get('contextWindowOverrides')),
     'contextCompactionThreshold': _compaction_threshold(payload.get('contextCompactionThreshold')),
     'embeddingBaseUrl': _string(payload.get('embeddingBaseUrl'), _string(payload.get('baseUrl'))),

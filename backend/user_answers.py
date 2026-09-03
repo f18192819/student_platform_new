@@ -67,6 +67,28 @@ class AnswerUnderstanding(BaseModel):
   confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class ReconstructedAnswerBlock(BaseModel):
+  page: int = Field(default=1, ge=1)
+  bbox: list[float] = Field(default_factory=list)
+  text: str = ''
+  role: Literal['main_work', 'scratch', 'correction', 'final_answer', 'uncertain'] = 'main_work'
+
+
+class ReconstructedQuestionAnswer(BaseModel):
+  question_id: str
+  transcription: str = ''
+  steps: list[str] = Field(default_factory=list)
+  final_answer: str = ''
+  blocks: list[ReconstructedAnswerBlock] = Field(default_factory=list)
+  confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+  uncertain_parts: list[str] = Field(default_factory=list)
+
+
+class StudentAnswerReconstruction(BaseModel):
+  questions: list[ReconstructedQuestionAnswer] = Field(default_factory=list)
+  unassigned_blocks: list[ReconstructedAnswerBlock] = Field(default_factory=list)
+
+
 ErrorType = Literal[
   'conceptual_error', 'formula_error', 'calculation_error', 'reasoning_error',
   'missing_step', 'incomplete_answer', 'misread_question', 'unit_error',
@@ -104,6 +126,15 @@ class UserAnswerGrading(BaseModel):
   is_wrong: bool = False
 
 
+class UserAnswerQuestionResult(BaseModel):
+  question_id: str
+  question_index: int = Field(default=1, ge=1)
+  title: str = ''
+  content: str = ''
+  understanding: AnswerUnderstanding
+  grading: UserAnswerGrading
+
+
 class UserAnswerGradingRevision(BaseModel):
   revision: int
   understanding: AnswerUnderstanding
@@ -111,6 +142,7 @@ class UserAnswerGradingRevision(BaseModel):
   model: str
   version: str
   graded_at: str
+  question_results: list[UserAnswerQuestionResult] = Field(default_factory=list)
 
 
 class UserQuestionAnswer(BaseModel):
@@ -123,13 +155,26 @@ class UserQuestionAnswer(BaseModel):
   assets: list[UserAnswerAsset] = Field(default_factory=list)
   created_at: str
   updated_at: str
-  processing_status: Literal['pending', 'processing', 'completed', 'failed', 'needs_review'] = 'pending'
+  processing_status: Literal[
+    'pending', 'processing', 'mineru_processing', 'reconstructing', 'grading',
+    'completed', 'failed', 'needs_review',
+  ] = 'pending'
+  mineru_status: Literal['not_started', 'processing', 'completed', 'failed'] = 'not_started'
+  mineru_markdown: str = ''
+  mineru_layout: dict = Field(default_factory=dict)
+  mineru_error: str = ''
+  reconstruction: StudentAnswerReconstruction | None = None
+  reconstruction_model: str = ''
+  reconstruction_version: str = ''
+  reconstructed_at: str = ''
+  reconstruction_error: str = ''
   grading: UserAnswerGrading | None = None
   understanding: AnswerUnderstanding | None = None
   grading_model: str = ''
   grading_version: str = ''
   graded_at: str = ''
   grading_error: str = ''
+  question_results: list[UserAnswerQuestionResult] = Field(default_factory=list)
   grading_revisions: list[UserAnswerGradingRevision] = Field(default_factory=list)
 
 
@@ -138,7 +183,7 @@ UserAnswerAttempt = UserQuestionAnswer
 
 
 class UserQuestionAnswerRecord(BaseModel):
-  schema_version: int = 2
+  schema_version: int = 3
   current_attempt_id: str | None = None
   attempts: list[UserQuestionAnswer] = Field(default_factory=list)
 
@@ -258,15 +303,24 @@ class UserAnswerStore:
   @staticmethod
   def _summary(attempt: UserQuestionAnswer) -> UserAnswerAttemptSummary:
     grading = attempt.grading
+    question_gradings = [item.grading for item in attempt.question_results]
+    score = (
+      sum(item.score for item in question_gradings) / len(question_gradings)
+      if question_gradings else (grading.score if grading else None)
+    )
     return UserAnswerAttemptSummary(
       id=attempt.id,
       attempt_number=attempt.attempt_number,
       created_at=attempt.created_at,
       updated_at=attempt.updated_at,
       processing_status=attempt.processing_status,
-      score=grading.score if grading else None,
-      correct=grading.correct if grading else None,
-      needs_review=grading.needs_review if grading else attempt.processing_status == 'needs_review',
+      score=score,
+      correct=(all(item.correct for item in question_gradings) if question_gradings else (
+        grading.correct if grading else None
+      )),
+      needs_review=(any(item.needs_review for item in question_gradings) if question_gradings else (
+        grading.needs_review if grading else attempt.processing_status == 'needs_review'
+      )),
       asset_count=len(attempt.assets),
       grading_model=attempt.grading_model,
     )
@@ -282,13 +336,8 @@ class UserAnswerStore:
     course_id = _normalized(course_id, 'course_id')
     source_document_id = _normalized(source_document_id, 'source_document_id')
     question_id = _normalized(question_id, 'question_id')
-    with self._lock:
-      answer = self._current(self._read_record(course_id, question_id))
-      if answer is None:
-        return None
-      if answer.course_id != course_id or answer.source_document_id != source_document_id:
-        return None
-      return answer
+    attempts = self.list_attempts(course_id, source_document_id, question_id)
+    return attempts[0] if attempts else None
 
   def list_attempts(
     self,
@@ -300,10 +349,17 @@ class UserAnswerStore:
     source_document_id = _normalized(source_document_id, 'source_document_id')
     question_id = _normalized(question_id, 'question_id')
     with self._lock:
-      return [
-        item for item in reversed(self._read_record(course_id, question_id).attempts)
-        if item.course_id == course_id and item.source_document_id == source_document_id
-      ]
+      course_dir = self.root / safe_storage_name(course_id)
+      attempts: list[UserQuestionAnswer] = []
+      for question_dir in list(course_dir.iterdir()) if course_dir.is_dir() else []:
+        if not question_dir.is_dir():
+          continue
+        record = self._read_record(course_id, question_dir.name)
+        attempts.extend(
+          item for item in record.attempts
+          if item.course_id == course_id and item.source_document_id == source_document_id
+        )
+      return sorted(attempts, key=lambda item: (item.created_at, item.id), reverse=True)
 
   def list_attempt_summaries(
     self,
@@ -349,9 +405,11 @@ class UserAnswerStore:
       raise UserAnswerValidationError(f'Upload between 1 and {MAX_ASSETS_PER_ANSWER} answer files.')
 
     with self._lock:
-      record = self._read_record(course_id, question_id)
+      document_attempts = self.list_attempts(course_id, source_document_id, question_id)
+      storage_question_id = document_attempts[0].question_id if document_attempts else question_id
+      record = self._read_record(course_id, storage_question_id)
       answer_id = uuid.uuid4().hex
-      question_dir = self._question_dir(course_id, question_id)
+      question_dir = self._question_dir(course_id, storage_question_id)
       attempt_dir = question_dir / 'attempts' / answer_id
       staging_dir = question_dir / f'.staging-{answer_id}'
       assets_dir = staging_dir / 'assets'
@@ -392,10 +450,10 @@ class UserAnswerStore:
         timestamp = _now()
         answer = UserQuestionAnswer(
           id=answer_id,
-          attempt_number=len(record.attempts) + 1,
+          attempt_number=max((item.attempt_number for item in document_attempts), default=0) + 1,
           course_id=course_id,
           source_document_id=source_document_id,
-          question_id=question_id,
+          question_id=storage_question_id,
           source_type=actual_source_type,
           assets=assets,
           created_at=timestamp,
@@ -403,7 +461,7 @@ class UserAnswerStore:
         )
         record.attempts.append(answer)
         record.current_attempt_id = answer.id
-        self._write_record(course_id, question_id, record)
+        self._write_record(course_id, storage_question_id, record)
         metadata_committed = True
         return answer
       except Exception:
@@ -429,7 +487,7 @@ class UserAnswerStore:
     asset = next((item for item in answer.assets if item.id == asset_id), None)
     if asset is None:
       raise UserAnswerNotFound('Answer asset not found.')
-    assets_dir = self._question_dir(course_id, question_id) / 'attempts' / answer.id / 'assets'
+    assets_dir = self._question_dir(course_id, answer.question_id) / 'attempts' / answer.id / 'assets'
     matches = list(assets_dir.glob(f'{asset.order:03d}-{safe_storage_name(asset.id)}.*'))
     if len(matches) != 1 or not matches[0].is_file():
       raise UserAnswerNotFound('Answer asset file not found.')
@@ -447,6 +505,72 @@ class UserAnswerStore:
       self._write_record(course_id, question_id, record)
       return True
 
+  def mark_stage(self, course_id: str, question_id: str, attempt_id: str, stage: str) -> bool:
+    allowed = {'mineru_processing', 'reconstructing', 'grading'}
+    if stage not in allowed:
+      raise ValueError(f'Unsupported answer processing stage: {stage}')
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None:
+        return False
+      attempt.processing_status = stage
+      if stage == 'mineru_processing':
+        attempt.mineru_status = 'processing'
+      attempt.grading_error = ''
+      attempt.updated_at = _now()
+      self._write_record(course_id, question_id, record)
+      return True
+
+  def save_mineru_projection(
+    self,
+    course_id: str,
+    question_id: str,
+    attempt_id: str,
+    *,
+    status: Literal['completed', 'failed'],
+    markdown: str = '',
+    layout: dict | None = None,
+    error: str = '',
+  ) -> UserQuestionAnswer:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      attempt.mineru_status = status
+      attempt.mineru_markdown = markdown
+      attempt.mineru_layout = layout or {}
+      attempt.mineru_error = str(error or '')[:1000]
+      attempt.updated_at = _now()
+      self._write_record(course_id, question_id, record)
+      return attempt
+
+  def save_reconstruction(
+    self,
+    course_id: str,
+    question_id: str,
+    attempt_id: str,
+    *,
+    reconstruction: StudentAnswerReconstruction,
+    model: str,
+    version: str,
+  ) -> UserQuestionAnswer:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      timestamp = _now()
+      attempt.reconstruction = reconstruction
+      attempt.reconstruction_model = model
+      attempt.reconstruction_version = version
+      attempt.reconstructed_at = timestamp
+      attempt.reconstruction_error = ''
+      attempt.updated_at = timestamp
+      self._write_record(course_id, question_id, record)
+      return attempt
+
   def attempt_exists(self, course_id: str, question_id: str, attempt_id: str) -> bool:
     with self._lock:
       record = self._read_record(course_id, question_id)
@@ -463,28 +587,61 @@ class UserAnswerStore:
     model: str,
     version: str,
   ) -> UserQuestionAnswer:
+    return self.save_document_grading(
+      course_id,
+      question_id,
+      attempt_id,
+      question_results=[UserAnswerQuestionResult(
+        question_id=question_id,
+        understanding=understanding,
+        grading=grading,
+      )],
+      model=model,
+      version=version,
+    )
+
+  def save_document_grading(
+    self,
+    course_id: str,
+    question_id: str,
+    attempt_id: str,
+    *,
+    question_results: list[UserAnswerQuestionResult],
+    model: str,
+    version: str,
+  ) -> UserQuestionAnswer:
+    if not question_results:
+      raise UserAnswerValidationError('Document grading produced no question results.')
     with self._lock:
       record = self._read_record(course_id, question_id)
       attempt = next((item for item in record.attempts if item.id == attempt_id), None)
       if attempt is None:
         raise UserAnswerNotFound('User answer attempt not found.')
       timestamp = _now()
+      compatibility_result = next(
+        (item for item in question_results if item.question_id == attempt.question_id),
+        question_results[0],
+      )
       revision = UserAnswerGradingRevision(
         revision=len(attempt.grading_revisions) + 1,
-        understanding=understanding,
-        grading=grading,
+        understanding=compatibility_result.understanding,
+        grading=compatibility_result.grading,
         model=model,
         version=version,
         graded_at=timestamp,
+        question_results=question_results,
       )
       attempt.grading_revisions.append(revision)
-      attempt.understanding = understanding
-      attempt.grading = grading
+      attempt.question_results = question_results
+      attempt.understanding = compatibility_result.understanding
+      attempt.grading = compatibility_result.grading
       attempt.grading_model = model
       attempt.grading_version = version
       attempt.graded_at = timestamp
       attempt.grading_error = ''
-      attempt.processing_status = 'needs_review' if grading.needs_review else 'completed'
+      attempt.processing_status = (
+        'needs_review' if any(item.grading.needs_review for item in question_results) else 'completed'
+      )
       attempt.updated_at = timestamp
       self._write_record(course_id, question_id, record)
       return attempt
@@ -507,8 +664,9 @@ class UserAnswerStore:
         for question_dir in course_dir.iterdir() if course_dir.is_dir() else []:
           record = self._read_record(course_dir.name, question_dir.name)
           for attempt in record.attempts:
-            if attempt.processing_status in {'pending', 'processing'}:
-              if attempt.processing_status == 'processing':
+            active_states = {'pending', 'processing', 'mineru_processing', 'reconstructing', 'grading'}
+            if attempt.processing_status in active_states:
+              if attempt.processing_status != 'pending':
                 attempt.processing_status = 'pending'
                 attempt.grading_error = 'Interrupted by backend restart; queued again.'
                 self._write_record(course_dir.name, question_dir.name, record)
@@ -519,9 +677,7 @@ class UserAnswerStore:
     answer = self.get(course_id, source_document_id, question_id)
     if answer is None:
       return False
-    with self._lock:
-      shutil.rmtree(self._question_dir(course_id, question_id), ignore_errors=True)
-    return True
+    return self.delete_document(course_id, source_document_id) > 0
 
   def delete_document(self, course_id: str, source_document_id: str) -> int:
     course_dir = self.root / safe_storage_name(course_id)
@@ -529,9 +685,12 @@ class UserAnswerStore:
     with self._lock:
       for question_dir in list(course_dir.iterdir()) if course_dir.is_dir() else []:
         record = self._read_record(course_id, question_dir.name)
-        if any(item.source_document_id == source_document_id for item in record.attempts):
+        matching_attempts = [
+          item for item in record.attempts if item.source_document_id == source_document_id
+        ]
+        if matching_attempts:
           shutil.rmtree(question_dir, ignore_errors=True)
-          removed += 1
+          removed += len(matching_attempts)
     return removed
 
   def delete_course(self, course_id: str) -> bool:

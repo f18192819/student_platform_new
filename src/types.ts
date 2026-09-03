@@ -248,8 +248,11 @@ export type ApiConfig = {
   ocrApiKey: string
   ocrModel: string
   ocrModels: string[]
+  ocrProvider: 'api' | 'deepseek-web'
   doubtModel: string
   doubtModels: string[]
+  doubtProvider: 'api' | 'deepseek-web'
+  deepseekWebBridgeUrl: string
   contextWindowOverrides: Record<string, number>
   contextCompactionThreshold: number
   embeddingBaseUrl: string

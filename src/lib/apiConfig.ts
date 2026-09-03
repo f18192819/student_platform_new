@@ -6,6 +6,7 @@ import {
 } from './modelCapabilities'
 
 export const API_CONFIG_STORAGE_KEY = 'student-platform.api-config'
+export const DEFAULT_DEEPSEEK_WEB_BRIDGE_URL = 'http://127.0.0.1:8765'
 
 export const defaultApiConfig: ApiConfig = {
   baseUrl: 'https://llmapi.paratera.com/v1',
@@ -16,8 +17,11 @@ export const defaultApiConfig: ApiConfig = {
   ocrApiKey: '',
   ocrModel: 'GLM-4.6V',
   ocrModels: ['GLM-4.6V'],
+  ocrProvider: 'api',
   doubtModel: 'GLM-4.6V',
   doubtModels: ['GLM-4.6V'],
+  doubtProvider: 'api',
+  deepseekWebBridgeUrl: DEFAULT_DEEPSEEK_WEB_BRIDGE_URL,
   contextWindowOverrides: {},
   contextCompactionThreshold: DEFAULT_COMPACTION_THRESHOLD,
   embeddingBaseUrl: 'https://llmapi.paratera.com/v1',
@@ -97,8 +101,11 @@ function normalizeApiConfig(input: Partial<ApiConfig>): ApiConfig {
     ocrApiKey: input.ocrApiKey ?? input.apiKey ?? '',
     ocrModel: ocrModels.model,
     ocrModels: ocrModels.models,
+    ocrProvider: input.ocrProvider === 'deepseek-web' ? 'deepseek-web' : 'api',
     doubtModel: doubtModels.model,
     doubtModels: doubtModels.models,
+    doubtProvider: input.doubtProvider === 'deepseek-web' ? 'deepseek-web' : 'api',
+    deepseekWebBridgeUrl: input.deepseekWebBridgeUrl?.trim() || DEFAULT_DEEPSEEK_WEB_BRIDGE_URL,
     contextWindowOverrides: normalizeContextWindowOverrides(input.contextWindowOverrides),
     contextCompactionThreshold: normalizeCompactionThreshold(input.contextCompactionThreshold),
     // Existing installations only have text credentials, so use them as the provider fallback.
@@ -276,7 +283,10 @@ function normalizeDiscoveredModel(value: unknown): DiscoveredModel | null {
     : undefined
   return {
     id,
+    mode: typeof item.mode === 'string' ? item.mode.trim().toLowerCase() || undefined : undefined,
+    type: typeof item.type === 'string' ? item.type.trim().toLowerCase() || undefined : undefined,
     capabilities: stringArray(item.capabilities),
+    supported_endpoints: stringArray(item.supported_endpoints),
     input_modalities: stringArray(item.input_modalities),
     output_modalities: stringArray(item.output_modalities),
   }
@@ -289,7 +299,10 @@ function mergeDiscoveredModels(left: DiscoveredModel, right: DiscoveredModel): D
   }
   return {
     id: left.id,
+    mode: left.mode ?? right.mode,
+    type: left.type ?? right.type,
     capabilities: merge(left.capabilities, right.capabilities),
+    supported_endpoints: merge(left.supported_endpoints, right.supported_endpoints),
     input_modalities: merge(left.input_modalities, right.input_modalities),
     output_modalities: merge(left.output_modalities, right.output_modalities),
   }
@@ -301,6 +314,39 @@ export function hasUsableApiConfig(config: ApiConfig) {
       config.apiKey.trim() &&
       (config.model.trim() || config.models.some((model) => model.trim())),
   )
+}
+
+export type DeepSeekWebBridgeStatus = {
+  browser_running: boolean
+  logged_in: boolean
+  chat_available: boolean
+  image_upload_available: boolean
+}
+
+async function readBridgeResponse(response: Response) {
+  const payload = (await response.json().catch(() => ({}))) as {
+    detail?: string | { code?: string; message?: string }
+  }
+  if (!response.ok) {
+    const detail = payload.detail
+    const message = typeof detail === 'string' ? detail : detail?.message
+    throw new Error(message || `DeepSeek Web Bridge request failed (HTTP ${response.status}).`)
+  }
+  return payload
+}
+
+export async function fetchDeepSeekWebBridgeStatus(): Promise<DeepSeekWebBridgeStatus> {
+  const response = await fetch(resolveBackendApiUrl('/api/deepseek-web/status'))
+  return (await readBridgeResponse(response)) as DeepSeekWebBridgeStatus
+}
+
+export async function openDeepSeekWebBridge(bridgeUrl: string) {
+  const response = await fetch(resolveBackendApiUrl('/api/deepseek-web/open'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bridge_url: bridgeUrl.trim() }),
+  })
+  return readBridgeResponse(response)
 }
 
 export function hasUsableAsrConfig(config: ApiConfig) {

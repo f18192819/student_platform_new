@@ -299,7 +299,7 @@ export async function askWithConfiguredVisionApi(
   modelOverride?: string,
   conversationHistory: ChatMessage[] = [],
 ): Promise<AskAnswer> {
-  if (!hasUsableApiConfig(config)) {
+  if (config.doubtProvider !== 'deepseek-web' && !hasUsableApiConfig(config)) {
     throw new Error('Please configure a valid text API first.')
   }
 
@@ -379,6 +379,48 @@ export async function askWithConfiguredVisionApi(
       ? `Course material and selected context:\n\n${contextPlan.sourceText}`
       : 'No usable course material fits in the current model context.',
   ].join('\n\n')
+
+  if (config.doubtProvider === 'deepseek-web') {
+    if (imageAttachments.length) {
+      throw new Error('DeepSeek 网页疑点回答暂不接收附件，请移除附件或切换到 API 模式。')
+    }
+    const prompt = [
+      safeSystemPrompt,
+      ...contextPlan.history.map((message) =>
+        `${message.role === 'user' ? '用户' : '助手'}：${message.content.trim()}`,
+      ),
+      userInstruction,
+    ].filter(Boolean).join('\n\n')
+    const response = await fetch(resolveBackendApiUrl('/api/deepseek-web/chat'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
+    })
+    const payload = (await response.json().catch(() => ({}))) as {
+      text?: string
+      detail?: string | { message?: string }
+    }
+    if (!response.ok || !payload.text?.trim()) {
+      const detail = payload.detail
+      const message = typeof detail === 'string' ? detail : detail?.message
+      throw new Error(message || `DeepSeek Web Bridge request failed (HTTP ${response.status}).`)
+    }
+    emitDeltaText(payload.text, handlers)
+    return {
+      answer: payload.text.trim(),
+      evidence: [],
+      keyword: null,
+      mode: 'api',
+      note: 'Answered through the local DeepSeek Web Bridge.',
+      contextUsage: {
+        model: 'deepseek-web',
+        contextWindow: contextPlan.model.contextWindow,
+        estimatedInputTokens: contextPlan.estimatedInputTokens,
+        rawInputTokens: contextPlan.rawInputTokens + rawFixedTokenDelta,
+        wasTruncated: contextPlan.wasTruncated || fixedInputWasTruncated,
+      },
+    }
+  }
 
   try {
     resetTimeout()

@@ -3,10 +3,20 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from backend.provider_models import fetch_provider_models
+from backend.provider_models import (
+  clear_provider_model_metadata_cache,
+  fetch_provider_models,
+  provider_model_metadata,
+)
 
 
 class ProviderModelsTest(unittest.TestCase):
+  def setUp(self):
+    clear_provider_model_metadata_cache()
+
+  def tearDown(self):
+    clear_provider_model_metadata_cache()
+
   @patch('backend.provider_models.requests.get')
   def test_preserves_safe_capability_metadata(self, request_get: Mock):
     response = Mock(ok=True)
@@ -14,7 +24,10 @@ class ProviderModelsTest(unittest.TestCase):
       'data': [
         {
           'id': 'vision-model',
+          'mode': 'chat',
+          'type': 'vision',
           'capabilities': ['chat'],
+          'supported_endpoints': ['/v1/chat/completions'],
           'modalities': {'input': ['text', 'image'], 'output': ['text']},
           'owned_by': 'must-not-leak',
         },
@@ -34,7 +47,10 @@ class ProviderModelsTest(unittest.TestCase):
     self.assertEqual(
       {
         'id': 'vision-model',
+        'mode': 'chat',
+        'type': 'vision',
         'capabilities': ['chat'],
+        'supported_endpoints': ['/v1/chat/completions'],
         'input_modalities': ['image', 'text'],
         'output_modalities': ['text'],
       },
@@ -42,6 +58,10 @@ class ProviderModelsTest(unittest.TestCase):
     )
     self.assertEqual(['embedding-model', 'legacy-model', 'vision-model'], result['models'])
     self.assertNotIn('owned_by', result['discovered_models'][0])
+    self.assertEqual(
+      'vision',
+      provider_model_metadata('https://provider.example/v1', 'VISION-MODEL')['type'],
+    )
     request_get.assert_called_once_with(
       'https://provider.example/v1/models',
       headers={'Accept': 'application/json', 'Authorization': 'Bearer secret'},
@@ -62,7 +82,7 @@ class ProviderModelsTest(unittest.TestCase):
     result = fetch_provider_models(base_url='https://provider.example/v1/models')
 
     self.assertEqual(
-      [{'id': 'same-model', 'capabilities': ['chat'], 'input_modalities': ['image']}],
+      [{'id': 'same-model', 'mode': 'chat', 'input_modalities': ['image']}],
       result['discovered_models'],
     )
 

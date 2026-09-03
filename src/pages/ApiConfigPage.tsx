@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react'
 import {
+  fetchDeepSeekWebBridgeStatus,
   fetchProviderModels,
   loadApiConfig,
   loadApiConfigFromServer,
+  openDeepSeekWebBridge,
   saveApiConfig,
   saveApiConfigToServer,
 } from '../lib/apiConfig'
+import type { DeepSeekWebBridgeStatus } from '../lib/apiConfig'
 import {
   formatTokenCount,
   partitionModelsForSlot,
@@ -112,6 +115,77 @@ function ConfigStateBadge({ ready }: { ready: boolean }) {
   )
 }
 
+function ProviderModeControl({
+  value,
+  onChange,
+}: {
+  value: 'api' | 'deepseek-web'
+  onChange: (value: 'api' | 'deepseek-web') => void
+}) {
+  return (
+    <div className="provider-mode" role="radiogroup" aria-label="处理方式">
+      <button
+        type="button"
+        className={value === 'api' ? 'is-active' : ''}
+        onClick={() => onChange('api')}
+      >
+        API
+      </button>
+      <button
+        type="button"
+        className={value === 'deepseek-web' ? 'is-active' : ''}
+        onClick={() => onChange('deepseek-web')}
+      >
+        DeepSeek 网页端
+      </button>
+    </div>
+  )
+}
+
+function DeepSeekBridgePanel({
+  url,
+  status,
+  message,
+  checking,
+  onUrlChange,
+  onCheck,
+  onOpen,
+}: {
+  url: string
+  status: DeepSeekWebBridgeStatus | null
+  message: string
+  checking: boolean
+  onUrlChange: (value: string) => void
+  onCheck: () => void
+  onOpen: () => void
+}) {
+  return (
+    <div className="deepseek-bridge-panel">
+      <label className="settings-field settings-field--full">
+        <span>本地 Bridge</span>
+        <input value={url} onChange={(event) => onUrlChange(event.target.value)} />
+        <small className="settings-field__hint">仅允许连接本机 127.0.0.1 或 localhost。</small>
+      </label>
+      <div className="deepseek-bridge-status" aria-live="polite">
+        <span className={status?.browser_running ? 'is-ready' : ''}>Bridge {status?.browser_running ? '已连接' : '未连接'}</span>
+        <span className={status?.logged_in ? 'is-ready' : ''}>网页 {status?.logged_in ? '已登录' : '未登录'}</span>
+        <p>{message}</p>
+      </div>
+      <div className="model-config-actions">
+        <button type="button" className="ghost-button" onClick={onCheck} disabled={checking}>
+          {checking ? '正在检测...' : '检测连接'}
+        </button>
+        <button type="button" className="ghost-button" onClick={onOpen} disabled={checking}>
+          打开 DeepSeek 登录
+        </button>
+      </div>
+      <small className="settings-field__hint">
+        登录状态仅保存在独立浏览器 profile 中；项目不会保存账号密码，也不会读取主浏览器 Cookie。
+      </small>
+    </div>
+  )
+}
+
 export function ApiConfigPage() {
   const [form, setForm] = useState(loadApiConfig())
   const [tsinghuaConfig, setTsinghuaConfig] = useState<TsinghuaSyncConfig>(emptyTsinghuaConfig)
@@ -119,6 +193,9 @@ export function ApiConfigPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [modelDiscovery, setModelDiscovery] = useState(emptyModelDiscoveryState)
+  const [bridgeStatus, setBridgeStatus] = useState<DeepSeekWebBridgeStatus | null>(null)
+  const [bridgeMessage, setBridgeMessage] = useState('尚未检测本地 Bridge。')
+  const [bridgeChecking, setBridgeChecking] = useState(false)
   const [status, setStatus] = useState(
     '配置会保存到当前项目后端。文本模型用于问答与映射；网络学堂账号仅保存在后端，不会回写到浏览器本地。',
   )
@@ -147,6 +224,32 @@ export function ApiConfigPage() {
       }
       return { ...current, contextWindowOverrides: nextOverrides }
     })
+  }
+
+  const checkDeepSeekBridge = async () => {
+    setBridgeChecking(true)
+    try {
+      const next = await fetchDeepSeekWebBridgeStatus()
+      setBridgeStatus(next)
+      setBridgeMessage(next.logged_in ? 'Bridge 已连接，DeepSeek 网页已登录。' : 'Bridge 已连接，请打开浏览器完成登录。')
+    } catch (error) {
+      setBridgeStatus(null)
+      setBridgeMessage(error instanceof Error ? error.message : '未检测到 DeepSeek Web Bridge。')
+    } finally {
+      setBridgeChecking(false)
+    }
+  }
+
+  const openDeepSeekLogin = async () => {
+    setBridgeChecking(true)
+    try {
+      await openDeepSeekWebBridge(form.deepseekWebBridgeUrl)
+      setBridgeMessage('已打开独立 DeepSeek 调试浏览器，请在窗口中手动完成登录。')
+      window.setTimeout(() => void checkDeepSeekBridge(), 1000)
+    } catch (error) {
+      setBridgeMessage(error instanceof Error ? error.message : '无法打开 DeepSeek 调试浏览器。')
+      setBridgeChecking(false)
+    }
   }
 
   const updateModelDiscovery = (
@@ -448,6 +551,7 @@ export function ApiConfigPage() {
       doubtModel: sanitizedDoubtModels.includes(form.doubtModel.trim())
         ? form.doubtModel.trim()
         : sanitizedDoubtModels[0],
+      deepseekWebBridgeUrl: form.deepseekWebBridgeUrl.trim() || 'http://127.0.0.1:8765',
       contextWindowOverrides: sanitizedContextWindowOverrides,
       contextCompactionThreshold: Math.min(
         0.9,
@@ -502,8 +606,12 @@ export function ApiConfigPage() {
 
   const serviceReadiness = {
     text: Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.model.trim()),
-    doubt: Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.doubtModel.trim()),
-    ocr: Boolean(form.ocrBaseUrl.trim() && form.ocrApiKey.trim() && form.ocrModel.trim()),
+    doubt: form.doubtProvider === 'deepseek-web'
+      ? Boolean(bridgeStatus?.logged_in && bridgeStatus.chat_available)
+      : Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.doubtModel.trim()),
+    ocr: form.ocrProvider === 'deepseek-web'
+      ? Boolean(bridgeStatus?.logged_in && bridgeStatus.image_upload_available)
+      : Boolean(form.ocrBaseUrl.trim() && form.ocrApiKey.trim() && form.ocrModel.trim()),
     knowledge: Boolean(
       form.embeddingBaseUrl.trim() &&
       form.embeddingApiKey.trim() &&
@@ -725,12 +833,35 @@ export function ApiConfigPage() {
               <ConfigStateBadge ready={serviceReadiness.doubt} />
             </header>
 
-            <div className="api-config-inline-note">
+            <div className="api-config-subsection">
+              <div className="api-config-subsection__heading">
+                <h4>处理方式</h4>
+                <p>正式使用请选择 API；网页端仅用于本机开发调试，失败时不会自动调用付费 API。</p>
+              </div>
+              <ProviderModeControl
+                value={form.doubtProvider}
+                onChange={(value) => setForm((current) => ({ ...current, doubtProvider: value }))}
+              />
+            </div>
+
+            {form.doubtProvider === 'deepseek-web' ? (
+              <DeepSeekBridgePanel
+                url={form.deepseekWebBridgeUrl}
+                status={bridgeStatus}
+                message={bridgeMessage}
+                checking={bridgeChecking}
+                onUrlChange={(value) => updateField('deepseekWebBridgeUrl', value)}
+                onCheck={() => void checkDeepSeekBridge()}
+                onOpen={() => void openDeepSeekLogin()}
+              />
+            ) : null}
+
+            <div className="api-config-inline-note" hidden={form.doubtProvider !== 'api'}>
               <strong>共享连接信息</strong>
               <span>该模型复用文本处理服务的 Base URL 与 API Key，只需在这里选择回答模型。</span>
             </div>
 
-            <div className="api-config-subsection">
+            <div className="api-config-subsection" hidden={form.doubtProvider !== 'api'}>
               <div className="api-config-subsection__heading">
                 <h4>回答模型</h4>
                 <p>用户可以在阅读器内切换这里配置的模型。</p>
@@ -780,7 +911,7 @@ export function ApiConfigPage() {
               </div>
             </div>
 
-            <details className="settings-advanced">
+            <details className="settings-advanced" hidden={form.doubtProvider !== 'api'}>
               <summary>
                 <span>上下文与记忆</span>
                 <small>当前 Soft Target {formatTokenCount(doubtContextBudget.softTargetTokens)}</small>
@@ -837,6 +968,29 @@ export function ApiConfigPage() {
 
             <div className="api-config-subsection">
               <div className="api-config-subsection__heading">
+                <h4>处理方式</h4>
+                <p>选择网页端后，答案识别、自动分题和逐题批改都通过 DeepSeek 网页完成，不调用 OCR 或文本 API。</p>
+              </div>
+              <ProviderModeControl
+                value={form.ocrProvider}
+                onChange={(value) => setForm((current) => ({ ...current, ocrProvider: value }))}
+              />
+            </div>
+
+            {form.ocrProvider === 'deepseek-web' ? (
+              <DeepSeekBridgePanel
+                url={form.deepseekWebBridgeUrl}
+                status={bridgeStatus}
+                message={bridgeMessage}
+                checking={bridgeChecking}
+                onUrlChange={(value) => updateField('deepseekWebBridgeUrl', value)}
+                onCheck={() => void checkDeepSeekBridge()}
+                onOpen={() => void openDeepSeekLogin()}
+              />
+            ) : null}
+
+            <div className="api-config-subsection" hidden={form.ocrProvider !== 'api'}>
+              <div className="api-config-subsection__heading">
                 <h4>视觉模型服务</h4>
                 <p>可以使用独立的 OpenAI-compatible 服务；旧配置会自动沿用文本模型的连接信息。</p>
               </div>
@@ -862,7 +1016,7 @@ export function ApiConfigPage() {
               </div>
             </div>
 
-            <div className="api-config-subsection">
+            <div className="api-config-subsection" hidden={form.ocrProvider !== 'api'}>
               <div className="api-config-subsection__heading">
                 <h4>OCR / 视觉模型</h4>
                 <p>模型必须支持图片输入。可读取服务模型列表，也可以手动填写模型名称。</p>
@@ -908,7 +1062,9 @@ export function ApiConfigPage() {
                       <option key={model} value={model}>{model}</option>
                     ))}
                   </select>
-                  <small className="settings-field__hint">该模型用于手写 OCR、答案理解和结构化批改。</small>
+                  <small className="settings-field__hint">
+                    系统会自动识别 OCR 接口或视觉 Chat；专用 OCR 的识别结果会交给文本模型批改。
+                  </small>
                 </label>
               </div>
             </div>

@@ -7,6 +7,7 @@ from backend.app_factory import (
   create_app_with_router,
   mount_student_learning_platform_demo_frontend,
 )
+from backend.deepseek_web_router import create_deepseek_web_router
 from backend.application_runtime import ApplicationRuntime
 from backend.knowledge_router import create_knowledge_router
 from backend.media_router import (
@@ -26,6 +27,7 @@ backend_router = APIRouter()
 backend_router.include_router(tsinghua_router)
 backend_router.include_router(adaptive_testing_router)
 backend_router.include_router(provider_router)
+backend_router.include_router(create_deepseek_web_router())
 backend_router.include_router(create_user_answer_router(
   application_runtime.require_user_answer_store(),
   application_runtime.require_user_answer_grading(),

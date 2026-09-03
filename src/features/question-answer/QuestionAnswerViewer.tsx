@@ -1,20 +1,83 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import ReactMarkdown from 'react-markdown'
+import rehypeKatex from 'rehype-katex'
+import remarkMath from 'remark-math'
 import {
   userAnswerAssetUrl,
   type QuestionAnswerIdentity,
+  type UserAnswerQuestionResult,
   type UserQuestionAnswer,
 } from '../../lib/userAnswers'
+import { prepareAssessmentMarkdownMath } from '../../lib/latexMarkdown'
 import { useQuestionAnswer } from './useQuestionAnswer'
 import { userAnswerGradingLabel } from './questionAnswerState'
 
 const ACCEPTED_ANSWERS = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
 
+function MathContent({ children }: { children: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+      {prepareAssessmentMarkdownMath(children)}
+    </ReactMarkdown>
+  )
+}
+
+function QuestionGradingResult({ result }: { result: UserAnswerQuestionResult }) {
+  const { grading, understanding } = result
+  return (
+    <article className="question-answer-grading__question">
+      <header>
+        <div>
+          <small>第 {result.question_index} 题</small>
+          <strong>{result.title || `题目 ${result.question_index}`}</strong>
+        </div>
+        <span>{Math.round(grading.score * 100)}% · {userAnswerGradingLabel(grading)}</span>
+      </header>
+      {result.content ? <div className="question-answer-grading__prompt"><MathContent>{result.content}</MathContent></div> : null}
+      {grading.needs_review ? (
+        <p className="question-answer-grading__review">该题识别或批改把握较低，请结合原答案核对。</p>
+      ) : null}
+      <section className="question-answer-understanding">
+        <h4>AI 识别结果</h4>
+        <div className="question-answer-understanding__transcription">
+          <MathContent>{understanding.transcription || '本题没有识别到可展示的作答内容。'}</MathContent>
+        </div>
+        {understanding.final_answer ? <div><strong>最终答案</strong><MathContent>{understanding.final_answer}</MathContent></div> : null}
+        {understanding.steps.length ? <div><strong>解题步骤</strong><ol>{understanding.steps.map((step, index) => (
+          <li key={`${index}-${step}`}><MathContent>{step}</MathContent></li>
+        ))}</ol></div> : null}
+        {understanding.uncertain_parts.length ? (
+          <div className="question-answer-understanding__uncertain"><strong>不确定部分</strong><MathContent>{understanding.uncertain_parts.join('；')}</MathContent></div>
+        ) : null}
+      </section>
+      {grading.summary ? <MathContent>{grading.summary}</MathContent> : null}
+      {grading.errors.length ? <div><h4>错误原因</h4><ol>{grading.errors.map((error, index) => (
+        <li key={`${error.type}-${index}`}><MathContent>{[error.problem, error.correction ? `建议：${error.correction}` : ''].filter(Boolean).join('；')}</MathContent></li>
+      ))}</ol></div> : null}
+      {grading.knowledge_points.length ? <div><h4>知识点分析</h4><ul>{grading.knowledge_points.map((point, index) => (
+        <li key={`${point.name}-${index}`}><strong>{point.name}</strong><span>{point.status}</span>{point.evidence ? <MathContent>{point.evidence}</MathContent> : null}</li>
+      ))}</ul></div> : null}
+      {grading.correct_parts.length ? <div><h4>做对的部分</h4><ul>{grading.correct_parts.map((item, index) => <li key={`${index}-${item}`}><MathContent>{item}</MathContent></li>)}</ul></div> : null}
+      {grading.improvement_suggestions.length ? <div><h4>改进建议</h4><ul>{grading.improvement_suggestions.map((item, index) => <li key={`${index}-${item}`}><MathContent>{item}</MathContent></li>)}</ul></div> : null}
+      {grading.feedback ? <div className="question-answer-grading__feedback"><MathContent>{grading.feedback}</MathContent></div> : null}
+    </article>
+  )
+}
+
 function GradingPanel({ attempt, onRetry }: {
   attempt: UserQuestionAnswer
   onRetry: () => void
 }) {
-  if (attempt.processing_status === 'pending' || attempt.processing_status === 'processing') {
-    return <div className="question-answer-grading is-processing"><i />正在批改，请稍候…</div>
+  if (['pending', 'processing', 'mineru_processing', 'reconstructing', 'grading'].includes(attempt.processing_status)) {
+    const statusLabels: Record<string, string> = {
+      pending: '等待处理',
+      processing: '正在处理',
+      mineru_processing: '正在分析手写版面',
+      reconstructing: '正在重建各题答案',
+      grading: '正在批改答案',
+    }
+    const statusText = statusLabels[attempt.processing_status] || '正在处理'
+    return <div className="question-answer-grading is-processing"><i />{statusText}，请稍候…</div>
   }
   if (attempt.processing_status === 'failed') {
     return (
@@ -26,37 +89,28 @@ function GradingPanel({ attempt, onRetry }: {
     )
   }
   const grading = attempt.grading
-  if (!grading) return null
+  const results = attempt.question_results?.length ? attempt.question_results : (
+    grading && attempt.understanding ? [{
+      question_id: attempt.question_id,
+      question_index: 1,
+      title: '',
+      content: '',
+      understanding: attempt.understanding,
+      grading,
+    }] : []
+  )
+  if (!grading || !results.length) return null
+  const overallScore = results.reduce((sum, result) => sum + result.grading.score, 0) / results.length
+  const reviewCount = results.filter((result) => result.grading.needs_review).length
   return (
     <section className="question-answer-grading">
       <header>
-        <div><small>批改结果</small><strong>{Math.round(grading.score * 100)}%</strong></div>
-        <span>{userAnswerGradingLabel(grading)}</span>
+        <div><small>整份答案批改结果 · 共 {results.length} 题</small><strong>{Math.round(overallScore * 100)}%</strong></div>
+        <span>{reviewCount ? `${reviewCount} 题需要确认` : '全部题目已批改'}</span>
       </header>
-      {grading.needs_review ? (
-        <p className="question-answer-grading__review">AI 对该答案的判断把握较低，请结合原答案核对，不将其视为确定结论。</p>
-      ) : null}
-      {grading.summary ? <p>{grading.summary}</p> : null}
-      {grading.errors.length ? (
-        <div><h4>错误原因</h4><ol>{grading.errors.map((error, index) => (
-          <li key={`${error.type}-${index}`}><strong>{error.problem}</strong>{error.correction ? `；建议：${error.correction}` : ''}</li>
-        ))}</ol></div>
-      ) : null}
-      {grading.knowledge_points.length ? (
-        <div><h4>知识点分析</h4><ul>{grading.knowledge_points.map((point) => (
-          <li key={point.name}><strong>{point.name}</strong><span>{point.status}</span>{point.evidence ? `：${point.evidence}` : ''}</li>
-        ))}</ul></div>
-      ) : null}
-      {grading.correct_parts.length ? (
-        <div><h4>做对的部分</h4><ul>{grading.correct_parts.map((item) => <li key={item}>{item}</li>)}</ul></div>
-      ) : null}
-      {grading.improvement_suggestions.length ? (
-        <div><h4>改进建议</h4><ul>{grading.improvement_suggestions.map((item) => <li key={item}>{item}</li>)}</ul></div>
-      ) : null}
-      {grading.feedback ? <p className="question-answer-grading__feedback">{grading.feedback}</p> : null}
-      {attempt.understanding?.transcription ? (
-        <details><summary>查看 AI 识别文本</summary><p>{attempt.understanding.transcription}</p></details>
-      ) : null}
+      <div className="question-answer-grading__questions">
+        {results.map((result) => <QuestionGradingResult key={result.question_id} result={result} />)}
+      </div>
       <footer>模型 {attempt.grading_model || '未记录'} · {attempt.grading_version}</footer>
       <button type="button" className="ghost-button" onClick={onRetry}>重新批改</button>
     </section>
@@ -130,9 +184,9 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
           ) : selected ? (
             <>
               <div className="question-answer-viewer__actions">
-                <div><strong>第 {selected.attempt_number} 次作答</strong><span>{new Date(selected.created_at).toLocaleString()} · {orderedAssets.length} 个文件</span></div>
-                <div><button type="button" onClick={openUpload} disabled={isSaving}>提交新答案</button><button type="button" className="is-danger" disabled={isSaving} onClick={() => {
-                  if (window.confirm('确定删除这道题的全部作答历史吗？')) void remove()
+                <div><strong>整份文档第 {selected.attempt_number} 次作答</strong><span>{new Date(selected.created_at).toLocaleString()} · {orderedAssets.length} 个文件</span></div>
+                <div><button type="button" onClick={openUpload} disabled={isSaving}>提交整份新答案</button><button type="button" className="is-danger" disabled={isSaving} onClick={() => {
+                  if (window.confirm('确定删除这份作业或往年题的全部作答历史吗？')) void remove()
                 }}>删除全部记录</button></div>
               </div>
               <div className="question-answer-viewer__assets">
@@ -157,7 +211,7 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
               ) : null}
             </>
           ) : (
-            <div className="question-answer-viewer__empty"><strong>暂无答案</strong><span>上传 PDF 或按顺序选择多张手写图片，保存后将在后台自动批改。</span><button type="button" onClick={openUpload} disabled={isSaving}>{isSaving ? '上传中…' : '上传答案'}</button></div>
+            <div className="question-answer-viewer__empty"><strong>暂无整份答案</strong><span>上传包含这份作业或往年题全部作答的 PDF，或按顺序选择多张手写图片。AI 会自动分题并逐题批改。</span><button type="button" onClick={openUpload} disabled={isSaving}>{isSaving ? '上传中…' : '上传整份答案'}</button></div>
           )}
           {error ? <p className="question-answer-viewer__error">{error}</p> : null}
         </div>

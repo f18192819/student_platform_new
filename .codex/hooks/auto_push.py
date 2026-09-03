@@ -18,13 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 SOURCE_ROOTS = {
-    "backend", "docs", "frontend", "frontend-tests", "public", "scripts", "src",
+    "backend", "docs", "frontend", "frontend-tests", "public", "scripts", "src", "tools",
 }
 SOURCE_FILES = {
     ".gitignore", ".gitattributes", "README.md", "app.py", "index.html",
     "octopus-service.yaml", "package-lock.json", "package.json", "pyproject.toml",
     "requirements.txt", "tsconfig.app.json", "tsconfig.json", "tsconfig.node.json",
-    "vite.config.ts",
+    "vite.config.ts", ".codex/hooks.json",
 }
 
 

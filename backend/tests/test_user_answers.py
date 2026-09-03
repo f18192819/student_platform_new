@@ -73,7 +73,7 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertEqual('pdf', asset.kind)
     self.assertEqual(PDF, path.read_bytes())
 
-  def test_question_and_course_bindings_are_isolated(self):
+  def test_document_answer_is_shared_by_questions_but_courses_remain_isolated(self):
     self.store.replace(
       'course-1', 'homework-1', 'q1', 'homework',
       [upload('q1.png', 'image/png', PNG)],
@@ -83,7 +83,7 @@ class UserAnswerStoreTest(unittest.TestCase):
       [upload('course-2.jpg', 'image/jpeg', JPEG)],
     )
 
-    self.assertIsNone(self.store.get('course-1', 'homework-1', 'q2'))
+    self.assertEqual('q1', self.store.get('course-1', 'homework-1', 'q2').question_id)
     self.assertEqual(
       'q1.png', self.store.get('course-1', 'homework-1', 'q1').assets[0].filename,
     )

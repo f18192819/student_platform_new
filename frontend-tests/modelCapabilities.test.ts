@@ -47,6 +47,16 @@ test('provider metadata has priority over conservative name heuristics', () => {
   assert.deepEqual([...capabilities], ['chat'])
 })
 
+test('provider OCR endpoint metadata is recognized as image capability', () => {
+  const capabilities = resolveModelUsageCapabilities({
+    id: 'provider-specific-model',
+    mode: 'ocr',
+    supported_endpoints: ['/v1/ocr'],
+  })
+
+  assert.deepEqual([...capabilities], ['vision'])
+})
+
 test('dedicated model names are not treated as chat models', () => {
   const models: DiscoveredModel[] = [
     { id: 'GLM-Embedding-3' },

@@ -9,8 +9,21 @@ import requests
 
 
 _API_SUFFIX = re.compile(
-  r'/(?:chat/completions|embeddings|rerank|audio/transcriptions|models)$',
+  r'/(?:chat/completions|embeddings|rerank|audio/transcriptions|models|ocr)$',
   re.IGNORECASE,
+)
+
+_MULTIMODAL_PROTOCOL_ERRORS = (
+  'expected str instance, list found',
+  'multimodal content unsupported',
+  'multimodal content is not supported',
+  'image content unsupported',
+  'image content is not supported',
+)
+_OCR_PROTOCOL_ERRORS = (
+  'ocr is not supported for provider',
+  'ocr endpoint is not supported',
+  'unsupported ocr endpoint',
 )
 
 
@@ -32,6 +45,29 @@ class ProviderTransportError(RuntimeError):
 def normalize_openai_api_root(base_url: str) -> str:
   normalized = str(base_url or '').strip().rstrip('/')
   return _API_SUFFIX.sub('', normalized)
+
+
+def is_multimodal_protocol_error(error: BaseException | str) -> bool:
+  if isinstance(error, ProviderTransportError) and error.error_type == 'multimodal_protocol_error':
+    return True
+  message = str(error or '').casefold()
+  return any(marker in message for marker in _MULTIMODAL_PROTOCOL_ERRORS)
+
+
+def is_ocr_protocol_error(error: BaseException | str) -> bool:
+  message = str(error or '').casefold()
+  return any(marker in message for marker in _OCR_PROTOCOL_ERRORS)
+
+
+def _response_detail(response: requests.Response, limit: int = 1000) -> str:
+  try:
+    return str(response.text or '').strip()[:limit]
+  except Exception:  # noqa: BLE001 - diagnostics must not hide the provider failure.
+    return ''
+
+
+def _contains_multimodal_content(messages: list[dict[str, Any]]) -> bool:
+  return any(isinstance(message.get('content'), list) for message in messages)
 
 
 def extract_json_object(content: str) -> dict[str, Any]:
@@ -128,6 +164,13 @@ class StructuredChatClient:
         ) from exc
       last_response = response
       if response.status_code >= 400:
+        detail = _response_detail(response)
+        if _contains_multimodal_content(messages) and is_multimodal_protocol_error(detail):
+          raise ProviderTransportError(
+            f'Provider returned HTTP {response.status_code}: {detail}',
+            status_code=response.status_code,
+            error_type='multimodal_protocol_error',
+          )
         continue
       try:
         content = response.json()['choices'][0]['message']['content']
@@ -157,10 +200,7 @@ class StructuredChatClient:
     status_code = last_response.status_code if last_response is not None else None
     detail = ''
     if last_response is not None:
-      try:
-        detail = str(last_response.text or '').strip()[:1000]
-      except Exception:  # noqa: BLE001 - error reporting must not mask the provider failure.
-        detail = ''
+      detail = _response_detail(last_response)
     message = f'Provider returned HTTP {status_code}' if status_code else 'Provider request failed'
     if detail:
       message = f'{message}: {detail}'
@@ -202,10 +242,90 @@ class MultimodalChatClient(StructuredChatClient):
     )
 
 
+class LiteLLMOcrClient:
+  """Narrow client for LiteLLM's document OCR endpoint."""
+
+  def __init__(self, post: Callable[..., requests.Response] | None = None) -> None:
+    self._post = post or requests.post
+
+  def transcribe(
+    self,
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    image_url: str,
+    timeout: float = 180,
+  ) -> str:
+    root = normalize_openai_api_root(base_url)
+    if not root or not str(api_key or '').strip() or not str(model or '').strip():
+      raise ProviderTransportError(
+        'Provider base URL, API key, and OCR model are required.',
+        error_type='configuration_error',
+      )
+    try:
+      response = self._post(
+        f'{root}/ocr',
+        headers={
+          'Authorization': f'Bearer {api_key}',
+          'Content-Type': 'application/json',
+        },
+        json={
+          'model': model,
+          'document': {
+            'type': 'image_url',
+            'image_url': image_url,
+          },
+        },
+        timeout=timeout,
+      )
+    except requests.RequestException as exc:
+      raise ProviderTransportError(
+        f'OCR provider request failed: {exc}',
+        error_type='network_error',
+      ) from exc
+    if response.status_code >= 400:
+      detail = _response_detail(response)
+      message = f'OCR provider returned HTTP {response.status_code}'
+      if detail:
+        message = f'{message}: {detail}'
+      raise ProviderTransportError(
+        message,
+        status_code=response.status_code,
+        error_type='http_error',
+      )
+    try:
+      payload = response.json()
+    except ValueError as exc:
+      raise ProviderTransportError(
+        'OCR provider returned invalid JSON.',
+        status_code=response.status_code,
+        error_type='invalid_response',
+      ) from exc
+    pages = payload.get('pages') if isinstance(payload, dict) else None
+    if not isinstance(pages, list) and isinstance(payload, dict) and isinstance(payload.get('data'), dict):
+      pages = payload['data'].get('pages')
+    markdown_pages = [
+      str(page.get('markdown') or '').strip()
+      for page in pages or []
+      if isinstance(page, dict) and str(page.get('markdown') or '').strip()
+    ]
+    if not markdown_pages:
+      raise ProviderTransportError(
+        'OCR provider response does not contain pages[].markdown.',
+        status_code=response.status_code,
+        error_type='invalid_response',
+      )
+    return '\n\n'.join(markdown_pages)
+
+
 __all__ = [
   'ProviderTransportError',
+  'LiteLLMOcrClient',
   'MultimodalChatClient',
   'StructuredChatClient',
   'extract_json_object',
+  'is_multimodal_protocol_error',
+  'is_ocr_protocol_error',
   'normalize_openai_api_root',
 ]
