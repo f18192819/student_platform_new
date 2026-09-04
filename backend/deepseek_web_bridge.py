@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import mimetypes
+import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,71 @@ class DeepSeekWebBridgeError(RuntimeError):
     self.code = code
     self.status_code = status_code
     super().__init__(message or _ERROR_MESSAGES.get(code) or 'DeepSeek Web Bridge 调用失败。')
+
+
+def extract_web_json_object(content: str) -> dict[str, Any]:
+  """Recover JSON whose string whitespace/backslashes were altered by rendered web text."""
+  cleaned = str(content or '').strip()
+  if cleaned.startswith('```'):
+    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE).strip()
+
+  repaired: list[str] = []
+  in_string = False
+  escaped = False
+  # Rendered model output commonly contains raw LaTeX commands such as
+  # \frac, \begin and \underbrace. Treat only delimiter escapes as JSON;
+  # otherwise preserve the backslash as literal mathematical content.
+  delimiter_escapes = {'"', '\\', '/'}
+  for index, char in enumerate(cleaned):
+    if not in_string:
+      repaired.append(char)
+      if char == '"':
+        in_string = True
+      continue
+    if escaped:
+      repaired.append(char)
+      escaped = False
+      continue
+    if char == '"':
+      following = cleaned[index + 1:].lstrip()[:1]
+      if following in {':', ',', '}', ']'} or not following:
+        repaired.append(char)
+        in_string = False
+      else:
+        # Rendered Markdown drops JSON escaping around quotations copied from
+        # the answer body. A structural quote can only precede JSON syntax.
+        repaired.append('\\"')
+      continue
+    if char == '\\':
+      next_char = cleaned[index + 1] if index + 1 < len(cleaned) else ''
+      repaired.append('\\' if next_char in delimiter_escapes else '\\\\')
+      escaped = next_char in delimiter_escapes
+      continue
+    if char == '\n':
+      repaired.append('\\n')
+    elif char == '\r':
+      repaired.append('\\r')
+    elif char == '\t':
+      repaired.append('\\t')
+    elif ord(char) < 0x20:
+      repaired.append(json.dumps(char)[1:-1])
+    else:
+      repaired.append(char)
+
+  source = ''.join(repaired)
+  decoder = json.JSONDecoder()
+  candidates: list[tuple[int, dict[str, Any]]] = []
+  for match in re.finditer(r'\{', source):
+    try:
+      value, consumed = decoder.raw_decode(source[match.start():])
+    except json.JSONDecodeError:
+      continue
+    if isinstance(value, dict):
+      candidates.append((consumed, value))
+  if candidates:
+    # Prefer the recovered outer response over a valid but incomplete nested block.
+    return max(candidates, key=lambda item: item[0])[1]
+  raise DeepSeekWebBridgeError('page_changed', 'DeepSeek 网页返回内容无法恢复为结构化结果。')
 
 
 def normalize_bridge_url(value: str | None) -> str:
@@ -149,5 +216,6 @@ __all__ = [
   'DEFAULT_DEEPSEEK_WEB_BRIDGE_URL',
   'DeepSeekWebBridgeClient',
   'DeepSeekWebBridgeError',
+  'extract_web_json_object',
   'normalize_bridge_url',
 ]

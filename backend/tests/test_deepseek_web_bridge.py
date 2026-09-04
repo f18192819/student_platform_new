@@ -13,12 +13,13 @@ from backend.app_factory import create_app_with_router
 from backend.deepseek_web_bridge import (
   DeepSeekWebBridgeClient,
   DeepSeekWebBridgeError,
+  extract_web_json_object,
   normalize_bridge_url,
 )
 from backend.deepseek_web_router import create_deepseek_web_router
 from tools.deepseek_web_bridge.browser import SerializedBrowserTasks
 from tools.deepseek_web_bridge.app import create_bridge_app
-from tools.deepseek_web_bridge.deepseek_client import BridgeOperationError
+from tools.deepseek_web_bridge.deepseek_client import BridgeOperationError, DeepSeekWebClient
 
 
 class FakeResponse:
@@ -31,6 +32,26 @@ class FakeResponse:
 
 
 class DeepSeekWebBridgeClientTest(unittest.TestCase):
+  def test_rendered_markdown_json_recovers_all_questions(self):
+    rendered = r'''```json
+{"questions":[
+  {"question_id":"q1","transcription":"first line
+second line with "quoted evidence" and \\frac{1}{2}","confidence":0.9},
+  {"question_id":"q2","transcription":"$E=mc^2$","confidence":0.8}
+],"unassigned_blocks":[]}
+```'''
+
+    payload = extract_web_json_object(rendered)
+
+    self.assertEqual(['q1', 'q2'], [item['question_id'] for item in payload['questions']])
+    self.assertIn('first line\nsecond line', payload['questions'][0]['transcription'])
+    self.assertIn('"quoted evidence"', payload['questions'][0]['transcription'])
+    self.assertIn(r'\frac{1}{2}', payload['questions'][0]['transcription'])
+
+  def test_valid_fenced_json_remains_compatible(self):
+    payload = extract_web_json_object('```json\n{"questions": [], "unassigned_blocks": []}\n```')
+    self.assertEqual([], payload['questions'])
+
   def test_only_loopback_bridge_urls_are_allowed(self):
     self.assertEqual('http://127.0.0.1:8765', normalize_bridge_url('http://127.0.0.1:8765/'))
     self.assertEqual('http://localhost:8765', normalize_bridge_url('http://localhost:8765'))
@@ -139,6 +160,33 @@ class SerializedBrowserTasksTest(unittest.IsolatedAsyncioTestCase):
     )
     self.assertEqual(1, peak)
     self.assertEqual(['start-chat', 'end-chat', 'start-ocr', 'end-ocr'], order)
+
+  async def test_stable_answer_is_preserved_when_stop_control_stays_visible(self):
+    class MissingLocator:
+      async def count(self):
+        return 0
+
+    class Page:
+      def get_by_text(self, *_args, **_kwargs):
+        return MissingLocator()
+
+      async def wait_for_timeout(self, _milliseconds):
+        await asyncio.sleep(0.002)
+
+    client = DeepSeekWebClient(object(), generation_timeout=0.2)
+
+    async def latest_answer(_page):
+      return '{"questions": [], "unassigned_blocks": []}'
+
+    async def stop_visible(_page):
+      return True
+
+    client._latest_answer = latest_answer
+    client._stop_button_visible = stop_visible
+
+    result = await client._wait_and_extract(Page())
+
+    self.assertEqual('{"questions": [], "unassigned_blocks": []}', result)
 
 
 class BridgeHttpApiTest(unittest.TestCase):

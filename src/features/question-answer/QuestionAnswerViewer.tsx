@@ -68,6 +68,21 @@ function GradingPanel({ attempt, onRetry }: {
   attempt: UserQuestionAnswer
   onRetry: () => void
 }) {
+  const grading = attempt.grading
+  const results = attempt.question_results?.length ? [...attempt.question_results].sort(
+    (left, right) => left.question_index - right.question_index,
+  ) : (
+    grading && attempt.understanding ? [{
+      question_id: attempt.question_id,
+      question_index: 1,
+      title: '',
+      content: '',
+      understanding: attempt.understanding,
+      grading,
+    }] : []
+  )
+  const [selectedQuestionId, setSelectedQuestionId] = useState('')
+
   if (['pending', 'processing', 'mineru_processing', 'reconstructing', 'grading'].includes(attempt.processing_status)) {
     const statusLabels: Record<string, string> = {
       pending: '等待处理',
@@ -88,29 +103,52 @@ function GradingPanel({ attempt, onRetry }: {
       </div>
     )
   }
-  const grading = attempt.grading
-  const results = attempt.question_results?.length ? attempt.question_results : (
-    grading && attempt.understanding ? [{
-      question_id: attempt.question_id,
-      question_index: 1,
-      title: '',
-      content: '',
-      understanding: attempt.understanding,
-      grading,
-    }] : []
-  )
   if (!grading || !results.length) return null
   const overallScore = results.reduce((sum, result) => sum + result.grading.score, 0) / results.length
   const reviewCount = results.filter((result) => result.grading.needs_review).length
+  const activeQuestionId = results.some((result) => result.question_id === selectedQuestionId)
+    ? selectedQuestionId
+    : results[0].question_id
+  const selectedIndex = Math.max(0, results.findIndex((result) => result.question_id === activeQuestionId))
+  const selectedResult = results[selectedIndex]
   return (
     <section className="question-answer-grading">
       <header>
         <div><small>整份答案批改结果 · 共 {results.length} 题</small><strong>{Math.round(overallScore * 100)}%</strong></div>
         <span>{reviewCount ? `${reviewCount} 题需要确认` : '全部题目已批改'}</span>
       </header>
-      <div className="question-answer-grading__questions">
-        {results.map((result) => <QuestionGradingResult key={result.question_id} result={result} />)}
+      <div className="question-answer-grading__switcher" role="tablist" aria-label="切换题目批改结果">
+        {results.map((result) => (
+          <button
+            key={result.question_id}
+            type="button"
+            role="tab"
+            aria-selected={result.question_id === selectedResult.question_id}
+            className={result.question_id === selectedResult.question_id ? 'is-active' : ''}
+            onClick={() => setSelectedQuestionId(result.question_id)}
+          >
+            <span>第 {result.question_index} 题</span>
+            <strong>{Math.round(result.grading.score * 100)}%</strong>
+            <small>{result.grading.needs_review ? '需确认' : userAnswerGradingLabel(result.grading)}</small>
+          </button>
+        ))}
       </div>
+      <QuestionGradingResult result={selectedResult} />
+      {results.length > 1 ? (
+        <nav className="question-answer-grading__pager" aria-label="题目批改结果翻页">
+          <button
+            type="button"
+            disabled={selectedIndex === 0}
+            onClick={() => setSelectedQuestionId(results[selectedIndex - 1].question_id)}
+          >上一题</button>
+          <span>{selectedIndex + 1} / {results.length}</span>
+          <button
+            type="button"
+            disabled={selectedIndex === results.length - 1}
+            onClick={() => setSelectedQuestionId(results[selectedIndex + 1].question_id)}
+          >下一题</button>
+        </nav>
+      ) : null}
       <footer>模型 {attempt.grading_model || '未记录'} · {attempt.grading_version}</footer>
       <button type="button" className="ghost-button" onClick={onRetry}>重新批改</button>
     </section>

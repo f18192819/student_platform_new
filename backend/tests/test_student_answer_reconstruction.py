@@ -143,6 +143,9 @@ class StudentAnswerReconstructionTest(unittest.TestCase):
     self.assertIn('q2', prompt)
     self.assertIn('original page images are the strongest evidence', system)
     self.assertIn('Do not assume top-to-bottom reading order', system)
+    self.assertIn('exactly one questions item for every supplied question_id', prompt)
+    self.assertIn('same order', prompt)
+    self.assertIn('confidence=0', prompt)
 
   def test_question_mapping_and_unassigned_content_are_preserved(self):
     reconstruction = StudentAnswerReconstruction(

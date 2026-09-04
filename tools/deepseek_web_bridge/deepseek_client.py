@@ -37,7 +37,7 @@ class DeepSeekWebClient:
     self.browser = browser
     self.tasks = SerializedBrowserTasks()
     self.generation_timeout = generation_timeout or float(
-      os.environ.get('DEEPSEEK_WEB_GENERATION_TIMEOUT_SECONDS', '180')
+      os.environ.get('DEEPSEEK_WEB_GENERATION_TIMEOUT_SECONDS', '240')
     )
 
   async def open_browser(self) -> dict[str, bool]:
@@ -250,6 +250,11 @@ class DeepSeekWebClient:
       if stable_text and stable_rounds >= 5 and not stop_visible:
         return stable_text
       await page.wait_for_timeout(500)
+    if stable_text and stable_rounds >= 3:
+      # DeepSeek occasionally leaves its stop control visible after the answer
+      # has stopped changing. Preserve that stable response at the deadline;
+      # downstream structured validation still rejects incomplete JSON.
+      return stable_text
     raise BridgeOperationError('generation_timeout', 'DeepSeek 网页生成超时。')
 
   async def _latest_answer(self, page) -> str:

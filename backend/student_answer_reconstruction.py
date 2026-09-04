@@ -132,7 +132,9 @@ class StudentAnswerReconstructionPrompt:
       'provider_ocr': provider_ocr[:60000],
       'instruction': (
         'Determine how many questions are present and what each asks, then assign handwritten regions and '
-        'reconstruct the student work. Return one questions item per answer found, keyed by the supplied question_id.'
+        'reconstruct the student work. Return exactly one questions item for every supplied question_id, in the '
+        'same order. When no answer can be found, keep its transcription/steps/final_answer/blocks empty, set '
+        'confidence=0, and explain that absence in uncertain_parts.'
       ),
       'output_schema': cls.schema(),
     }

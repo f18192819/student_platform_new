@@ -13,7 +13,11 @@ from typing import Any, Protocol
 
 from PIL import Image, ImageOps
 
-from .deepseek_web_bridge import DeepSeekWebBridgeClient, DeepSeekWebBridgeError
+from .deepseek_web_bridge import (
+  DeepSeekWebBridgeClient,
+  DeepSeekWebBridgeError,
+  extract_web_json_object,
+)
 from .knowledge_storage import read_knowledge_library
 from .learning_state import LearningStateStore
 from .ocr_transport import (
@@ -535,7 +539,7 @@ class UserAnswerGradingService:
       ])
       try:
         raw = self.web_bridge_client.chat(bridge_url, prompt, timeout=180)
-        return extract_json_object(raw), 'deepseek-web'
+        return extract_web_json_object(raw), 'deepseek-web'
       except DeepSeekWebBridgeError as exc:
         raise UserAnswerGradingError(str(exc)) from exc
       except ProviderTransportError as exc:
@@ -619,9 +623,15 @@ class UserAnswerGradingService:
   @classmethod
   def _parse_reconstruction(cls, raw: str, context: dict[str, Any]) -> StudentAnswerReconstruction:
     try:
-      return cls._normalize_reconstruction(extract_json_object(raw), context, raw)
+      payload = extract_json_object(raw)
+      if not isinstance(payload.get('questions'), list) and not isinstance(payload.get('understanding'), dict):
+        raise ProviderTransportError('Reconstruction response is missing its top-level structure.')
+      return cls._normalize_reconstruction(payload, context, raw)
     except (ProviderTransportError, ValueError, TypeError):
-      return cls._normalize_reconstruction({}, context, raw)
+      try:
+        return cls._normalize_reconstruction(extract_web_json_object(raw), context, raw)
+      except (DeepSeekWebBridgeError, ValueError, TypeError):
+        return cls._normalize_reconstruction({}, context, raw)
 
   @staticmethod
   def _understanding_for_question(

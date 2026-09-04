@@ -213,6 +213,30 @@ class UserAnswerGradingTest(unittest.TestCase):
       [upload(filename, content_type, data)],
     )
 
+  def test_web_reconstruction_recovers_multiple_questions_from_rendered_json(self):
+    raw = r'''```json
+{"questions":[
+  {"question_id":"question-1","transcription":"line one
+line two with "P point" and \\frac{1}{2}","steps":[],"final_answer":"1/2","blocks":[],"confidence":0.9,"uncertain_parts":[]},
+  {"question_id":"question-2","transcription":"$y=2$","steps":[],"final_answer":"2","blocks":[],"confidence":0.8,"uncertain_parts":[]}
+],"unassigned_blocks":[]}
+```'''
+    context = {
+      'question_id': 'question-1',
+      'all_questions': [
+        {'question_id': 'question-1'},
+        {'question_id': 'question-2'},
+      ],
+    }
+
+    reconstruction = UserAnswerGradingService._parse_reconstruction(raw, context)
+
+    self.assertEqual(
+      ['question-1', 'question-2'],
+      [item.question_id for item in reconstruction.questions],
+    )
+    self.assertIn('"P point"', reconstruction.questions[0].transcription)
+
   @patch('backend.user_answer_grading.load_api_config')
   def test_document_answer_reconstructs_grades_and_persists_every_question(self, load_config):
     load_config.return_value = {
