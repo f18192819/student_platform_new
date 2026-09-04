@@ -4,10 +4,14 @@ import {
   loadUserQuestionAnswerAttempt,
   loadUserQuestionAnswerAttempts,
   retryUserAnswerGrading,
+  saveUserAnswerQuestionReview,
+  effectiveQuestionReview,
+  effectiveQuestionScore,
   uploadUserQuestionAnswer,
   type QuestionAnswerIdentity,
   type UserAnswerAttemptSummary,
   type UserQuestionAnswer,
+  type ReviewedError,
 } from '../../lib/userAnswers'
 import {
   ACTIVE_USER_ANSWER_STATUSES,
@@ -18,15 +22,29 @@ import {
 export { USER_ANSWER_POLL_DELAYS_MS } from './questionAnswerState'
 
 function summaryOf(attempt: UserQuestionAnswer): UserAnswerAttemptSummary {
+  const results = attempt.question_results ?? []
+  const effectiveScore = results.length
+    ? results.reduce((sum, result) => sum + effectiveQuestionScore(attempt, result), 0) / results.length
+    : attempt.grading?.score ?? null
+  const effectiveCorrect = results.length
+    ? results.every((result) => (
+      effectiveQuestionReview(attempt, result.question_id)?.final_correct ?? result.grading.correct
+    ))
+    : attempt.grading?.correct ?? null
+  const effectiveNeedsReview = results.length
+    ? results.some((result) => (
+      result.grading.needs_review && !effectiveQuestionReview(attempt, result.question_id)
+    ))
+    : attempt.grading?.needs_review ?? attempt.processing_status === 'needs_review'
   return {
     id: attempt.id,
     attempt_number: attempt.attempt_number,
     created_at: attempt.created_at,
     updated_at: attempt.updated_at,
     processing_status: attempt.processing_status,
-    score: attempt.grading?.score ?? null,
-    correct: attempt.grading?.correct ?? null,
-    needs_review: attempt.grading?.needs_review ?? attempt.processing_status === 'needs_review',
+    score: effectiveScore,
+    correct: effectiveCorrect,
+    needs_review: effectiveNeedsReview,
     asset_count: attempt.assets.length,
     grading_model: attempt.grading_model,
   }
@@ -41,6 +59,7 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
   const [details, setDetails] = useState<Record<string, UserQuestionAnswer>>({})
   const [isLoading, setIsLoading] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const [reviewSavingQuestionId, setReviewSavingQuestionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
   const identityKey = `${identity.courseId}:${identity.sourceDocumentId}:${identity.questionId}`
@@ -154,6 +173,39 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
     }
   }
 
+  const saveReview = async (
+    attemptId: string,
+    questionId: string,
+    baseGradingRevision: number,
+    errors: ReviewedError[],
+  ) => {
+    setReviewSavingQuestionId(questionId)
+    setError(null)
+    try {
+      const payloadErrors = errors.map((item) => item.source === 'ai' ? {
+        id: item.id,
+        source: item.source,
+        accepted: item.accepted,
+      } : item)
+      const saved = await saveUserAnswerQuestionReview(
+        { courseId, sourceDocumentId, questionId: identity.questionId },
+        attemptId,
+        questionId,
+        { base_grading_revision: baseGradingRevision, errors: payloadErrors },
+      )
+      setDetails((current) => ({ ...current, [attemptId]: saved.answer }))
+      setAttempts((current) => current.map((attempt) => (
+        attempt.id === attemptId ? summaryOf(saved.answer) : attempt
+      )))
+      return saved.review
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存人工确认失败。')
+      return null
+    } finally {
+      setReviewSavingQuestionId(null)
+    }
+  }
+
   const remove = async () => {
     setIsSaving(true)
     setError(null)
@@ -170,5 +222,8 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
     }
   }
 
-  return { attempts, details, isLoading, isSaving, error, loadAttempt, upload, retry, remove }
+  return {
+    attempts, details, isLoading, isSaving, reviewSavingQuestionId, error,
+    loadAttempt, upload, retry, saveReview, remove,
+  }
 }

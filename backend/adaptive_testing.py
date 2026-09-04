@@ -539,6 +539,19 @@ class AdaptiveTestingService:
       session.course_id,
       session.lecture_document_id,
     )
+    candidate_concepts = {
+      str(concept or '').strip()
+      for candidate in candidates
+      for concept in candidate.get('knowledge_points') or []
+      if str(concept or '').strip()
+    }
+    external_evidence = [
+      event for event in self.repositories.events.for_course(session.course_id)
+      if event.source_type in {'self-submitted-homework', 'self-submitted-past-exam'}
+      and candidate_concepts.intersection(event.knowledge_points)
+    ]
+    lecture_event_ids = {event.id for event in lecture_events}
+    lecture_events.extend(event for event in external_evidence if event.id not in lecture_event_ids)
     question_history = self.repositories.events.question_history_for_lecture(
       session.course_id,
       session.lecture_document_id,

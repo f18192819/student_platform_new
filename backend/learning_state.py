@@ -47,6 +47,7 @@ class LearningEvent(BaseModel):
   grading_method: str
   grading_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
   grading_feedback: str = ''
+  error_evidence: list[dict[str, Any]] = Field(default_factory=list)
   revision: int = Field(default=1, ge=1)
   supersedes_event_id: str | None = None
   created_at: str = Field(default_factory=_now)
@@ -659,6 +660,26 @@ class LearningStateStore:
   def effective_lecture_events(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]:
     return self._latest_revisions(self.lecture_events(course_id, lecture_document_id))
 
+  def course_events(self, course_id: str) -> list[LearningEvent]:
+    return self._events(course_id, 'course_id = ?', (course_id,))
+
+  def effective_course_events(self, course_id: str) -> list[LearningEvent]:
+    return self._latest_revisions(self.course_events(course_id))
+
+  def delete_user_answer_events(self, course_id: str, attempt_ids: list[str]) -> int:
+    session_ids = [f'user-answer:{value}' for value in dict.fromkeys(attempt_ids) if value]
+    if not session_ids:
+      return 0
+    placeholders = ','.join('?' for _ in session_ids)
+    with self._connect(course_id) as connection:
+      cursor = connection.execute(
+        f'''DELETE FROM learning_events
+            WHERE test_session_id IN ({placeholders})
+              AND source_type IN ('self-submitted-homework', 'self-submitted-past-exam')''',
+        tuple(session_ids),
+      )
+    return max(0, int(cursor.rowcount))
+
   def delete_document(self, course_id: str, document_id: str) -> None:
     with self._connect(course_id) as connection:
       connection.execute(
@@ -879,6 +900,10 @@ class LearningStateStore:
       connection.execute(
         "ALTER TABLE learning_events ADD COLUMN assessment_spec_snapshot TEXT NOT NULL DEFAULT '{}'"
       )
+    if 'error_evidence' not in event_columns:
+      connection.execute(
+        "ALTER TABLE learning_events ADD COLUMN error_evidence TEXT NOT NULL DEFAULT '[]'"
+      )
 
     if needs_revision_migration:
       connection.execute(
@@ -936,9 +961,9 @@ class LearningStateStore:
         source_type, source_document_id, knowledge_points, difficulty, correct,
         score, response_time_ms, response_text, structured_responses,
         part_grading_results, assessment_spec_snapshot, grading_method,
-        grading_confidence, grading_feedback, revision, supersedes_event_id,
-        created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        grading_confidence, grading_feedback, error_evidence, revision,
+        supersedes_event_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ''',
       (
         event.id,
@@ -960,6 +985,7 @@ class LearningStateStore:
         event.grading_method,
         event.grading_confidence,
         event.grading_feedback,
+        json.dumps(event.error_evidence, ensure_ascii=False),
         event.revision,
         event.supersedes_event_id,
         event.created_at,
@@ -1004,6 +1030,7 @@ class LearningStateStore:
       grading_method=row['grading_method'],
       grading_confidence=row['grading_confidence'],
       grading_feedback=row['grading_feedback'],
+      error_evidence=json.loads(row['error_evidence'] or '[]'),
       revision=row['revision'],
       supersedes_event_id=row['supersedes_event_id'],
       created_at=row['created_at'],

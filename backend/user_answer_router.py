@@ -7,23 +7,28 @@ from fastapi.responses import FileResponse
 
 from .user_answers import (
   UserAnswerCorruptionError,
+  UserAnswerConflictError,
   UserAnswerError,
   UserAnswerNotFound,
   UserAnswerStore,
   UserAnswerValidationError,
 )
 from .user_answer_grading import UserAnswerGradingCoordinator
+from .user_answer_review import SaveQuestionReviewRequest, UserAnswerReviewService
 
 
 def create_user_answer_router(
   store: UserAnswerStore,
   grading: UserAnswerGradingCoordinator | None = None,
+  review: UserAnswerReviewService | None = None,
 ) -> APIRouter:
   router = APIRouter(prefix='/api/user-answers', tags=['user-question-answers'])
 
   def translate(error: UserAnswerError) -> HTTPException:
     if isinstance(error, UserAnswerNotFound):
       return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, UserAnswerConflictError):
+      return HTTPException(status_code=409, detail=str(error))
     if isinstance(error, UserAnswerValidationError):
       return HTTPException(status_code=422, detail=str(error))
     if isinstance(error, UserAnswerCorruptionError):
@@ -64,7 +69,14 @@ def create_user_answer_router(
   @router.delete('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}')
   async def delete_answer(course_id: str, source_document_id: str, question_id: str) -> dict:
     try:
+      attempts = await asyncio.to_thread(store.list_attempts, course_id, source_document_id, question_id)
       deleted = await asyncio.to_thread(store.delete, course_id, source_document_id, question_id)
+      if deleted and review is not None:
+        await asyncio.to_thread(
+          review.delete_attempt_evidence,
+          course_id,
+          [attempt.id for attempt in attempts],
+        )
       return {'deleted': deleted}
     except UserAnswerError as error:
       raise translate(error) from error
@@ -133,6 +145,34 @@ def create_user_answer_router(
         raise UserAnswerValidationError('Answer grading is not configured.')
       queued = grading.queue(attempt)
       return {'queued': queued, 'answer': attempt.model_dump()}
+    except UserAnswerError as error:
+      raise translate(error) from error
+
+  @router.put(
+    '/courses/{course_id}/documents/{source_document_id}/questions/{route_question_id}'
+    '/attempts/{attempt_id}/questions/{question_id}/review'
+  )
+  async def save_question_review(
+    course_id: str,
+    source_document_id: str,
+    route_question_id: str,
+    attempt_id: str,
+    question_id: str,
+    payload: SaveQuestionReviewRequest,
+  ) -> dict:
+    try:
+      if review is None:
+        raise UserAnswerValidationError('Manual answer review is not configured.')
+      attempt, saved = await asyncio.to_thread(
+        review.save,
+        course_id,
+        source_document_id,
+        route_question_id,
+        attempt_id,
+        question_id,
+        payload,
+      )
+      return {'answer': attempt.model_dump(), 'review': saved.model_dump()}
     except UserAnswerError as error:
       raise translate(error) from error
 

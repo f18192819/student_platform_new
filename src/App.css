@@ -5758,7 +5758,7 @@ body.is-resizing-panels {
 .question-answer-grading p,
 .question-answer-grading ol,
 .question-answer-grading ul { margin: 0; line-height: 1.75; }
-.question-answer-grading li span { margin-left: 8px; color: #1672f3; }
+.question-answer-grading__knowledge-status { margin-left: 8px; color: #1672f3; }
 .question-answer-grading__review { padding: 12px 14px; border-radius: 12px; background: #fff6de; color: #8a5c00; }
 .question-answer-grading__feedback { padding: 14px; border-left: 3px solid #25a879; background: #ecfaf5; }
 .question-answer-grading > footer { color: #7b8eab; font-size: 12px; }
@@ -5838,7 +5838,69 @@ body.is-resizing-panels {
 }
 .question-answer-grading__prompt { padding: 12px 14px; border-radius: 12px; background: #f5f8fd; }
 .question-answer-grading__question .katex-display { overflow-x: auto; overflow-y: hidden; }
-.question-answer-grading__question .katex { color: inherit; }
+.question-answer-grading__question .katex,
+.question-answer-grading__question .katex span { color: inherit; margin-left: 0; }
+.question-answer-review {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #c9ddf7;
+  border-radius: 16px;
+  background: #f8fbff;
+}
+.question-answer-review > header h4 { margin-bottom: 3px; }
+.question-answer-review > header p { color: #6f83a0; font-size: 13px; }
+.question-answer-review__stale { padding: 10px 12px; border-radius: 10px; background: #fff3d6; color: #8a5c00; }
+.question-answer-review__errors { display: grid; gap: 10px; }
+.question-answer-review__errors > article {
+  display: grid;
+  gap: 8px;
+  padding: 13px;
+  border: 1px solid #d7e4f4;
+  border-radius: 12px;
+  background: #fff;
+}
+.question-answer-review__errors > article.is-rejected { opacity: .56; background: #f5f7fa; }
+.question-answer-review__error-head { display: flex; align-items: center; gap: 12px; }
+.question-answer-review__error-head label { display: flex; align-items: center; gap: 7px; font-weight: 700; }
+.question-answer-review__error-head span { margin-left: auto; color: #b54708; font-weight: 700; }
+.question-answer-review__error-head button,
+.question-answer-review__add {
+  border: 0;
+  color: #1769d2;
+  background: transparent;
+  cursor: pointer;
+}
+.question-answer-review__correction { display: flex; gap: 5px; color: #536b89; }
+.question-answer-review__fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.question-answer-review__fields label { display: grid; gap: 5px; color: #526985; font-size: 12px; font-weight: 700; }
+.question-answer-review__fields .is-wide { grid-column: 1 / -1; }
+.question-answer-review__fields input,
+.question-answer-review__fields select,
+.question-answer-review__fields textarea {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #cbdcf0;
+  border-radius: 9px;
+  color: #203a5f;
+  background: #fff;
+  font: inherit;
+}
+.question-answer-review__add { justify-self: start; padding: 4px 0; font-weight: 800; }
+.question-answer-review__scores { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.question-answer-review__scores span { display: flex; justify-content: space-between; padding: 11px 13px; border-radius: 10px; background: #eaf3ff; }
+.question-answer-review__scores strong { color: #116ce8; }
+.question-answer-review__save {
+  min-height: 42px;
+  border: 0;
+  border-radius: 11px;
+  color: #fff;
+  background: #1672f3;
+  font-weight: 800;
+  cursor: pointer;
+}
+.question-answer-review__save:disabled { cursor: not-allowed; opacity: .5; }
+.question-answer-review__saved { color: #17845f; font-weight: 700; }
 .question-answer-understanding {
   display: grid;
   gap: 9px;
@@ -5869,6 +5931,9 @@ body.is-resizing-panels {
   .question-answer-grading__switcher { grid-template-columns: repeat(5, minmax(104px, 1fr)); }
   .question-answer-grading__question > header { align-items: stretch; flex-direction: column; }
   .question-answer-grading__question > header span { align-self: flex-start; }
+  .question-answer-review__fields { grid-template-columns: 1fr; }
+  .question-answer-review__fields .is-wide { grid-column: auto; }
+  .question-answer-review__scores { grid-template-columns: 1fr; }
 }
 
 .question-answer-history { margin-top: 22px; }

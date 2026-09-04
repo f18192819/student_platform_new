@@ -55,6 +55,7 @@ from .user_answers import (
   UserAnswerQuestionResult,
   UserAnswerStore,
   UserQuestionAnswer,
+  normalize_error_deductions,
 )
 
 
@@ -877,7 +878,7 @@ class UserAnswerGradingService:
       'needs_review': needs_review,
       'is_wrong': score < 0.75 and not needs_review,
     })
-    return understanding, UserAnswerGrading.model_validate(grading_payload)
+    return understanding, normalize_error_deductions(UserAnswerGrading.model_validate(grading_payload))
 
   @staticmethod
   def _validate_grading(
@@ -901,7 +902,7 @@ class UserAnswerGradingService:
       'needs_review': needs_review,
       'is_wrong': score < 0.75 and not needs_review,
     })
-    return UserAnswerGrading.model_validate(grading_payload)
+    return normalize_error_deductions(UserAnswerGrading.model_validate(grading_payload))
 
   @staticmethod
   def _reconstruction_schema() -> dict[str, Any]:

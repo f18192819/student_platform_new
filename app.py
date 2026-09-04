@@ -31,6 +31,7 @@ backend_router.include_router(create_deepseek_web_router())
 backend_router.include_router(create_user_answer_router(
   application_runtime.require_user_answer_store(),
   application_runtime.require_user_answer_grading(),
+  application_runtime.require_user_answer_review(),
 ))
 backend_router.include_router(create_knowledge_router(application_runtime))
 backend_router.include_router(create_pipeline_router(application_runtime))

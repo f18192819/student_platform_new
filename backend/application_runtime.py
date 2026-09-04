@@ -15,16 +15,32 @@ from .document_pipeline import DocumentPipeline, QDRANT_COLLECTION, local_mineru
 from .pipeline_orchestration import PipelineCoordinator
 from .question_pipeline import QUESTION_COLLECTION, QuestionPipeline
 from .question_relations import QuestionRelationPipeline
+from .learning_state import LearningStateStore
 from .user_answers import UserAnswerStore
-from .user_answer_grading import UserAnswerGradingCoordinator
+from .user_answer_grading import (
+  KnowledgeQuestionContextProvider,
+  UserAnswerGradingCoordinator,
+  UserAnswerGradingService,
+)
+from .user_answer_review import UserAnswerReviewService
 
 
 class ApplicationRuntime:
   """Owns process-scoped providers, workers, and application lifecycle."""
 
   def __init__(self) -> None:
+    self.learning_state = LearningStateStore()
     self.user_answer_store = UserAnswerStore()
-    self.user_answer_grading = UserAnswerGradingCoordinator(self.user_answer_store)
+    self.user_answer_contexts = KnowledgeQuestionContextProvider(self.learning_state)
+    self.user_answer_grading = UserAnswerGradingCoordinator(
+      self.user_answer_store,
+      service=UserAnswerGradingService(self.user_answer_store, self.user_answer_contexts),
+    )
+    self.user_answer_review = UserAnswerReviewService(
+      self.user_answer_store,
+      self.learning_state,
+      self.user_answer_contexts,
+    )
     self.document_pipeline: DocumentPipeline | None = None
     self.question_pipeline: QuestionPipeline | None = None
     self.question_relations: QuestionRelationPipeline | None = None
@@ -66,6 +82,9 @@ class ApplicationRuntime:
 
   def require_user_answer_grading(self) -> UserAnswerGradingCoordinator:
     return self.user_answer_grading
+
+  def require_user_answer_review(self) -> UserAnswerReviewService:
+    return self.user_answer_review
 
   def start(self) -> None:
     if self.document_pipeline is not None:

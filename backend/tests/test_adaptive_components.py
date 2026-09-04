@@ -449,6 +449,53 @@ class AdaptiveComponentTest(unittest.TestCase):
 
       self.assertEqual(['q1'], list(history))
 
+  def test_external_homework_evidence_affects_concepts_not_question_exposure(self):
+    external = event(
+      question_id='homework-q', concepts=['concept-a'], correct=False, score=0.4,
+    ).model_copy(update={
+      'lecture_document_id': '',
+      'source_type': 'self-submitted-homework',
+      'test_session_id': 'user-answer:attempt-1',
+    })
+
+    class Events:
+      def for_lecture(self, *_args):
+        return []
+
+      def for_course(self, *_args):
+        return [external]
+
+      def for_session(self, *_args):
+        return []
+
+      def question_history_for_lecture(self, *_args):
+        return {}
+
+    class Selection:
+      def __init__(self):
+        self.lecture_events = []
+        self.question_history = None
+
+      def rank(self, _session, candidates, lecture_events, _session_events, question_history):
+        self.lecture_events = lecture_events
+        self.question_history = question_history
+        return candidates
+
+    service = AdaptiveTestingService.__new__(AdaptiveTestingService)
+    service.repositories = SimpleNamespace(events=Events())
+    service.selection_strategy = Selection()
+    service._cached_assessment_spec = lambda *_args: SimpleNamespace()
+    service._prefetch_assessments = lambda *_args, **_kwargs: None
+    session = AdaptiveTestSession(
+      id='session', course_id='c1', lecture_document_id='lecture-1', target_question_count=1,
+    )
+
+    selected = service._select_next(session, [candidate('lecture-q')])
+
+    self.assertEqual('lecture-q', selected)
+    self.assertEqual([external.id], [item.id for item in service.selection_strategy.lecture_events])
+    self.assertEqual({}, service.selection_strategy.question_history)
+
 
 if __name__ == '__main__':
   unittest.main()

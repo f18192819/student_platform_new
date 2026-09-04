@@ -46,12 +46,14 @@ export type UserAnswerGrading = {
   feedback: string
   error_types: string[]
   errors: Array<{
+    id: string
     type: string
     location: string
     student_reasoning: string
     problem: string
     correction: string
     severity: 'low' | 'medium' | 'high'
+    deduction: number
   }>
   knowledge_points: Array<{
     name: string
@@ -61,6 +63,30 @@ export type UserAnswerGrading = {
   correct_parts: string[]
   improvement_suggestions: string[]
   is_wrong: boolean
+}
+
+export type ReviewedError = {
+  id: string
+  source: 'ai' | 'user'
+  accepted: boolean
+  type: string
+  location: string
+  student_reasoning: string
+  problem: string
+  correction: string
+  severity: 'low' | 'medium' | 'high'
+  deduction: number
+}
+
+export type UserAnswerQuestionReview = {
+  revision: number
+  question_id: string
+  base_grading_revision: number
+  errors: ReviewedError[]
+  final_score: number
+  final_correct: boolean
+  reviewed_at: string
+  learning_event_id: string
 }
 
 export type UserAnswerQuestionResult = {
@@ -99,6 +125,8 @@ export type UserQuestionAnswer = {
   graded_at: string
   grading_error: string
   question_results: UserAnswerQuestionResult[]
+  grading_revisions: Array<{ revision: number }>
+  manual_review_revisions: UserAnswerQuestionReview[]
 }
 
 export type UserAnswerAttemptSummary = {
@@ -173,6 +201,38 @@ export async function retryUserAnswerGrading(identity: QuestionAnswerIdentity, a
     method: 'POST',
   })
   if (!response.ok) throw new Error(await responseError(response))
+}
+
+export async function saveUserAnswerQuestionReview(
+  identity: QuestionAnswerIdentity,
+  attemptId: string,
+  questionId: string,
+  payload: {
+    base_grading_revision: number
+    errors: Array<Partial<ReviewedError> & Pick<ReviewedError, 'id' | 'source' | 'accepted'>>
+  },
+) {
+  const response = await fetch(
+    `${answerPath(identity)}/attempts/${encodeURIComponent(attemptId)}/questions/${encodeURIComponent(questionId)}/review`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  )
+  if (!response.ok) throw new Error(await responseError(response))
+  return await response.json() as { answer: UserQuestionAnswer; review: UserAnswerQuestionReview }
+}
+
+export function effectiveQuestionReview(attempt: UserQuestionAnswer, questionId: string) {
+  const gradingRevision = attempt.grading_revisions?.length ?? 0
+  return [...(attempt.manual_review_revisions ?? [])].reverse().find((review) => (
+    review.question_id === questionId && review.base_grading_revision === gradingRevision
+  )) ?? null
+}
+
+export function effectiveQuestionScore(attempt: UserQuestionAnswer, result: UserAnswerQuestionResult) {
+  return effectiveQuestionReview(attempt, result.question_id)?.final_score ?? result.grading.score
 }
 
 export async function deleteUserQuestionAnswer(identity: QuestionAnswerIdentity) {

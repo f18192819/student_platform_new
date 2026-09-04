@@ -16,6 +16,7 @@ class SessionRepository(Protocol):
 class EventRepository(Protocol):
   def for_session(self, course_id: str, session_id: str) -> list[LearningEvent]: ...
   def for_lecture(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]: ...
+  def for_course(self, course_id: str) -> list[LearningEvent]: ...
   def question_history_for_lecture(
     self,
     course_id: str,
@@ -53,6 +54,9 @@ class StoreEventRepository:
 
   def for_lecture(self, course_id: str, lecture_document_id: str) -> list[LearningEvent]:
     return self._store.effective_lecture_events(course_id, lecture_document_id)
+
+  def for_course(self, course_id: str) -> list[LearningEvent]:
+    return self._store.effective_course_events(course_id)
 
   def question_history_for_lecture(
     self,

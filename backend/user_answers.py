@@ -37,6 +37,10 @@ class UserAnswerCorruptionError(UserAnswerError):
   """Raised when durable answer metadata exists but cannot be trusted."""
 
 
+class UserAnswerConflictError(UserAnswerError):
+  """Raised when a write is based on an obsolete grading revision."""
+
+
 class UserAnswerAttemptSummary(BaseModel):
   id: str
   attempt_number: int
@@ -97,12 +101,50 @@ ErrorType = Literal[
 
 
 class ErrorAnalysis(BaseModel):
+  id: str = ''
   type: ErrorType
   location: str = ''
   student_reasoning: str = ''
   problem: str = ''
   correction: str = ''
   severity: Literal['low', 'medium', 'high'] = 'medium'
+  deduction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+def normalize_error_deductions(grading: 'UserAnswerGrading') -> 'UserAnswerGrading':
+  """Make every score reduction explicit and reproducible."""
+  target = max(0.0, min(1.0, 1.0 - float(grading.score)))
+  errors = [error for error in grading.errors if error.type != 'no_error']
+  if target > 0 and not errors:
+    errors = [ErrorAnalysis(
+      id='ai-error-1',
+      type='uncertain',
+      problem='AI did not itemize the reason for this score reduction.',
+      deduction=target,
+    )]
+  if not errors:
+    return grading.model_copy(update={'errors': []})
+
+  supplied = [max(0.0, float(error.deduction)) for error in errors]
+  weights = supplied if sum(supplied) > 0 else [
+    {'low': 1.0, 'medium': 2.0, 'high': 4.0}[error.severity] for error in errors
+  ]
+  total_weight = sum(weights)
+  deductions: list[float] = []
+  allocated = 0.0
+  for index, weight in enumerate(weights):
+    deduction = target - allocated if index == len(weights) - 1 else target * weight / total_weight
+    deduction = max(0.0, min(1.0, deduction))
+    deductions.append(deduction)
+    allocated += deduction
+  normalized = [
+    error.model_copy(update={
+      'id': f'ai-error-{index + 1}',
+      'deduction': deductions[index],
+    })
+    for index, error in enumerate(errors)
+  ]
+  return grading.model_copy(update={'errors': normalized})
 
 
 class KnowledgePointEvidence(BaseModel):
@@ -145,6 +187,30 @@ class UserAnswerGradingRevision(BaseModel):
   question_results: list[UserAnswerQuestionResult] = Field(default_factory=list)
 
 
+class ReviewedError(BaseModel):
+  id: str
+  source: Literal['ai', 'user']
+  accepted: bool = True
+  type: ErrorType
+  location: str = ''
+  student_reasoning: str = ''
+  problem: str = ''
+  correction: str = ''
+  severity: Literal['low', 'medium', 'high'] = 'medium'
+  deduction: float = Field(ge=0.0, le=1.0)
+
+
+class UserAnswerQuestionReview(BaseModel):
+  revision: int = Field(ge=1)
+  question_id: str
+  base_grading_revision: int = Field(ge=1)
+  errors: list[ReviewedError] = Field(default_factory=list)
+  final_score: float = Field(ge=0.0, le=1.0)
+  final_correct: bool
+  reviewed_at: str
+  learning_event_id: str = ''
+
+
 class UserQuestionAnswer(BaseModel):
   id: str
   attempt_number: int = 1
@@ -176,6 +242,7 @@ class UserQuestionAnswer(BaseModel):
   grading_error: str = ''
   question_results: list[UserAnswerQuestionResult] = Field(default_factory=list)
   grading_revisions: list[UserAnswerGradingRevision] = Field(default_factory=list)
+  manual_review_revisions: list[UserAnswerQuestionReview] = Field(default_factory=list)
 
 
 # Compatibility name retained for the first-stage frontend/API contract.
@@ -277,7 +344,20 @@ class UserAnswerStore:
       return UserQuestionAnswerRecord()
     try:
       payload = json.loads(path.read_text(encoding='utf-8'))
-      return UserQuestionAnswerRecord.model_validate(payload)
+      record = UserQuestionAnswerRecord.model_validate(payload)
+      for attempt in record.attempts:
+        attempt.grading = normalize_error_deductions(attempt.grading) if attempt.grading else None
+        attempt.question_results = [
+          result.model_copy(update={'grading': normalize_error_deductions(result.grading)})
+          for result in attempt.question_results
+        ]
+        for revision in attempt.grading_revisions:
+          revision.grading = normalize_error_deductions(revision.grading)
+          revision.question_results = [
+            result.model_copy(update={'grading': normalize_error_deductions(result.grading)})
+            for result in revision.question_results
+          ]
+      return record
     except Exception as exc:
       raise UserAnswerCorruptionError(
         f'User answer metadata is damaged ({path.name}). Restore record.json.bak before retrying.',
@@ -304,8 +384,18 @@ class UserAnswerStore:
   def _summary(attempt: UserQuestionAnswer) -> UserAnswerAttemptSummary:
     grading = attempt.grading
     question_gradings = [item.grading for item in attempt.question_results]
+    grading_revision = len(attempt.grading_revisions)
+    effective_reviews = {
+      review.question_id: review
+      for review in attempt.manual_review_revisions
+      if review.base_grading_revision == grading_revision
+    }
     score = (
-      sum(item.score for item in question_gradings) / len(question_gradings)
+      sum(
+        effective_reviews[result.question_id].final_score
+        if result.question_id in effective_reviews else result.grading.score
+        for result in attempt.question_results
+      ) / len(attempt.question_results)
       if question_gradings else (grading.score if grading else None)
     )
     return UserAnswerAttemptSummary(
@@ -315,10 +405,17 @@ class UserAnswerStore:
       updated_at=attempt.updated_at,
       processing_status=attempt.processing_status,
       score=score,
-      correct=(all(item.correct for item in question_gradings) if question_gradings else (
+      correct=(all(
+        effective_reviews[result.question_id].final_correct
+        if result.question_id in effective_reviews else result.grading.correct
+        for result in attempt.question_results
+      ) if question_gradings else (
         grading.correct if grading else None
       )),
-      needs_review=(any(item.needs_review for item in question_gradings) if question_gradings else (
+      needs_review=(any(
+        result.grading.needs_review and result.question_id not in effective_reviews
+        for result in attempt.question_results
+      ) if question_gradings else (
         grading.needs_review if grading else attempt.processing_status == 'needs_review'
       )),
       asset_count=len(attempt.assets),
@@ -612,6 +709,10 @@ class UserAnswerStore:
   ) -> UserQuestionAnswer:
     if not question_results:
       raise UserAnswerValidationError('Document grading produced no question results.')
+    question_results = [
+      result.model_copy(update={'grading': normalize_error_deductions(result.grading)})
+      for result in question_results
+    ]
     with self._lock:
       record = self._read_record(course_id, question_id)
       attempt = next((item for item in record.attempts if item.id == attempt_id), None)
@@ -645,6 +746,40 @@ class UserAnswerStore:
       attempt.updated_at = timestamp
       self._write_record(course_id, question_id, record)
       return attempt
+
+  def save_manual_review(
+    self,
+    course_id: str,
+    question_id: str,
+    attempt_id: str,
+    review: UserAnswerQuestionReview,
+  ) -> tuple[UserQuestionAnswer, UserAnswerQuestionReview, bool]:
+    with self._lock:
+      record = self._read_record(course_id, question_id)
+      attempt = next((item for item in record.attempts if item.id == attempt_id), None)
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      if review.base_grading_revision != len(attempt.grading_revisions):
+        raise UserAnswerConflictError('The AI grading changed. Review the latest result before saving again.')
+      comparable = review.model_dump(exclude={'revision', 'reviewed_at', 'learning_event_id'})
+      latest = next((
+        item for item in reversed(attempt.manual_review_revisions)
+        if item.question_id == review.question_id
+        and item.base_grading_revision == review.base_grading_revision
+      ), None)
+      if latest and latest.model_dump(exclude={'revision', 'reviewed_at', 'learning_event_id'}) == comparable:
+        return attempt, latest, False
+      expected_revision = max((
+        item.revision for item in attempt.manual_review_revisions
+        if item.question_id == review.question_id
+      ), default=0) + 1
+      if review.revision != expected_revision:
+        raise UserAnswerConflictError('The manual review changed. Reload it before saving again.')
+      saved = review
+      attempt.manual_review_revisions.append(saved)
+      attempt.updated_at = _now()
+      self._write_record(course_id, question_id, record)
+      return attempt, saved, True
 
   def mark_failed(self, course_id: str, question_id: str, attempt_id: str, error: str) -> None:
     with self._lock:
