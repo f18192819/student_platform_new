@@ -5,7 +5,7 @@ import mimetypes
 import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import requests
@@ -137,11 +137,22 @@ class DeepSeekWebBridgeClient:
     )
     return self._json(response)
 
-  def chat(self, base_url: str, prompt: str, *, timeout: float = 180) -> str:
+  def chat(
+    self,
+    base_url: str,
+    prompt: str,
+    *,
+    response_format: Literal['text', 'json'] = 'text',
+    timeout: float = 180,
+  ) -> str:
     response = self._request(
       self._post,
       f'{normalize_bridge_url(base_url)}/v1/chat',
-      json={'prompt': prompt, 'conversation_id': None},
+      json={
+        'prompt': prompt,
+        'conversation_id': None,
+        'response_format': response_format,
+      },
       timeout=timeout,
     )
     text = str(self._json(response).get('text') or '').strip()
@@ -155,6 +166,7 @@ class DeepSeekWebBridgeClient:
     paths: Sequence[Path],
     *,
     prompt: str = '',
+    response_format: Literal['text', 'json'] = 'text',
     timeout: float = 300,
   ) -> str:
     handles = []
@@ -168,7 +180,7 @@ class DeepSeekWebBridgeClient:
       response = self._request(
         self._post,
         f'{normalize_bridge_url(base_url)}/v1/ocr',
-        data={'prompt': prompt},
+        data={'prompt': prompt, 'response_format': response_format},
         files=files,
         timeout=timeout,
       )

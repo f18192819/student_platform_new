@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from .browser import PersistentBrowser, SerializedBrowserTasks
 
@@ -79,16 +79,21 @@ class DeepSeekWebClient:
 
     return await self.tasks.run(operation)
 
-  async def chat(self, prompt: str) -> str:
+  async def chat(self, prompt: str, response_format: Literal['text', 'json'] = 'text') -> str:
     async def operation() -> str:
       page = await self._ready_page()
       await self._new_chat(page)
       await self._send_prompt(page, prompt)
-      return await self._wait_and_extract(page)
+      return await self._wait_and_extract(page, response_format=response_format)
 
     return await self.tasks.run(operation)
 
-  async def ocr(self, files: Sequence[Path], prompt: str = '') -> str:
+  async def ocr(
+    self,
+    files: Sequence[Path],
+    prompt: str = '',
+    response_format: Literal['text', 'json'] = 'text',
+  ) -> str:
     async def operation() -> str:
       page = await self._ready_page()
       await self._new_chat(page)
@@ -114,7 +119,7 @@ class DeepSeekWebClient:
       except Exception as exc:
         raise BridgeOperationError('upload_failed', '图片上传失败。') from exc
       await self._send_prompt(page, prompt.strip() or DEFAULT_OCR_PROMPT)
-      return await self._wait_and_extract(page)
+      return await self._wait_and_extract(page, response_format=response_format)
 
     return await self.tasks.run(operation)
 
@@ -221,7 +226,12 @@ class DeepSeekWebClient:
         nearby.append((box['x'], candidate))
     return max(nearby, key=lambda item: item[0])[1] if nearby else None
 
-  async def _wait_and_extract(self, page, timeout_seconds: float | None = None) -> str:
+  async def _wait_and_extract(
+    self,
+    page,
+    timeout_seconds: float | None = None,
+    response_format: Literal['text', 'json'] = 'text',
+  ) -> str:
     timeout_seconds = timeout_seconds or self.generation_timeout
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     stable_text = ''
@@ -239,7 +249,11 @@ class DeepSeekWebClient:
           continue
       stop_visible = await self._stop_button_visible(page)
       generation_started = generation_started or stop_visible
-      answer = await self._latest_answer(page)
+      answer = (
+        await self._latest_structured_answer(page)
+        if response_format == 'json'
+        else await self._latest_answer(page)
+      )
       if answer and answer == stable_text:
         stable_rounds += 1
       else:
@@ -258,6 +272,26 @@ class DeepSeekWebClient:
     raise BridgeOperationError('generation_timeout', 'DeepSeek 网页生成超时。')
 
   async def _latest_answer(self, page) -> str:
+    locator = await self._latest_answer_locator(page)
+    if locator is not None:
+      text = (await locator.inner_text()).strip()
+      if text:
+        return text
+    return ''
+
+  async def _latest_structured_answer(self, page) -> str:
+    locator = await self._latest_answer_locator(page)
+    if locator is not None:
+      for selector in ('pre code', 'pre', 'code'):
+        code = locator.locator(selector)
+        if await code.count():
+          text = (await code.last.text_content() or '').strip()
+          if text:
+            return text
+    return await self._latest_answer(page)
+
+  @staticmethod
+  async def _latest_answer_locator(page):
     selectors = (
       '[data-message-author-role="assistant"]',
       '[data-role="assistant"]',
@@ -267,10 +301,8 @@ class DeepSeekWebClient:
     for selector in selectors:
       locator = page.locator(selector)
       if await locator.count():
-        text = (await locator.last.inner_text()).strip()
-        if text:
-          return text
-    return ''
+        return locator.last
+    return None
 
   @staticmethod
   async def _stop_button_visible(page) -> bool:

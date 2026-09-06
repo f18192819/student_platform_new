@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
   prompt: str = Field(min_length=1, max_length=200_000)
   conversation_id: str | None = None
+  response_format: Literal['text', 'json'] = 'text'
 
 
 class ChatResponse(BaseModel):

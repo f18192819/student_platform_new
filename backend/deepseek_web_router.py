@@ -39,7 +39,15 @@ def create_deepseek_web_router(
     prompt = str(payload.get('prompt') or '').strip()
     if not prompt:
       raise HTTPException(status_code=422, detail='prompt is required.')
-    text = await execute(bridge.chat, bridge_url(payload), prompt)
+    response_format = str(payload.get('response_format') or 'text')
+    if response_format not in {'text', 'json'}:
+      raise HTTPException(status_code=422, detail='response_format must be text or json.')
+    text = await execute(
+      bridge.chat,
+      bridge_url(payload),
+      prompt,
+      response_format=response_format,
+    )
     return {'text': text, 'provider': 'deepseek-web'}
 
   return router

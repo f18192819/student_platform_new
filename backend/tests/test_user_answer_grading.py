@@ -161,16 +161,22 @@ class WebBridgeClient:
     self.chat_calls = []
     self.transcription = transcription
 
-  def ocr(self, base_url, paths, *, prompt=''):
+  def ocr(self, base_url, paths, *, prompt='', response_format='text'):
     self.calls.append({
       'base_url': base_url,
       'names': [path.name for path in paths],
       'prompt': prompt,
+      'response_format': response_format,
     })
     return self.transcription
 
-  def chat(self, base_url, prompt, *, timeout=180):
-    self.chat_calls.append({'base_url': base_url, 'prompt': prompt, 'timeout': timeout})
+  def chat(self, base_url, prompt, *, response_format='text', timeout=180):
+    self.chat_calls.append({
+      'base_url': base_url,
+      'prompt': prompt,
+      'response_format': response_format,
+      'timeout': timeout,
+    })
     return json.dumps({
       'score': 1.0,
       'correct': True,
@@ -433,10 +439,14 @@ line two with "P point" and \\frac{1}{2}","steps":[],"final_answer":"1/2","block
     self.assertEqual(2, len(web_ocr.calls[0]['names']))
     self.assertIn('You reconstruct handwritten mathematics', web_ocr.calls[0]['prompt'])
     self.assertIn('\n\nINPUT:\n', web_ocr.calls[0]['prompt'])
+    self.assertIn('```json', web_ocr.calls[0]['prompt'])
+    self.assertEqual('json', web_ocr.calls[0]['response_format'])
     self.assertEqual([], text_grader.calls)
     self.assertEqual(1, len(web_ocr.chat_calls))
     self.assertIn('web page one', web_ocr.chat_calls[0]['prompt'])
     self.assertIn('reference_answer', web_ocr.chat_calls[0]['prompt'])
+    self.assertIn('```json', web_ocr.chat_calls[0]['prompt'])
+    self.assertEqual('json', web_ocr.chat_calls[0]['response_format'])
     self.assertEqual('web page one\nweb page two', understanding.transcription)
     self.assertEqual('deepseek-web', model)
     self.assertTrue(grading.correct)

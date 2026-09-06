@@ -78,6 +78,21 @@ IMAGE_CONTENT_TYPES = {
 
 logger = logging.getLogger(__name__)
 
+WEB_JSON_TRANSPORT_INSTRUCTION = '''
+只输出一个 ```json 代码块。
+所有 JSON 必须位于代码块内。
+不要在代码块外输出任何说明。
+数学表达式必须保留 LaTeX。JSON 字符串中的反斜杠必须正确转义，例如：
+"$\\\\vec{E}$"
+"$\\\\frac{1}{2}$"
+"$\\\\varepsilon_0$"
+"$\\\\mathbf{S}=\\\\vec{E}\\\\times\\\\vec{H}$"
+'''.strip()
+
+
+def _web_structured_prompt(prompt: str) -> str:
+  return f'{prompt.rstrip()}\n\n{WEB_JSON_TRANSPORT_INSTRUCTION}'
+
 
 class UserAnswerGradingError(RuntimeError):
   pass
@@ -425,7 +440,8 @@ class UserAnswerGradingService:
         raw = self.web_bridge_client.ocr(
           str(config.get('deepseekWebBridgeUrl') or '').strip(),
           [path for path, _ in images],
-          prompt=prompt,
+          prompt=_web_structured_prompt(prompt),
+          response_format='json',
         )
       except DeepSeekWebBridgeError as exc:
         raise UserAnswerGradingError(str(exc)) from exc
@@ -539,7 +555,12 @@ class UserAnswerGradingService:
         }, ensure_ascii=False),
       ])
       try:
-        raw = self.web_bridge_client.chat(bridge_url, prompt, timeout=180)
+        raw = self.web_bridge_client.chat(
+          bridge_url,
+          _web_structured_prompt(prompt),
+          response_format='json',
+          timeout=180,
+        )
         return extract_web_json_object(raw), 'deepseek-web'
       except DeepSeekWebBridgeError as exc:
         raise UserAnswerGradingError(str(exc)) from exc

@@ -5,7 +5,7 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Literal, Protocol, Sequence
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
@@ -25,8 +25,13 @@ MAX_FILES = 16
 class BridgeClient(Protocol):
   async def open_browser(self) -> dict[str, bool]: ...
   async def status(self) -> dict[str, bool]: ...
-  async def chat(self, prompt: str) -> str: ...
-  async def ocr(self, files: Sequence[Path], prompt: str = '') -> str: ...
+  async def chat(self, prompt: str, response_format: Literal['text', 'json'] = 'text') -> str: ...
+  async def ocr(
+    self,
+    files: Sequence[Path],
+    prompt: str = '',
+    response_format: Literal['text', 'json'] = 'text',
+  ) -> str: ...
 
 
 def _http_error(exc: BridgeOperationError) -> HTTPException:
@@ -71,12 +76,16 @@ def create_bridge_app(client: BridgeClient | None = None) -> FastAPI:
   @app.post('/v1/chat', response_model=ChatResponse)
   async def chat(request: ChatRequest):
     try:
-      return ChatResponse(text=await client.chat(request.prompt))
+      return ChatResponse(text=await client.chat(request.prompt, request.response_format))
     except BridgeOperationError as exc:
       raise _http_error(exc) from exc
 
   @app.post('/v1/ocr', response_model=OcrResponse)
-  async def ocr(prompt: str = Form(default=''), files: list[UploadFile] = File(...)):
+  async def ocr(
+    prompt: str = Form(default=''),
+    response_format: Literal['text', 'json'] = Form(default='text'),
+    files: list[UploadFile] = File(...),
+  ):
     if not files or len(files) > MAX_FILES:
       raise HTTPException(
         status_code=422,
@@ -101,7 +110,7 @@ def create_bridge_app(client: BridgeClient | None = None) -> FastAPI:
         path.write_bytes(content)
         paths.append(path)
       try:
-        text = await client.ocr(paths, prompt)
+        text = await client.ocr(paths, prompt, response_format)
       except BridgeOperationError as exc:
         raise _http_error(exc) from exc
     return OcrResponse(text=text, page_count=len(paths))
