@@ -18,6 +18,13 @@ import { userAnswerGradingLabel } from './questionAnswerState'
 
 const ACCEPTED_ANSWERS = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
 
+function attemptDeletionMessage(attemptNumber: number, attemptCount: number) {
+  const originalAssetAction = attemptCount > 1
+    ? '- 原始答案文件将保留，直到该文档的最后一条作答记录被删除'
+    : '- 原始答案文件'
+  return `确定删除 Attempt ${attemptNumber} 吗？\n\n将同时删除：\n${originalAssetAction}\n- 本次 MinerU/识别结果\n- 本次 AI 批改记录\n- 本次人工复核记录\n- 本次对学习状态产生的知识点证据\n\n此操作不可恢复。`
+}
+
 function MathContent({ children }: { children: string }) {
   return (
     <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
@@ -390,7 +397,7 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
                       onClick={(event) => {
                         event.stopPropagation()
                         const confirmed = window.confirm(
-                          `确定删除 Attempt ${attempt.attempt_number} 吗？\n\n将同时删除：\n- 原始答案文件\n- MinerU/识别结果\n- AI 批改记录\n- 人工复核记录\n- 对学习状态产生的知识点证据\n\n此操作不可恢复。`,
+                          attemptDeletionMessage(attempt.attempt_number, attempts.length),
                         )
                         if (!confirmed) return
                         const currentIndex = attempts.findIndex((item) => item.id === attempt.id)

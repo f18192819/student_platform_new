@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -8,6 +10,7 @@ from fastapi.responses import FileResponse
 from .user_answers import (
   UserAnswerCorruptionError,
   UserAnswerConflictError,
+  UserAnswerDeletionError,
   UserAnswerError,
   UserAnswerNotFound,
   UserAnswerStore,
@@ -15,6 +18,9 @@ from .user_answers import (
 )
 from .user_answer_grading import UserAnswerGradingCoordinator
 from .user_answer_review import SaveQuestionReviewRequest, UserAnswerReviewService
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_user_answer_router(
@@ -29,6 +35,8 @@ def create_user_answer_router(
       return HTTPException(status_code=404, detail=str(error))
     if isinstance(error, UserAnswerConflictError):
       return HTTPException(status_code=409, detail=str(error))
+    if isinstance(error, UserAnswerDeletionError):
+      return HTTPException(status_code=error.status_code, detail=str(error))
     if isinstance(error, UserAnswerValidationError):
       return HTTPException(status_code=422, detail=str(error))
     if isinstance(error, UserAnswerCorruptionError):
@@ -142,6 +150,7 @@ def create_user_answer_router(
     question_id: str,
     attempt_id: str,
   ) -> dict:
+    frozen = False
     try:
       attempt = await asyncio.to_thread(
         store.get_attempt, course_id, source_document_id, question_id, attempt_id,
@@ -151,6 +160,7 @@ def create_user_answer_router(
       forget = getattr(grading, 'forget_attempt', None)
       if callable(forget):
         forget(course_id, attempt_id)
+        frozen = True
       if review is not None:
         _, remaining = await asyncio.to_thread(
           review.delete_attempt,
@@ -173,7 +183,35 @@ def create_user_answer_router(
         'remaining_attempts': remaining,
       }
     except UserAnswerError as error:
+      restore = getattr(grading, 'restore_attempt', None)
+      if frozen and callable(restore):
+        restore(course_id, attempt_id)
+      if not isinstance(error, UserAnswerNotFound):
+        logger.exception(
+          'Failed deleting user answer attempt',
+          extra={
+            'course_id': course_id,
+            'source_document_id': source_document_id,
+            'attempt_id': attempt_id,
+          },
+        )
       raise translate(error) from error
+    except (OSError, sqlite3.Error) as error:
+      restore = getattr(grading, 'restore_attempt', None)
+      if frozen and callable(restore):
+        restore(course_id, attempt_id)
+      logger.exception(
+        'Failed deleting user answer attempt',
+        extra={
+          'course_id': course_id,
+          'source_document_id': source_document_id,
+          'attempt_id': attempt_id,
+        },
+      )
+      raise HTTPException(
+        status_code=503,
+        detail='暂时无法删除该作答，请稍后重试。',
+      ) from error
 
   @router.post('/courses/{course_id}/documents/{source_document_id}/questions/{question_id}/attempts/{attempt_id}/grade')
   async def retry_grading(

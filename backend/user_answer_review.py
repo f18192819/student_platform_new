@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-from threading import RLock
+import logging
+import sqlite3
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -12,6 +14,8 @@ from .user_answers import (
   ErrorType,
   ReviewedError,
   UserAnswerConflictError,
+  UserAnswerDeletionError,
+  UserAnswerError,
   UserAnswerNotFound,
   UserAnswerQuestionResult,
   UserAnswerQuestionReview,
@@ -26,6 +30,8 @@ SELF_SUBMITTED_SOURCE_TYPES = {
   'homework': 'self-submitted-homework',
   'past-exam': 'self-submitted-past-exam',
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -140,11 +146,46 @@ class UserAnswerReviewService:
     attempt_id: str,
   ) -> tuple[UserQuestionAnswer, int]:
     with self._lock:
-      deleted, remaining = self.answers.delete_attempt(
+      if self.answers.get_attempt(
         course_id, source_document_id, route_question_id, attempt_id,
-      )
-      self.learning.delete_user_answer_events(course_id, [attempt_id])
-      return deleted, remaining
+      ) is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      session_id = f'user-answer:{attempt_id}'
+      previous_events = self.learning.session_events(course_id, session_id)
+      try:
+        # Zero deleted rows is valid for pending, failed, and unreviewed Attempts.
+        self.learning.delete_user_answer_events(course_id, [attempt_id])
+      except sqlite3.Error as error:
+        logger.exception(
+          'Failed removing learning evidence for user answer Attempt',
+          extra={'course_id': course_id, 'attempt_id': attempt_id},
+        )
+        raise UserAnswerDeletionError(
+          '暂时无法清理该作答的学习记录，请稍后重试。',
+          status_code=503,
+        ) from error
+      try:
+        return self.answers.delete_attempt(
+          course_id, source_document_id, route_question_id, attempt_id,
+        )
+      except UserAnswerError:
+        attempt_still_exists = self.answers.get_attempt(
+          course_id, source_document_id, route_question_id, attempt_id,
+        ) is not None
+        if attempt_still_exists:
+          try:
+            for event in previous_events:
+              self.learning.append_event(event)
+          except sqlite3.Error as restore_error:
+            logger.exception(
+              'Failed restoring learning evidence after user answer deletion rollback',
+              extra={'course_id': course_id, 'attempt_id': attempt_id},
+            )
+            raise UserAnswerDeletionError(
+              '删除未完成，且学习记录恢复失败，请停止操作并检查服务日志。',
+              status_code=503,
+            ) from restore_error
+        raise
 
   @staticmethod
   def _question_result(attempt: UserQuestionAnswer, question_id: str) -> UserAnswerQuestionResult:

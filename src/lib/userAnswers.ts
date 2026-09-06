@@ -157,8 +157,18 @@ function answerPath(identity: QuestionAnswerIdentity) {
 }
 
 async function responseError(response: Response) {
-  const payload = await response.json().catch(() => null) as { detail?: string } | null
-  return payload?.detail || `请求失败（${response.status}）`
+  const payload = await response.json().catch(() => null) as {
+    detail?: string | { message?: string }
+  } | null
+  const detail = typeof payload?.detail === 'string' ? payload.detail : payload?.detail?.message
+  if (import.meta.env?.DEV) {
+    console.error('User answer request failed', {
+      url: response.url,
+      status: response.status,
+      detail,
+    })
+  }
+  return detail || `请求失败（${response.status}）`
 }
 
 export async function loadUserQuestionAnswerAttempts(identity: QuestionAnswerIdentity, signal?: AbortSignal) {

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from backend.learning_state import LearningStateStore
+from backend.user_answer_router import create_user_answer_router
 from backend.user_answer_review import (
   ReviewErrorInput,
   SaveQuestionReviewRequest,
@@ -183,6 +189,127 @@ class UserAnswerReviewTest(unittest.TestCase):
     self.assertIsNone(self.answers.get_attempt(
       'course-1', 'document-1', 'route-question', self.attempt.id,
     ))
+
+  def _delete_client(self, grading=None):
+    app = FastAPI()
+    app.include_router(create_user_answer_router(
+      self.answers,
+      grading or SimpleNamespace(forget_attempt=lambda *_args: False),
+      self.service,
+    ))
+    return TestClient(app)
+
+  def _attempt_url(self) -> str:
+    return (
+      '/api/user-answers/courses/course-1/documents/document-1/questions/route-question/'
+      f'attempts/{self.attempt.id}'
+    )
+
+  def test_production_router_delete_cleans_review_event_metadata_backup_and_files(self):
+    self.service.save(
+      'course-1', 'document-1', 'route-question', self.attempt.id, 'q1', self.request(),
+    )
+    question_dir = self.answers._question_dir('course-1', self.attempt.question_id)
+    record_path = question_dir / 'record.json'
+    attempt_dir = question_dir / 'attempts' / self.attempt.id
+    self.assertEqual(1, len(self.learning.course_events('course-1')))
+
+    response = self._delete_client().delete(self._attempt_url())
+
+    self.assertEqual(200, response.status_code)
+    self.assertIsNone(self.answers.get_attempt(
+      'course-1', 'document-1', 'route-question', self.attempt.id,
+    ))
+    self.assertFalse(attempt_dir.exists())
+    for path in (record_path, record_path.with_name('record.json.bak')):
+      if path.is_file():
+        self.assertNotIn(self.attempt.id, path.read_text(encoding='utf-8'))
+    self.assertEqual([], self.learning.course_events('course-1'))
+    self.assertEqual(404, self._delete_client().delete(self._attempt_url()).status_code)
+
+  def test_router_intermediate_delete_skips_locked_original_and_cleans_derived_state(self):
+    self.service.save(
+      'course-1', 'document-1', 'route-question', self.attempt.id, 'q1', self.request(),
+    )
+    second = self.answers.replace(
+      'course-1', 'document-1', 'route-question', 'homework', [upload()],
+    )
+    question_dir = self.answers._question_dir('course-1', self.attempt.question_id)
+    retained_dir = question_dir / 'attempts' / self.attempt.id
+
+    with patch(
+      'backend.user_answers.shutil.rmtree',
+      side_effect=AssertionError('intermediate deletion must not touch original assets'),
+    ):
+      response = self._delete_client().delete(self._attempt_url())
+
+    self.assertEqual(200, response.status_code)
+    self.assertEqual(1, response.json()['remaining_attempts'])
+    self.assertTrue((retained_dir / 'assets').is_dir())
+    self.assertTrue((retained_dir / '.retained-original.json').is_file())
+    self.assertIsNone(self.answers.get_attempt(
+      'course-1', 'document-1', 'route-question', self.attempt.id,
+    ))
+    self.assertIsNotNone(self.answers.get_attempt(
+      'course-1', 'document-1', 'route-question', second.id,
+    ))
+    self.assertEqual([], self.learning.course_events('course-1'))
+
+  def test_attempt_without_learning_event_deletes_successfully(self):
+    self.answers.mark_failed(
+      'course-1', self.attempt.question_id, self.attempt.id, 'provider failed',
+    )
+    self.assertEqual([], self.learning.course_events('course-1'))
+    response = self._delete_client().delete(self._attempt_url())
+    self.assertEqual(200, response.status_code)
+
+  def test_sqlite_failure_keeps_attempt_and_returns_stable_json_error(self):
+    grading = SimpleNamespace(
+      forget_attempt=lambda *_args: False,
+      restore_attempt=lambda *_args: None,
+    )
+    with patch.object(
+      self.learning,
+      'delete_user_answer_events',
+      side_effect=sqlite3.OperationalError('database is locked'),
+    ):
+      response = self._delete_client(grading).delete(self._attempt_url())
+
+    self.assertEqual(503, response.status_code)
+    self.assertIn('学习记录', response.json()['detail'])
+    self.assertIsNotNone(self.answers.get_attempt(
+      'course-1', 'document-1', 'route-question', self.attempt.id,
+    ))
+
+  def test_persistent_windows_file_lock_returns_conflict_instead_of_500(self):
+    with (
+      patch('backend.user_answers.DELETE_RETRY_DELAYS_SECONDS', (0, 0, 0, 0)),
+      patch(
+        'backend.user_answers.shutil.rmtree',
+        side_effect=PermissionError('file is in use'),
+      ),
+    ):
+      response = self._delete_client().delete(self._attempt_url())
+
+    self.assertEqual(409, response.status_code)
+    self.assertIn('正在被使用', response.json()['detail'])
+
+  def test_file_move_failure_restores_learning_evidence_and_attempt(self):
+    self.service.save(
+      'course-1', 'document-1', 'route-question', self.attempt.id, 'q1', self.request(),
+    )
+    self.assertEqual(1, len(self.learning.course_events('course-1')))
+    with (
+      patch('backend.user_answers.DELETE_RETRY_DELAYS_SECONDS', (0, 0, 0, 0)),
+      patch('backend.user_answers.Path.replace', side_effect=PermissionError('locked')),
+    ):
+      response = self._delete_client().delete(self._attempt_url())
+
+    self.assertEqual(409, response.status_code)
+    self.assertIsNotNone(self.answers.get_attempt(
+      'course-1', 'document-1', 'route-question', self.attempt.id,
+    ))
+    self.assertEqual(1, len(self.learning.course_events('course-1')))
 
 
 if __name__ == '__main__':

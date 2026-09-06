@@ -166,7 +166,9 @@ class UserAnswerStoreTest(unittest.TestCase):
     )
     self.assertNotIn(second.id, record_path.read_text(encoding='utf-8'))
     self.assertNotIn(second.id, record_path.with_name('record.json.bak').read_text(encoding='utf-8'))
-    self.assertFalse((record_path.parent / 'attempts' / second.id).exists())
+    retained_dir = record_path.parent / 'attempts' / second.id
+    self.assertTrue((retained_dir / 'assets').is_dir())
+    self.assertTrue((retained_dir / '.retained-original.json').is_file())
 
   def test_delete_current_and_last_attempt_updates_or_removes_record(self):
     first = self.store.replace(
@@ -184,6 +186,93 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertFalse(self.store._question_dir('course-1', 'q1').exists())
     with self.assertRaises(UserAnswerNotFound):
       self.store.delete_attempt('course-1', 'homework-1', 'q1', first.id)
+
+  def test_intermediate_delete_keeps_original_but_removes_attempt_projections(self):
+    first = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('first.png', 'image/png', PNG)],
+    )
+    second = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('second.png', 'image/png', PNG)],
+    )
+    self.store.save_mineru_projection(
+      'course-1', first.question_id, first.id,
+      status='completed', markdown='recognized answer', layout={'pages': [1]},
+    )
+    record_path = self.store._record_path('course-1', 'q1')
+    first_dir = record_path.parent / 'attempts' / first.id
+
+    with patch('backend.user_answers.shutil.rmtree', side_effect=AssertionError('must retain assets')):
+      deleted, remaining = self.store.delete_attempt(
+        'course-1', 'homework-1', 'q1', first.id,
+      )
+
+    self.assertEqual(first.id, deleted.id)
+    self.assertEqual(1, remaining)
+    self.assertTrue((first_dir / 'assets').is_dir())
+    self.assertTrue((first_dir / '.retained-original.json').is_file())
+    self.assertNotIn(first.id, record_path.read_text(encoding='utf-8'))
+    self.assertNotIn('recognized answer', record_path.read_text(encoding='utf-8'))
+
+    self.store.delete_attempt('course-1', 'homework-1', 'q1', second.id)
+    self.assertFalse(first_dir.exists())
+
+  def test_windows_file_lock_is_retried_before_attempt_deletion_succeeds(self):
+    answer = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('answer.png', 'image/png', PNG)],
+    )
+    real_replace = Path.replace
+    attempts = 0
+
+    def flaky_replace(path, target):
+      nonlocal attempts
+      if path.name == answer.id and attempts < 2:
+        attempts += 1
+        raise PermissionError('file is in use')
+      return real_replace(path, target)
+
+    with (
+      patch('backend.user_answers.DELETE_RETRY_DELAYS_SECONDS', (0, 0, 0, 0)),
+      patch.object(Path, 'replace', new=flaky_replace),
+    ):
+      deleted, remaining = self.store.delete_attempt(
+        'course-1', 'homework-1', 'q1', answer.id,
+      )
+
+    self.assertEqual(2, attempts)
+    self.assertEqual(answer.id, deleted.id)
+    self.assertEqual(0, remaining)
+
+  def test_stale_tombstone_cleanup_never_removes_an_active_attempt(self):
+    answer = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('answer.png', 'image/png', PNG)],
+    )
+    question_dir = self.store._question_dir('course-1', 'q1')
+    stale = question_dir / '.deleted-stale-attempt'
+    stale.mkdir()
+    (stale / 'asset').write_bytes(b'stale')
+    active_tombstone = question_dir / f'.deleted-{answer.id}'
+    active_tombstone.mkdir()
+
+    removed = self.store.cleanup_deleted_attempt_dirs()
+
+    self.assertEqual(1, removed)
+    self.assertFalse(stale.exists())
+    self.assertTrue(active_tombstone.exists())
+
+  def test_startup_cleanup_restores_active_attempt_from_tombstone(self):
+    answer = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('answer.png', 'image/png', PNG)],
+    )
+    question_dir = self.store._question_dir('course-1', 'q1')
+    attempt_dir = question_dir / 'attempts' / answer.id
+    tombstone = question_dir / f'.deleted-{answer.id}'
+    attempt_dir.replace(tombstone)
+
+    removed = self.store.cleanup_deleted_attempt_dirs()
+
+    self.assertEqual(0, removed)
+    self.assertTrue(attempt_dir.is_dir())
+    self.assertFalse(tombstone.exists())
 
   def test_missing_record_is_empty_but_corrupt_record_blocks_reads_and_reupload(self):
     self.assertIsNone(self.store.get('course-1', 'homework-1', 'q1'))

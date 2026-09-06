@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import json
+import logging
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +22,10 @@ USER_ANSWERS_ROOT = PROJECT_ROOT / '.runtime' / 'user-answers' / 'courses'
 MAX_ASSET_BYTES = 50 * 1024 * 1024
 MAX_ANSWER_BYTES = 100 * 1024 * 1024
 MAX_ASSETS_PER_ANSWER = 20
+DELETE_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4)
+RETAINED_ASSETS_MARKER = '.retained-original.json'
+
+logger = logging.getLogger(__name__)
 
 
 class UserAnswerError(Exception):
@@ -39,6 +46,14 @@ class UserAnswerCorruptionError(UserAnswerError):
 
 class UserAnswerConflictError(UserAnswerError):
   """Raised when a write is based on an obsolete grading revision."""
+
+
+class UserAnswerDeletionError(UserAnswerError):
+  """Raised when an Attempt cannot be deleted without exposing partial state."""
+
+  def __init__(self, message: str, *, status_code: int = 409) -> None:
+    self.status_code = status_code
+    super().__init__(message)
 
 
 class UserAnswerAttemptSummary(BaseModel):
@@ -320,6 +335,43 @@ def _asset_format(filename: str, content_type: str, header: bytes) -> tuple[str,
   raise UserAnswerValidationError('Only PDF, PNG, JPG, JPEG, and WEBP answers are supported.')
 
 
+def _is_retryable_file_error(error: OSError) -> bool:
+  return (
+    isinstance(error, PermissionError)
+    or getattr(error, 'winerror', None) in {5, 32, 33}
+    or error.errno in {errno.EACCES, errno.EBUSY, errno.EPERM}
+  )
+
+
+def _retry_file_operation(operation, error_message: str) -> None:
+  for attempt in range(len(DELETE_RETRY_DELAYS_SECONDS) + 1):
+    try:
+      operation()
+      return
+    except OSError as error:
+      if not _is_retryable_file_error(error):
+        raise UserAnswerDeletionError(error_message) from error
+      if attempt == len(DELETE_RETRY_DELAYS_SECONDS):
+        raise UserAnswerDeletionError(error_message) from error
+      time.sleep(DELETE_RETRY_DELAYS_SECONDS[attempt])
+
+
+def _remove_tree_with_retry(path: Path) -> None:
+  if not path.exists():
+    return
+  _retry_file_operation(
+    lambda: shutil.rmtree(path),
+    '该作答文件暂时正在被使用，请关闭预览后稍后再次删除。',
+  )
+
+
+def _replace_with_retry(source: Path, target: Path) -> None:
+  _retry_file_operation(
+    lambda: source.replace(target),
+    '该作答文件暂时正在被使用，请关闭预览后稍后再次删除。',
+  )
+
+
 class UserAnswerStore:
   """Durable Question -> user-answer repository with attempt-ready metadata."""
 
@@ -331,6 +383,97 @@ class UserAnswerStore:
     self.root = root
     self.resolver = resolver or KnowledgeLibraryQuestionResolver()
     self._lock = RLock()
+
+  def cleanup_deleted_attempt_dirs(self) -> int:
+    """Remove tombstones only when durable metadata no longer references them."""
+    removed = 0
+    with self._lock:
+      for course_dir in self.root.iterdir() if self.root.is_dir() else []:
+        if not course_dir.is_dir():
+          continue
+        active_attempt_ids: set[str] = set()
+        active_document_ids: set[str] = set()
+        for question_dir in course_dir.iterdir():
+          record_path = question_dir / 'record.json'
+          if not question_dir.is_dir() or not record_path.is_file():
+            continue
+          try:
+            active_record = UserQuestionAnswerRecord.model_validate(
+              json.loads(record_path.read_text(encoding='utf-8')),
+            )
+          except (OSError, ValueError):
+            continue
+          active_attempt_ids.update(attempt.id for attempt in active_record.attempts)
+          active_document_ids.update(attempt.source_document_id for attempt in active_record.attempts)
+        for question_dir in course_dir.iterdir():
+          if not question_dir.is_dir():
+            continue
+          record_path = question_dir / 'record.json'
+          try:
+            record = (
+              UserQuestionAnswerRecord.model_validate(json.loads(record_path.read_text(encoding='utf-8')))
+              if record_path.is_file() else UserQuestionAnswerRecord()
+            )
+          except (OSError, ValueError):
+            continue
+          active_ids = {attempt.id for attempt in record.attempts}
+          for tombstone in question_dir.glob('.deleted-*'):
+            attempt_id = tombstone.name.removeprefix('.deleted-')
+            if not attempt_id:
+              continue
+            if attempt_id in active_ids:
+              attempt_dir = question_dir / 'attempts' / attempt_id
+              if not attempt_dir.exists():
+                try:
+                  attempt_dir.parent.mkdir(parents=True, exist_ok=True)
+                  _replace_with_retry(tombstone, attempt_dir)
+                except UserAnswerDeletionError:
+                  logger.warning('Deferred restore for user answer tombstone %s', tombstone)
+              continue
+            try:
+              _remove_tree_with_retry(tombstone)
+              removed += 1
+            except UserAnswerDeletionError:
+              logger.warning('Deferred cleanup for user answer tombstone %s', tombstone)
+          attempts_dir = question_dir / 'attempts'
+          for retained_dir in attempts_dir.iterdir() if attempts_dir.is_dir() else []:
+            marker = retained_dir / RETAINED_ASSETS_MARKER
+            if not retained_dir.is_dir() or not marker.is_file() or retained_dir.name in active_attempt_ids:
+              continue
+            try:
+              payload = json.loads(marker.read_text(encoding='utf-8'))
+              source_document_id = str(payload.get('source_document_id') or '')
+            except (OSError, ValueError):
+              continue
+            if source_document_id in active_document_ids:
+              continue
+            try:
+              _remove_tree_with_retry(retained_dir)
+              removed += 1
+            except UserAnswerDeletionError:
+              logger.warning('Deferred cleanup for retained answer assets %s', retained_dir)
+    return removed
+
+  def _retained_asset_dirs_locked(
+    self,
+    course_id: str,
+    source_document_id: str,
+  ) -> list[Path]:
+    course_dir = self.root / safe_storage_name(course_id)
+    retained: list[Path] = []
+    for question_dir in course_dir.iterdir() if course_dir.is_dir() else []:
+      attempts_dir = question_dir / 'attempts'
+      for attempt_dir in attempts_dir.iterdir() if attempts_dir.is_dir() else []:
+        marker = attempt_dir / RETAINED_ASSETS_MARKER
+        if not attempt_dir.is_dir() or not marker.is_file():
+          continue
+        try:
+          payload = json.loads(marker.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+          continue
+        if str(payload.get('source_document_id') or '') == source_document_id:
+          retained.append(attempt_dir)
+    return retained
 
   def _question_dir(self, course_id: str, question_id: str) -> Path:
     return self.root / safe_storage_name(course_id) / safe_storage_name(question_id)
@@ -657,11 +800,28 @@ class UserAnswerStore:
       question_dir = self._question_dir(course_id, storage_question_id)
       attempt_dir = question_dir / 'attempts' / attempt_id
       tombstone_dir = question_dir / f'.deleted-{attempt_id}'
+      document_attempt_count = sum(
+        1 for _, current_record in records for attempt in current_record.attempts
+        if attempt.course_id == course_id and attempt.source_document_id == source_document_id
+      )
+      retain_original_assets = document_attempt_count > 1
       moved = False
-      if attempt_dir.is_dir():
+      if retain_original_assets and attempt_dir.is_dir():
+        try:
+          write_json_atomic(attempt_dir / RETAINED_ASSETS_MARKER, {
+            'attempt_id': attempt_id,
+            'source_document_id': source_document_id,
+            'retained_at': _now(),
+          })
+        except OSError as error:
+          raise UserAnswerDeletionError(
+            '无法保留仍被其他批改记录使用的原始作答文件，请稍后重试。',
+            status_code=503,
+          ) from error
+      elif attempt_dir.is_dir():
         if tombstone_dir.exists():
-          shutil.rmtree(tombstone_dir)
-        attempt_dir.replace(tombstone_dir)
+          _remove_tree_with_retry(tombstone_dir)
+        _replace_with_retry(attempt_dir, tombstone_dir)
         moved = True
       try:
         record.attempts = [attempt for attempt in record.attempts if attempt.id != attempt_id]
@@ -670,26 +830,37 @@ class UserAnswerStore:
           record.current_attempt_id = latest.id if latest else None
         record.schema_version = 4
         path = self._record_path(course_id, storage_question_id)
-        if record.attempts:
-          self._write_sanitized_record(course_id, storage_question_id, record)
-        else:
-          path.unlink(missing_ok=True)
-          self._backup_path(path).unlink(missing_ok=True)
-      except Exception:
+        self._write_sanitized_record(course_id, storage_question_id, record)
+      except Exception as error:
         if moved and tombstone_dir.is_dir() and not attempt_dir.exists():
-          tombstone_dir.replace(attempt_dir)
-        raise
+          try:
+            _replace_with_retry(tombstone_dir, attempt_dir)
+          except UserAnswerDeletionError:
+            logger.exception('Failed rolling back user answer Attempt directory')
+        if isinstance(error, UserAnswerError):
+          raise
+        raise UserAnswerDeletionError('无法更新作答记录，请稍后重试。', status_code=503) from error
       if tombstone_dir.is_dir():
-        shutil.rmtree(tombstone_dir)
+        _remove_tree_with_retry(tombstone_dir)
+      if not retain_original_assets:
+        for retained_dir in self._retained_asset_dirs_locked(course_id, source_document_id):
+          _remove_tree_with_retry(retained_dir)
+      if not record.attempts:
+        for metadata_path in (path, self._backup_path(path)):
+          try:
+            metadata_path.unlink(missing_ok=True)
+          except OSError:
+            # Both files contain the sanitized empty record, so no Attempt can reappear.
+            logger.warning('Deferred cleanup for empty user answer metadata %s', metadata_path)
       attempts_dir = question_dir / 'attempts'
-      if attempts_dir.is_dir() and not any(attempts_dir.iterdir()):
-        attempts_dir.rmdir()
-      if question_dir.is_dir() and not any(question_dir.iterdir()):
-        question_dir.rmdir()
-      remaining = sum(
-        1 for _, current_record in records for attempt in current_record.attempts
-        if attempt.course_id == course_id and attempt.source_document_id == source_document_id
-      )
+      try:
+        if attempts_dir.is_dir() and not any(attempts_dir.iterdir()):
+          attempts_dir.rmdir()
+        if question_dir.is_dir() and not any(question_dir.iterdir()):
+          question_dir.rmdir()
+      except OSError:
+        logger.debug('Deferred cleanup for empty user answer directories', exc_info=True)
+      remaining = document_attempt_count - 1
       return deleted, remaining
 
   def asset(

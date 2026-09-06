@@ -1042,6 +1042,11 @@ class UserAnswerGradingCoordinator:
       self._forgotten.add((course_id, attempt_id))
       return any(key[0] == course_id and key[2] == attempt_id for key in self._in_flight)
 
+  def restore_attempt(self, course_id: str, attempt_id: str) -> None:
+    """Allow retries when a coordinated deletion failed before completion."""
+    with self._lock:
+      self._forgotten.discard((course_id, attempt_id))
+
   def resume_pending(self) -> int:
     attempts = self.store.pending_attempts()
     return sum(1 for attempt in attempts if self.queue(attempt))

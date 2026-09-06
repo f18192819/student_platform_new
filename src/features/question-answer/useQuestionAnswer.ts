@@ -64,12 +64,14 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
   const [deletingAttemptId, setDeletingAttemptId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
+  const deletedAttemptIdsRef = useRef(new Set<string>())
   const identityKey = `${identity.courseId}:${identity.sourceDocumentId}:${identity.questionId}`
   const identityKeyRef = useRef(identityKey)
   identityKeyRef.current = identityKey
   const { courseId, sourceDocumentId, questionId } = identity
 
   useEffect(() => {
+    deletedAttemptIdsRef.current.clear()
     setAttempts([])
     setDetails({})
     setError(null)
@@ -117,17 +119,27 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
   }, [enabled, courseId, sourceDocumentId, questionId, refreshTick])
 
   const loadAttempt = async (attemptId: string, force = false) => {
-    if (!enabled || (!force && details[attemptId])) return details[attemptId] ?? null
+    if (
+      !enabled
+      || deletedAttemptIdsRef.current.has(attemptId)
+      || (!force && details[attemptId])
+    ) return details[attemptId] ?? null
     const requestedIdentity = identityKey
     try {
       const detail = await loadUserQuestionAnswerAttempt(
         { courseId, sourceDocumentId, questionId }, attemptId,
       )
-      if (identityKeyRef.current !== requestedIdentity) return null
+      if (
+        identityKeyRef.current !== requestedIdentity
+        || deletedAttemptIdsRef.current.has(attemptId)
+      ) return null
       setDetails((current) => ({ ...current, [attemptId]: detail }))
       return detail
     } catch (reason) {
-      if (identityKeyRef.current === requestedIdentity) {
+      if (
+        identityKeyRef.current === requestedIdentity
+        && !deletedAttemptIdsRef.current.has(attemptId)
+      ) {
         setError(reason instanceof Error ? reason.message : '读取作答详情失败。')
       }
       return null
@@ -226,6 +238,7 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
 
   const removeAttempt = async (attemptId: string) => {
     setDeletingAttemptId(attemptId)
+    deletedAttemptIdsRef.current.add(attemptId)
     setError(null)
     try {
       const result = await deleteUserQuestionAnswerAttempt(
@@ -239,6 +252,7 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
       })
       return result
     } catch (reason) {
+      deletedAttemptIdsRef.current.delete(attemptId)
       setError(reason instanceof Error ? reason.message : '删除本次作答失败。')
       return null
     } finally {

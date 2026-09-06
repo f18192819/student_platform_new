@@ -89,6 +89,7 @@ class ApplicationRuntime:
   def start(self) -> None:
     if self.document_pipeline is not None:
       return
+    self.user_answer_store.cleanup_deleted_attempt_dirs()
     self._pipeline_executor = ThreadPoolExecutor(
       max_workers=1,
       thread_name_prefix='document-pipeline',
