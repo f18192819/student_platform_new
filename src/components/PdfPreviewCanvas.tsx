@@ -86,6 +86,7 @@ function getFallbackRenderedPageWidth(pdfController: PdfController | null, pageN
 }
 
 type PdfPreviewCanvasProps = {
+  variant?: 'workspace' | 'readonly'
   fileName: string
   pdfController: PdfController | null
   imageUrl?: string | null
@@ -100,16 +101,16 @@ type PdfPreviewCanvasProps = {
   onZoomOut: () => void
   onZoomIn: () => void
   onFitWidth: () => void
-  onOpenPdf: () => void
+  onOpenPdf?: () => void
   onVisiblePageChange: (pageNumber: number) => void
-  onInspectPageDoubts: (pageNumber: number) => void
-  onInspectPageLectureSegments: (pageNumber: number) => void
-  onPlayPageLectureSegments: (pageNumber: number) => void
+  onInspectPageDoubts?: (pageNumber: number) => void
+  onInspectPageLectureSegments?: (pageNumber: number) => void
+  onPlayPageLectureSegments?: (pageNumber: number) => void
   playingLecturePage?: number | null
   showLectureControls?: boolean
-  onInspectPageQuestions: (pageNumber: number) => void
-  isCaptureMode: boolean
-  selectedHomeworkQuestion: HomeworkQuestion | null
+  onInspectPageQuestions?: (pageNumber: number) => void
+  isCaptureMode?: boolean
+  selectedHomeworkQuestion?: HomeworkQuestion | null
   structuredBlocks?: StructuredDocumentBlock[]
   lectureSegmentsByPage?: Map<number, ClassroomLectureSegment[]>
   homeworkKnowledgeLinks?: HomeworkKnowledgeLink[]
@@ -117,13 +118,13 @@ type PdfPreviewCanvasProps = {
   onOpenLecturePageQuestions?: (pageNumber: number) => void
   visibleQuestions?: HomeworkQuestion[]
   onVisibleQuestionChange?: (questionId: string) => void
-  onCaptureSelection: (capture: {
+  onCaptureSelection?: (capture: {
     pageNumber: number
     dataUrl: string
     width: number
     height: number
   }) => void
-  onTextSelection: (selection: TextSelectionPayload) => void
+  onTextSelection?: (selection: TextSelectionPayload) => void
   referencedBlockIds?: Set<string>
   onRemoveBlockReference?: (blockId: string) => void
 }
@@ -465,6 +466,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   onTextSelection,
   referencedBlockIds = new Set<string>(),
   onRemoveBlockReference,
+  interactive = true,
 }: {
   pdfController: PdfController
   pageNumber: number
@@ -472,15 +474,16 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   structuredBlocks?: StructuredDocumentBlock[]
   onRendered: (page: RenderedPageData) => void
   isCaptureMode: boolean
-  onCaptureSelection: (capture: {
+  onCaptureSelection?: (capture: {
     pageNumber: number
     dataUrl: string
     width: number
     height: number
   }) => void
-  onTextSelection: (selection: TextSelectionPayload) => void
+  onTextSelection?: (selection: TextSelectionPayload) => void
   referencedBlockIds?: Set<string>
   onRemoveBlockReference?: (blockId: string) => void
+  interactive?: boolean
 }) {
   const surfaceRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -587,10 +590,12 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         return
       }
 
-      const textContent = await page.getTextContent({
-        includeMarkedContent: true,
-        disableNormalization: true,
-      })
+      const textContent = interactive
+        ? await page.getTextContent({
+            includeMarkedContent: true,
+            disableNormalization: true,
+          })
+        : null
 
       if (cancelled) {
         return
@@ -600,7 +605,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         pageNumber,
         width: viewport.width,
         height: viewport.height,
-        textLayer: buildTextLayer(viewport, textContent),
+        textLayer: textContent ? buildTextLayer(viewport, textContent) : [],
       } satisfies RenderedPageData
 
       setPageData(nextPageData)
@@ -619,7 +624,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       cancelled = true
       renderTask?.cancel()
     }
-  }, [pageNumber, pdfController])
+  }, [interactive, pageNumber, pdfController])
 
   const textBlocks = useMemo(() => {
     if (!pageData) {
@@ -772,7 +777,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         sourceHeight,
       )
 
-      captureSelectionRef.current({
+      captureSelectionRef.current?.({
         pageNumber,
         dataUrl: captureCanvas.toDataURL('image/png'),
         width: sourceWidth,
@@ -843,7 +848,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       : findTextBlocksInRect(textBlocks, rect)
     if (selectedBlocks.length) {
       const first = selectedBlocks[0]
-      textSelectionRef.current({
+      textSelectionRef.current?.({
         pageNumber,
         text: first.text,
         source: 'block',
@@ -862,8 +867,8 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     <div
       ref={surfaceRef}
       className="pdf-stage__page-surface"
-      onPointerDown={beginTextSelection}
-      onPointerMove={(event) => {
+      onPointerDown={interactive ? beginTextSelection : undefined}
+      onPointerMove={interactive ? (event) => {
         if (referenceDragRef.current) {
           updateTextSelection(event)
           return
@@ -880,16 +885,16 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         if (nextBlockId !== hoveredBlockId) {
           setHoveredBlockId(nextBlockId)
         }
-      }}
-      onPointerUp={finishTextSelection}
-      onPointerLeave={() => {
+      } : undefined}
+      onPointerUp={interactive ? finishTextSelection : undefined}
+      onPointerLeave={interactive ? () => {
         if (!referenceDragRef.current) setHoveredBlockId(null)
-      }}
-      onPointerCancel={() => {
+      } : undefined}
+      onPointerCancel={interactive ? () => {
         referenceDragRef.current = null
         setReferenceSelectionRect(null)
         setHoveredBlockId(null)
-      }}
+      } : undefined}
       style={
         pageData
           ? {
@@ -914,7 +919,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
             : undefined
         }
       />
-      {pageData && !hasLocalMineruBlocks ? (
+      {interactive && pageData && !hasLocalMineruBlocks ? (
         <div
           className="pdf-stage__text-layer"
           style={{
@@ -940,7 +945,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
           ))}
         </div>
       ) : null}
-      {pageData && hoveredBlock ? (
+      {interactive && pageData && hoveredBlock ? (
         <div
           className="pdf-stage__block-layer"
           style={{
@@ -961,7 +966,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
           />
         </div>
       ) : null}
-      {pageData && referenceSelectionRect ? (
+      {interactive && pageData && referenceSelectionRect ? (
         <div
           className="pdf-stage__block-layer"
           style={{
@@ -982,7 +987,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
           />
         </div>
       ) : null}
-      {pageData && textBlocks.length ? (
+      {interactive && pageData && textBlocks.length ? (
         <div
           className="pdf-stage__block-layer"
           style={{
@@ -1015,7 +1020,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
             ))}
         </div>
       ) : null}
-      {isCaptureMode && pageData ? (
+      {interactive && isCaptureMode && pageData ? (
         <div
           className="pdf-stage__capture-overlay"
           onPointerDown={beginCapture}
@@ -1060,7 +1065,7 @@ const ImagePreviewSurface = memo(function ImagePreviewSurface({
   imageUrl: string
   currentPage: number
   structuredBlocks?: StructuredDocumentBlock[]
-  onTextSelection: (selection: TextSelectionPayload) => void
+  onTextSelection?: (selection: TextSelectionPayload) => void
   referencedBlockIds?: Set<string>
   onRemoveBlockReference?: (blockId: string) => void
 }) {
@@ -1201,7 +1206,7 @@ const ImagePreviewSurface = memo(function ImagePreviewSurface({
       : findTextBlocksInRect(displayBlocks, rect)
     if (selectedBlocks.length) {
       const first = selectedBlocks[0]
-      onTextSelection({
+      onTextSelection?.({
         pageNumber: currentPage,
         text: first.text,
         source: 'block',
@@ -1341,6 +1346,7 @@ const ImagePreviewSurface = memo(function ImagePreviewSurface({
 })
 
 export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
+  variant = 'workspace',
   fileName,
   pdfController,
   imageUrl = null,
@@ -1363,8 +1369,8 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   playingLecturePage = null,
   showLectureControls = true,
   onInspectPageQuestions,
-  isCaptureMode,
-  selectedHomeworkQuestion,
+  isCaptureMode = false,
+  selectedHomeworkQuestion = null,
   structuredBlocks = [],
   lectureSegmentsByPage = new Map(),
   homeworkKnowledgeLinks = [],
@@ -1377,6 +1383,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   referencedBlockIds = new Set<string>(),
   onRemoveBlockReference,
 }: PdfPreviewCanvasProps) {
+  const isReadonly = variant === 'readonly'
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const pageRefs = useRef(new Map<number, HTMLElement>())
   const renderedPagesRef = useRef(new Map<number, RenderedPageData>())
@@ -1733,19 +1740,21 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     (isViewportMeasured && Boolean(firstPageWidth) && hasRenderedFirstPage && !isInitialPdfPaintPending)
 
   return (
-    <div className="pdf-stage">
+    <div className={`pdf-stage${isReadonly ? ' pdf-stage--readonly' : ''}`}>
       <div className="pdf-stage__toolbar">
-        <div>
+        {!isReadonly ? <div>
           <span>PDF Reader</span>
           <strong>{fileName}</strong>
-        </div>
+        </div> : null}
         <div className="pdf-stage__controls">
           <button type="button" className="toolbar-pill" onClick={onZoomOut}>
             缩小
           </button>
-          <button type="button" className="toolbar-pill" onClick={onOpenPdf}>
-            打开 PDF
-          </button>
+          {!isReadonly && onOpenPdf ? (
+            <button type="button" className="toolbar-pill" onClick={onOpenPdf}>
+              打开 PDF
+            </button>
+          ) : null}
           <button type="button" className="toolbar-pill">
             {zoomLabel}
           </button>
@@ -1770,7 +1779,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
         </button>
       </div>
 
-      {selectedHomeworkQuestion && pdfController ? (
+      {!isReadonly && selectedHomeworkQuestion && pdfController ? (
         <div className="pdf-stage__question-banner">
           <div className="pdf-stage__question-banner-meta">
             <span>当前题目</span>
@@ -1850,7 +1859,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                     }
                   >
                     <div className="pdf-stage__page-label">第 {pageNumber} 页</div>
-                    <div className="pdf-stage__page-actions">
+                    {!isReadonly ? <div className="pdf-stage__page-actions">
                       {pageLinks.slice(0, 2).map((link) => (
                         <button
                           key={link.id}
@@ -1876,7 +1885,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                         <button
                           type="button"
                           className="toolbar-pill toolbar-pill--knowledge-count"
-                          onClick={() => onInspectPageQuestions(pageNumber)}
+                          onClick={() => onInspectPageQuestions?.(pageNumber)}
                           title={`查看第 ${pageNumber} 页相关题目`}
                         >
                           查看题目
@@ -1886,7 +1895,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                         <button
                           type="button"
                           className="toolbar-pill toolbar-pill--knowledge-count"
-                          onClick={() => onInspectPageLectureSegments(pageNumber)}
+                          onClick={() => onInspectPageLectureSegments?.(pageNumber)}
                           title={`查看第 ${pageNumber} 页的 ${lectureSegments.length} 段课堂讲解`}
                         >
                           查看课堂讲解 ({lectureSegments.length})
@@ -1896,7 +1905,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                         <button
                           type="button"
                           className="toolbar-pill toolbar-pill--knowledge-count"
-                          onClick={() => onPlayPageLectureSegments(pageNumber)}
+                          onClick={() => onPlayPageLectureSegments?.(pageNumber)}
                           title={
                             playingLecturePage === pageNumber
                               ? `正在播放第 ${pageNumber} 页课堂讲解`
@@ -1909,11 +1918,11 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                       <button
                         type="button"
                         className="toolbar-pill toolbar-pill--accent pdf-stage__doubt-button"
-                        onClick={() => onInspectPageDoubts(pageNumber)}
+                        onClick={() => onInspectPageDoubts?.(pageNumber)}
                       >
                         查看疑点
                       </button>
-                    </div>
+                    </div> : null}
                   </div>
                   <PdfPageCanvas
                     pdfController={pdfController}
@@ -1926,6 +1935,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                     onTextSelection={onTextSelection}
                     referencedBlockIds={referencedBlockIds}
                     onRemoveBlockReference={onRemoveBlockReference}
+                    interactive={!isReadonly}
                   />
                 </article>
               )

@@ -15,6 +15,10 @@ import {
 import { prepareAssessmentMarkdownMath } from '../../lib/latexMarkdown'
 import { useQuestionAnswer } from './useQuestionAnswer'
 import { userAnswerGradingLabel } from './questionAnswerState'
+import {
+  UserAnswerPdfPreview,
+  type UserAnswerPdfPreviewCache,
+} from './UserAnswerPdfPreview'
 
 const ACCEPTED_ANSWERS = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
 
@@ -304,18 +308,35 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
   })
   const [activeTab, setActiveTab] = useState<'question' | 'answer'>('question')
   const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(null)
+  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [previewImage, setPreviewImage] = useState<string | null>(null)
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
+  const pdfPreviewCacheRef = useRef<UserAnswerPdfPreviewCache>(new Map())
   const identityKey = `${courseId}:${sourceDocumentId}:${questionId}`
 
   useEffect(() => {
     setActiveTab('question')
     setSelectedAttemptId(null)
+    setSelectedAssetId(null)
     setPreviewImage(null)
+    pdfPreviewCacheRef.current.clear()
   }, [identityKey])
 
   const selectedSummary = attempts.find((attempt) => attempt.id === selectedAttemptId) ?? attempts[0] ?? null
   const selected = selectedSummary ? details[selectedSummary.id] ?? null : null
+  const orderedAssets = [...(selected?.assets ?? [])].sort((left, right) => left.order - right.order)
+  const selectedAsset = orderedAssets.find((asset) => asset.id === selectedAssetId) ?? orderedAssets[0] ?? null
+  const selectedAssetIndex = selectedAsset
+    ? orderedAssets.findIndex((asset) => asset.id === selectedAsset.id)
+    : -1
+  const selectedAssetUrl = selected && selectedAsset
+    ? userAnswerAssetUrl(identity, selectedAsset.id, selected.id)
+    : null
+
+  useEffect(() => {
+    setSelectedAssetId(null)
+    setPreviewImage(null)
+  }, [selected?.id])
 
   useEffect(() => {
     if (activeTab !== 'answer' || !selectedSummary) return
@@ -326,7 +347,6 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
   }, [activeTab, identityKey, selectedSummary?.id, selectedSummary?.updated_at])
 
   if (!enabled) return children
-  const orderedAssets = [...(selected?.assets ?? [])].sort((left, right) => left.order - right.order)
   const openUpload = () => uploadInputRef.current?.click()
 
   return (
@@ -361,16 +381,42 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
                 }}>删除全部记录</button></div>
               </div>
               <div className="question-answer-viewer__assets">
-                {orderedAssets.map((asset) => {
-                  const url = userAnswerAssetUrl(identity, asset.id, selected.id)
-                  return asset.kind === 'image' ? (
-                    <button key={asset.id} type="button" className="question-answer-viewer__image" onClick={() => setPreviewImage(url)}>
-                      <img src={url} alt={asset.filename} /><span>{asset.order + 1}. {asset.filename}</span>
+                {orderedAssets.length > 1 ? (
+                  <nav className="question-answer-viewer__asset-pager" aria-label="切换答案文件">
+                    <button
+                      type="button"
+                      disabled={selectedAssetIndex <= 0}
+                      onClick={() => setSelectedAssetId(orderedAssets[selectedAssetIndex - 1]?.id ?? null)}
+                    >上一份</button>
+                    <span>{selectedAssetIndex + 1} / {orderedAssets.length}</span>
+                    <button
+                      type="button"
+                      disabled={selectedAssetIndex >= orderedAssets.length - 1}
+                      onClick={() => setSelectedAssetId(orderedAssets[selectedAssetIndex + 1]?.id ?? null)}
+                    >下一份</button>
+                  </nav>
+                ) : null}
+                {selectedAsset && selectedAssetUrl ? (
+                  selectedAsset.kind === 'image' ? (
+                    <button
+                      key={selectedAsset.id}
+                      type="button"
+                      className="question-answer-viewer__image"
+                      aria-label={`查看答案图片 ${selectedAsset.order + 1}`}
+                      onClick={() => setPreviewImage(selectedAssetUrl)}
+                    >
+                      <img src={selectedAssetUrl} alt={selectedAsset.filename} />
                     </button>
                   ) : (
-                    <article key={asset.id} className="question-answer-viewer__pdf"><header>{asset.order + 1}. {asset.filename}</header><iframe src={url} title={asset.filename} /></article>
+                    <UserAnswerPdfPreview
+                      key={selectedAsset.id}
+                      url={selectedAssetUrl}
+                      fileName={selectedAsset.filename}
+                      assetKey={`${selected.id}:${selectedAsset.id}`}
+                      cache={pdfPreviewCacheRef.current}
+                    />
                   )
-                })}
+                ) : null}
               </div>
               <GradingPanel
                 attempt={selected}
