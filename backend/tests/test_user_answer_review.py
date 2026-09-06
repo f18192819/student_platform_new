@@ -174,8 +174,15 @@ class UserAnswerReviewTest(unittest.TestCase):
     self.service.save(
       'course-1', 'document-1', 'route-question', self.attempt.id, 'q1', self.request(),
     )
-    self.assertEqual(1, self.service.delete_attempt_evidence('course-1', [self.attempt.id]))
+    deleted, remaining = self.service.delete_attempt(
+      'course-1', 'document-1', 'route-question', self.attempt.id,
+    )
+    self.assertEqual(self.attempt.id, deleted.id)
+    self.assertEqual(0, remaining)
     self.assertEqual([], self.learning.course_events('course-1'))
+    self.assertIsNone(self.answers.get_attempt(
+      'course-1', 'document-1', 'route-question', self.attempt.id,
+    ))
 
 
 if __name__ == '__main__':

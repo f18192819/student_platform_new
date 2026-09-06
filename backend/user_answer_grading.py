@@ -947,11 +947,12 @@ class UserAnswerGradingCoordinator:
     self._executor: ThreadPoolExecutor | None = None
     self._lock = threading.Lock()
     self._in_flight: set[tuple[str, str, str]] = set()
+    self._forgotten: set[tuple[str, str]] = set()
 
   def queue(self, attempt: UserQuestionAnswer) -> bool:
     key = (attempt.course_id, attempt.question_id, attempt.id)
     with self._lock:
-      if key in self._in_flight:
+      if key in self._in_flight or (attempt.course_id, attempt.id) in self._forgotten:
         return False
       self._in_flight.add(key)
       if self._executor is None:
@@ -964,11 +965,15 @@ class UserAnswerGradingCoordinator:
 
   def _run(self, attempt: UserQuestionAnswer, key: tuple[str, str, str]) -> None:
     try:
+      if self._is_forgotten(attempt.course_id, attempt.id):
+        return
       if not self.store.mark_stage(
         attempt.course_id, attempt.question_id, attempt.id, 'mineru_processing',
       ):
         return
-      if not self.store.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+      if self._is_forgotten(attempt.course_id, attempt.id) or not self.store.attempt_exists(
+        attempt.course_id, attempt.question_id, attempt.id,
+      ):
         return
       grade_document = getattr(self.service, 'grade_document', None)
       if not callable(grade_document):
@@ -983,7 +988,9 @@ class UserAnswerGradingCoordinator:
         )
       else:
         outcome = grade_document(attempt)
-      if not self.store.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+      if self._is_forgotten(attempt.course_id, attempt.id) or not self.store.attempt_exists(
+        attempt.course_id, attempt.question_id, attempt.id,
+      ):
         return
       self.store.save_document_grading(
         attempt.course_id,
@@ -996,11 +1003,23 @@ class UserAnswerGradingCoordinator:
     except UserAnswerNotFound:
       return
     except Exception as exc:  # noqa: BLE001 - persist every provider/render failure for retry.
-      if self.store.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+      if not self._is_forgotten(attempt.course_id, attempt.id) and self.store.attempt_exists(
+        attempt.course_id, attempt.question_id, attempt.id,
+      ):
         self.store.mark_failed(attempt.course_id, attempt.question_id, attempt.id, str(exc))
     finally:
       with self._lock:
         self._in_flight.discard(key)
+
+  def _is_forgotten(self, course_id: str, attempt_id: str) -> bool:
+    with self._lock:
+      return (course_id, attempt_id) in self._forgotten
+
+  def forget_attempt(self, course_id: str, attempt_id: str) -> bool:
+    """Tombstone an Attempt so an already-running provider result is discarded."""
+    with self._lock:
+      self._forgotten.add((course_id, attempt_id))
+      return any(key[0] == course_id and key[2] == attempt_id for key in self._in_flight)
 
   def resume_pending(self) -> int:
     attempts = self.store.pending_attempts()

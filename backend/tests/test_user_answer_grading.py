@@ -752,7 +752,12 @@ line two with "P point" and \\frac{1}{2}","steps":[],"final_answer":"1/2","block
     try:
       self.assertTrue(coordinator.queue(recovered[0]))
       self.assertTrue(started.wait(1))
-      self.assertTrue(self.store.delete('course-1', 'document-1', 'question-1'))
+      self.assertTrue(coordinator.forget_attempt('course-1', answer.id))
+      deleted, remaining = self.store.delete_attempt(
+        'course-1', 'document-1', 'question-1', answer.id,
+      )
+      self.assertEqual(answer.id, deleted.id)
+      self.assertEqual(0, remaining)
       release.set()
       coordinator.shutdown()
       self.assertFalse(self.store._question_dir('course-1', 'question-1').exists())

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   deleteUserQuestionAnswer,
+  deleteUserQuestionAnswerAttempt,
   loadUserQuestionAnswerAttempt,
   loadUserQuestionAnswerAttempts,
   retryUserAnswerGrading,
@@ -60,6 +61,7 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
   const [isLoading, setIsLoading] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [reviewSavingQuestionId, setReviewSavingQuestionId] = useState<string | null>(null)
+  const [deletingAttemptId, setDeletingAttemptId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
   const identityKey = `${identity.courseId}:${identity.sourceDocumentId}:${identity.questionId}`
@@ -222,8 +224,30 @@ export function useQuestionAnswer({ enabled, identity, sourceType }: {
     }
   }
 
+  const removeAttempt = async (attemptId: string) => {
+    setDeletingAttemptId(attemptId)
+    setError(null)
+    try {
+      const result = await deleteUserQuestionAnswerAttempt(
+        { courseId, sourceDocumentId, questionId }, attemptId,
+      )
+      setAttempts((current) => current.filter((attempt) => attempt.id !== attemptId))
+      setDetails((current) => {
+        const next = { ...current }
+        delete next[attemptId]
+        return next
+      })
+      return result
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '删除本次作答失败。')
+      return null
+    } finally {
+      setDeletingAttemptId(null)
+    }
+  }
+
   return {
-    attempts, details, isLoading, isSaving, reviewSavingQuestionId, error,
-    loadAttempt, upload, retry, saveReview, remove,
+    attempts, details, isLoading, isSaving, reviewSavingQuestionId, deletingAttemptId, error,
+    loadAttempt, upload, retry, saveReview, removeAttempt, remove,
   }
 }

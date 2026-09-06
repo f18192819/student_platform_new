@@ -290,8 +290,8 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
     courseId: courseId ?? '', sourceDocumentId: sourceDocumentId ?? '', questionId: questionId ?? '',
   }
   const {
-    attempts, details, isLoading, isSaving, reviewSavingQuestionId, error,
-    loadAttempt, upload, retry, saveReview, remove,
+    attempts, details, isLoading, isSaving, reviewSavingQuestionId, deletingAttemptId, error,
+    loadAttempt, upload, retry, saveReview, removeAttempt, remove,
   } = useQuestionAnswer({
     enabled, identity, sourceType,
   })
@@ -349,7 +349,7 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
             <>
               <div className="question-answer-viewer__actions">
                 <div><strong>整份文档第 {selected.attempt_number} 次作答</strong><span>{new Date(selected.created_at).toLocaleString()} · {orderedAssets.length} 个文件</span></div>
-                <div><button type="button" onClick={openUpload} disabled={isSaving}>提交整份新答案</button><button type="button" className="is-danger" disabled={isSaving} onClick={() => {
+                <div><button type="button" onClick={openUpload} disabled={isSaving || Boolean(deletingAttemptId)}>提交整份新答案</button><button type="button" className="is-danger" disabled={isSaving || Boolean(deletingAttemptId)} onClick={() => {
                   if (window.confirm('确定删除这份作业或往年题的全部作答历史吗？')) void remove()
                 }}>删除全部记录</button></div>
               </div>
@@ -376,11 +376,33 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
                   errors,
                 )}
               />
-              {attempts.length > 1 ? (
+              {attempts.length ? (
                 <section className="question-answer-history"><h3>历史作答记录</h3><div>{attempts.map((attempt) => (
-                  <button key={attempt.id} type="button" className={attempt.id === selected.id ? 'is-active' : ''} onClick={() => setSelectedAttemptId(attempt.id)}>
-                    <strong>Attempt {attempt.attempt_number}</strong><span>{attempt.score != null ? `${Math.round(attempt.score * 100)}%` : attempt.processing_status}</span><small>{new Date(attempt.created_at).toLocaleString()}</small>
-                  </button>
+                  <article key={attempt.id} className={attempt.id === selected.id ? 'is-active' : ''}>
+                    <button type="button" className="question-answer-history__select" onClick={() => setSelectedAttemptId(attempt.id)}>
+                      <strong>Attempt {attempt.attempt_number}</strong><span>{attempt.score != null ? `${Math.round(attempt.score * 100)}%` : attempt.processing_status}</span><small>{new Date(attempt.created_at).toLocaleString()}</small>
+                    </button>
+                    <button
+                      type="button"
+                      className="question-answer-history__delete"
+                      aria-label={`删除 Attempt ${attempt.attempt_number}`}
+                      disabled={Boolean(deletingAttemptId)}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        const confirmed = window.confirm(
+                          `确定删除 Attempt ${attempt.attempt_number} 吗？\n\n将同时删除：\n- 原始答案文件\n- MinerU/识别结果\n- AI 批改记录\n- 人工复核记录\n- 对学习状态产生的知识点证据\n\n此操作不可恢复。`,
+                        )
+                        if (!confirmed) return
+                        const currentIndex = attempts.findIndex((item) => item.id === attempt.id)
+                        const fallback = attempts[currentIndex + 1] ?? attempts[currentIndex - 1] ?? null
+                        void removeAttempt(attempt.id).then((result) => {
+                          if (result && selectedAttemptId === attempt.id) {
+                            setSelectedAttemptId(fallback?.id ?? null)
+                          }
+                        })
+                      }}
+                    >{deletingAttemptId === attempt.id ? '…' : '×'}</button>
+                  </article>
                 ))}</div></section>
               ) : null}
             </>

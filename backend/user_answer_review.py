@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from threading import RLock
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
 
@@ -65,8 +66,23 @@ class UserAnswerReviewService:
     self.answers = answers
     self.learning = learning
     self.contexts = contexts
+    self._lock = RLock()
 
   def save(
+    self,
+    course_id: str,
+    source_document_id: str,
+    route_question_id: str,
+    attempt_id: str,
+    question_id: str,
+    request: SaveQuestionReviewRequest,
+  ) -> tuple[UserQuestionAnswer, UserAnswerQuestionReview]:
+    with self._lock:
+      return self._save(
+        course_id, source_document_id, route_question_id, attempt_id, question_id, request,
+      )
+
+  def _save(
     self,
     course_id: str,
     source_document_id: str,
@@ -115,6 +131,20 @@ class UserAnswerReviewService:
 
   def delete_attempt_evidence(self, course_id: str, attempt_ids: list[str]) -> int:
     return self.learning.delete_user_answer_events(course_id, attempt_ids)
+
+  def delete_attempt(
+    self,
+    course_id: str,
+    source_document_id: str,
+    route_question_id: str,
+    attempt_id: str,
+  ) -> tuple[UserQuestionAnswer, int]:
+    with self._lock:
+      deleted, remaining = self.answers.delete_attempt(
+        course_id, source_document_id, route_question_id, attempt_id,
+      )
+      self.learning.delete_user_answer_events(course_id, [attempt_id])
+      return deleted, remaining
 
   @staticmethod
   def _question_result(attempt: UserQuestionAnswer, question_id: str) -> UserAnswerQuestionResult:
@@ -181,6 +211,8 @@ class UserAnswerReviewService:
     result: UserAnswerQuestionResult,
     review: UserAnswerQuestionReview,
   ) -> None:
+    if not self.answers.attempt_exists(attempt.course_id, attempt.question_id, attempt.id):
+      return
     session_id = f'user-answer:{attempt.id}'
     existing = self.learning.session_events(attempt.course_id, session_id)
     if any(event.id == review.learning_event_id for event in existing):

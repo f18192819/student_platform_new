@@ -240,6 +240,22 @@ export async function deleteUserQuestionAnswer(identity: QuestionAnswerIdentity)
   if (!response.ok) throw new Error(await responseError(response))
 }
 
+export async function deleteUserQuestionAnswerAttempt(
+  identity: QuestionAnswerIdentity,
+  attemptId: string,
+) {
+  const response = await fetch(
+    `${answerPath(identity)}/attempts/${encodeURIComponent(attemptId)}`,
+    { method: 'DELETE' },
+  )
+  if (!response.ok) throw new Error(await responseError(response))
+  return await response.json() as {
+    deleted: boolean
+    attempt_id: string
+    remaining_attempts: number
+  }
+}
+
 export function userAnswerAssetUrl(identity: QuestionAnswerIdentity, assetId: string, attemptId?: string) {
   const attempt = attemptId ? `/attempts/${encodeURIComponent(attemptId)}` : ''
   return `${answerPath(identity)}${attempt}/assets/${encodeURIComponent(assetId)}`

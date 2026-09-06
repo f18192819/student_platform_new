@@ -250,7 +250,7 @@ UserAnswerAttempt = UserQuestionAnswer
 
 
 class UserQuestionAnswerRecord(BaseModel):
-  schema_version: int = 3
+  schema_version: int = 4
   current_attempt_id: str | None = None
   attempts: list[UserQuestionAnswer] = Field(default_factory=list)
 
@@ -380,6 +380,67 @@ class UserAnswerStore:
       write_json_atomic(self._backup_path(path), existing)
     write_json_atomic(path, record.model_dump())
 
+  def _write_sanitized_record(
+    self,
+    course_id: str,
+    question_id: str,
+    record: UserQuestionAnswerRecord,
+  ) -> None:
+    """Write current and backup metadata from the same sanitized projection."""
+    path = self._record_path(course_id, question_id)
+    payload = record.model_dump()
+    write_json_atomic(path, payload)
+    backup = self._backup_path(path)
+    try:
+      write_json_atomic(backup, payload)
+    except OSError:
+      # The authoritative record is already sanitized. A missing backup is
+      # safer than retaining metadata that could resurrect a deleted Attempt.
+      backup.unlink(missing_ok=True)
+
+  def _document_records_locked(
+    self,
+    course_id: str,
+    source_document_id: str,
+  ) -> list[tuple[str, UserQuestionAnswerRecord]]:
+    course_dir = self.root / safe_storage_name(course_id)
+    records: list[tuple[str, UserQuestionAnswerRecord]] = []
+    for question_dir in list(course_dir.iterdir()) if course_dir.is_dir() else []:
+      if not question_dir.is_dir() or not (question_dir / 'record.json').is_file():
+        continue
+      record = self._read_record(course_id, question_dir.name)
+      if any(
+        attempt.course_id == course_id and attempt.source_document_id == source_document_id
+        for attempt in record.attempts
+      ):
+        records.append((question_dir.name, record))
+    return records
+
+  def ensure_document_attempt_numbers(self, course_id: str, source_document_id: str) -> None:
+    """Migrate legacy duplicate numbers once without closing intentional gaps."""
+    course_id = _normalized(course_id, 'course_id')
+    source_document_id = _normalized(source_document_id, 'source_document_id')
+    with self._lock:
+      records = self._document_records_locked(course_id, source_document_id)
+      attempts = [
+        attempt
+        for _, record in records
+        for attempt in record.attempts
+        if attempt.course_id == course_id and attempt.source_document_id == source_document_id
+      ]
+      numbers = [attempt.attempt_number for attempt in attempts]
+      needs_renumber = any(number <= 0 for number in numbers) or len(numbers) != len(set(numbers))
+      if needs_renumber:
+        for number, attempt in enumerate(
+          sorted(attempts, key=lambda item: (item.created_at, item.id)),
+          start=1,
+        ):
+          attempt.attempt_number = number
+      if needs_renumber or any(record.schema_version < 4 for _, record in records):
+        for storage_question_id, record in records:
+          record.schema_version = 4
+          self._write_sanitized_record(course_id, storage_question_id, record)
+
   @staticmethod
   def _summary(attempt: UserQuestionAnswer) -> UserAnswerAttemptSummary:
     grading = attempt.grading
@@ -446,6 +507,7 @@ class UserAnswerStore:
     source_document_id = _normalized(source_document_id, 'source_document_id')
     question_id = _normalized(question_id, 'question_id')
     with self._lock:
+      self.ensure_document_attempt_numbers(course_id, source_document_id)
       course_dir = self.root / safe_storage_name(course_id)
       attempts: list[UserQuestionAnswer] = []
       for question_dir in list(course_dir.iterdir()) if course_dir.is_dir() else []:
@@ -566,6 +628,69 @@ class UserAnswerStore:
         if attempt_dir.is_dir() and not metadata_committed:
           shutil.rmtree(attempt_dir, ignore_errors=True)
         raise
+
+  def delete_attempt(
+    self,
+    course_id: str,
+    source_document_id: str,
+    route_question_id: str,
+    attempt_id: str,
+  ) -> tuple[UserQuestionAnswer, int]:
+    course_id = _normalized(course_id, 'course_id')
+    source_document_id = _normalized(source_document_id, 'source_document_id')
+    _normalized(route_question_id, 'question_id')
+    attempt_id = _normalized(attempt_id, 'attempt_id')
+    with self._lock:
+      self.ensure_document_attempt_numbers(course_id, source_document_id)
+      records = self._document_records_locked(course_id, source_document_id)
+      located = next((
+        (storage_question_id, record, attempt)
+        for storage_question_id, record in records
+        for attempt in record.attempts
+        if attempt.id == attempt_id
+        and attempt.course_id == course_id
+        and attempt.source_document_id == source_document_id
+      ), None)
+      if located is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      storage_question_id, record, deleted = located
+      question_dir = self._question_dir(course_id, storage_question_id)
+      attempt_dir = question_dir / 'attempts' / attempt_id
+      tombstone_dir = question_dir / f'.deleted-{attempt_id}'
+      moved = False
+      if attempt_dir.is_dir():
+        if tombstone_dir.exists():
+          shutil.rmtree(tombstone_dir)
+        attempt_dir.replace(tombstone_dir)
+        moved = True
+      try:
+        record.attempts = [attempt for attempt in record.attempts if attempt.id != attempt_id]
+        if record.current_attempt_id == attempt_id:
+          latest = max(record.attempts, key=lambda item: (item.created_at, item.id), default=None)
+          record.current_attempt_id = latest.id if latest else None
+        record.schema_version = 4
+        path = self._record_path(course_id, storage_question_id)
+        if record.attempts:
+          self._write_sanitized_record(course_id, storage_question_id, record)
+        else:
+          path.unlink(missing_ok=True)
+          self._backup_path(path).unlink(missing_ok=True)
+      except Exception:
+        if moved and tombstone_dir.is_dir() and not attempt_dir.exists():
+          tombstone_dir.replace(attempt_dir)
+        raise
+      if tombstone_dir.is_dir():
+        shutil.rmtree(tombstone_dir)
+      attempts_dir = question_dir / 'attempts'
+      if attempts_dir.is_dir() and not any(attempts_dir.iterdir()):
+        attempts_dir.rmdir()
+      if question_dir.is_dir() and not any(question_dir.iterdir()):
+        question_dir.rmdir()
+      remaining = sum(
+        1 for _, current_record in records for attempt in current_record.attempts
+        if attempt.course_id == course_id and attempt.source_document_id == source_document_id
+      )
+      return deleted, remaining
 
   def asset(
     self,

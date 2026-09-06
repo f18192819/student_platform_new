@@ -70,6 +70,10 @@ def create_user_answer_router(
   async def delete_answer(course_id: str, source_document_id: str, question_id: str) -> dict:
     try:
       attempts = await asyncio.to_thread(store.list_attempts, course_id, source_document_id, question_id)
+      forget = getattr(grading, 'forget_attempt', None)
+      if callable(forget):
+        for attempt in attempts:
+          forget(course_id, attempt.id)
       deleted = await asyncio.to_thread(store.delete, course_id, source_document_id, question_id)
       if deleted and review is not None:
         await asyncio.to_thread(
@@ -125,6 +129,49 @@ def create_user_answer_router(
       if attempt is None:
         raise UserAnswerNotFound('User answer attempt not found.')
       return {'answer': attempt.model_dump()}
+    except UserAnswerError as error:
+      raise translate(error) from error
+
+  @router.delete(
+    '/courses/{course_id}/documents/{source_document_id}/questions/{question_id}'
+    '/attempts/{attempt_id}'
+  )
+  async def delete_attempt(
+    course_id: str,
+    source_document_id: str,
+    question_id: str,
+    attempt_id: str,
+  ) -> dict:
+    try:
+      attempt = await asyncio.to_thread(
+        store.get_attempt, course_id, source_document_id, question_id, attempt_id,
+      )
+      if attempt is None:
+        raise UserAnswerNotFound('User answer attempt not found.')
+      forget = getattr(grading, 'forget_attempt', None)
+      if callable(forget):
+        forget(course_id, attempt_id)
+      if review is not None:
+        _, remaining = await asyncio.to_thread(
+          review.delete_attempt,
+          course_id,
+          source_document_id,
+          question_id,
+          attempt_id,
+        )
+      else:
+        _, remaining = await asyncio.to_thread(
+          store.delete_attempt,
+          course_id,
+          source_document_id,
+          question_id,
+          attempt_id,
+        )
+      return {
+        'deleted': True,
+        'attempt_id': attempt_id,
+        'remaining_attempts': remaining,
+      }
     except UserAnswerError as error:
       raise translate(error) from error
 

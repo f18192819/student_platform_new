@@ -5939,8 +5939,12 @@ body.is-resizing-panels {
 .question-answer-history { margin-top: 22px; }
 .question-answer-history h3 { margin: 0 0 10px; font-size: 16px; }
 .question-answer-history > div { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
-.question-answer-history button { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 12px; border: 1px solid #d7e3f3; border-radius: 14px; background: #fff; text-align: left; color: #29466f; }
-.question-answer-history button.is-active { border-color: #1672f3; box-shadow: 0 0 0 2px #dcebff; }
+.question-answer-history article { position: relative; border: 1px solid #d7e3f3; border-radius: 14px; background: #fff; overflow: hidden; }
+.question-answer-history article.is-active { border-color: #1672f3; box-shadow: 0 0 0 2px #dcebff; }
+.question-answer-history__select { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; width: 100%; padding: 12px 42px 12px 12px; border: 0; background: transparent; text-align: left; color: #29466f; cursor: pointer; }
+.question-answer-history__delete { position: absolute; top: 7px; right: 7px; display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 50%; color: #8192aa; background: #f1f5fa; font-size: 18px; line-height: 1; cursor: pointer; }
+.question-answer-history__delete:hover { color: #b42318; background: #fff0ee; }
+.question-answer-history__delete:disabled { cursor: wait; opacity: .55; }
 .question-answer-history small { grid-column: 1 / -1; color: #8092ad; }
 
 @keyframes answer-grading-spin { to { transform: rotate(360deg); } }

@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.user_answer_router import create_user_answer_router
-from backend.user_answers import UserAnswerCorruptionError, UserAnswerStore
+from backend.user_answers import UserAnswerCorruptionError, UserAnswerNotFound, UserAnswerStore
 from backend.pipeline_router import PipelineApiService
 
 
@@ -106,6 +106,84 @@ class UserAnswerStoreTest(unittest.TestCase):
     self.assertEqual([first.id, second.id], [item.id for item in record.attempts])
     self.assertTrue(self.store.delete('course-1', 'homework-1', 'q1'))
     self.assertIsNone(self.store.get('course-1', 'homework-1', 'q1'))
+
+  def test_legacy_attempt_numbers_migrate_once_and_deletion_keeps_gaps(self):
+    first = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('first.png', 'image/png', PNG)],
+    )
+    second = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('second.png', 'image/png', PNG)],
+    )
+    third = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('third.png', 'image/png', PNG)],
+    )
+    record_path = self.store._record_path('course-1', 'q1')
+    payload = json.loads(record_path.read_text(encoding='utf-8'))
+    payload['schema_version'] = 3
+    for attempt in payload['attempts']:
+      attempt.pop('attempt_number', None)
+    third_payload = payload['attempts'].pop()
+    payload['current_attempt_id'] = second.id
+    record_path.write_text(json.dumps(payload), encoding='utf-8')
+    second_record_path = self.store._record_path('course-1', 'q2')
+    (second_record_path.parent / 'attempts').mkdir(parents=True)
+    (record_path.parent / 'attempts' / third.id).replace(
+      second_record_path.parent / 'attempts' / third.id,
+    )
+    second_record_path.write_text(json.dumps({
+      'schema_version': 3,
+      'current_attempt_id': third.id,
+      'attempts': [third_payload],
+    }), encoding='utf-8')
+
+    reloaded = UserAnswerStore(self.root, Resolver(self.identities))
+    migrated = {item.id: item.attempt_number for item in reloaded.list_attempts(
+      'course-1', 'homework-1', 'q2',
+    )}
+    self.assertEqual({first.id: 1, second.id: 2, third.id: 3}, migrated)
+    self.assertEqual(migrated, {
+      item.id: item.attempt_number for item in UserAnswerStore(
+        self.root, Resolver(self.identities),
+      ).list_attempts('course-1', 'homework-1', 'q1')
+    })
+
+    fourth = reloaded.replace(
+      'course-1', 'homework-1', 'q2', 'homework', [upload('fourth.png', 'image/png', PNG)],
+    )
+    self.assertEqual(4, fourth.attempt_number)
+    deleted, remaining = reloaded.delete_attempt(
+      'course-1', 'homework-1', 'q2', second.id,
+    )
+    self.assertEqual(second.id, deleted.id)
+    self.assertEqual(3, remaining)
+    fifth = reloaded.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('fifth.png', 'image/png', PNG)],
+    )
+    self.assertEqual(5, fifth.attempt_number)
+    self.assertEqual(
+      [5, 4, 3, 1],
+      [item.attempt_number for item in reloaded.list_attempts('course-1', 'homework-1', 'q1')],
+    )
+    self.assertNotIn(second.id, record_path.read_text(encoding='utf-8'))
+    self.assertNotIn(second.id, record_path.with_name('record.json.bak').read_text(encoding='utf-8'))
+    self.assertFalse((record_path.parent / 'attempts' / second.id).exists())
+
+  def test_delete_current_and_last_attempt_updates_or_removes_record(self):
+    first = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('first.png', 'image/png', PNG)],
+    )
+    second = self.store.replace(
+      'course-1', 'homework-1', 'q1', 'homework', [upload('second.png', 'image/png', PNG)],
+    )
+    _, remaining = self.store.delete_attempt('course-1', 'homework-1', 'q1', second.id)
+    record = self.store._read_record('course-1', 'q1')
+    self.assertEqual(1, remaining)
+    self.assertEqual(first.id, record.current_attempt_id)
+
+    self.store.delete_attempt('course-1', 'homework-1', 'q1', first.id)
+    self.assertFalse(self.store._question_dir('course-1', 'q1').exists())
+    with self.assertRaises(UserAnswerNotFound):
+      self.store.delete_attempt('course-1', 'homework-1', 'q1', first.id)
 
   def test_missing_record_is_empty_but_corrupt_record_blocks_reads_and_reupload(self):
     self.assertIsNone(self.store.get('course-1', 'homework-1', 'q1'))
@@ -220,6 +298,19 @@ class UserAnswerStoreTest(unittest.TestCase):
     )
     self.assertEqual(PNG, historical_asset.content)
     self.assertTrue(client.post(f"{base}/attempts/{answer['id']}/grade").json()['queued'])
+    deletion = client.delete(f"{base}/attempts/{answer['id']}")
+    self.assertEqual(200, deletion.status_code)
+    self.assertEqual({
+      'deleted': True, 'attempt_id': answer['id'], 'remaining_attempts': 0,
+    }, deletion.json())
+    self.assertEqual(404, client.delete(f"{base}/attempts/{answer['id']}").status_code)
+
+    replacement = client.post(
+      base,
+      data={'source_type': 'homework'},
+      files=[('files', ('replacement.png', PNG, 'image/png'))],
+    ).json()['answer']
+    self.assertEqual(1, replacement['attempt_number'])
     self.assertTrue(client.delete(base).json()['deleted'])
     self.assertIsNone(client.get(base).json()['answer'])
 
