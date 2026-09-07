@@ -1742,41 +1742,36 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   return (
     <div className={`pdf-stage${isReadonly ? ' pdf-stage--readonly' : ''}`}>
       <div className="pdf-stage__toolbar">
-        {!isReadonly ? <div>
+        {!isReadonly ? <div className="pdf-stage__document">
           <span>PDF Reader</span>
           <strong>{fileName}</strong>
         </div> : null}
-        <div className="pdf-stage__controls">
-          <button type="button" className="toolbar-pill" onClick={onZoomOut}>
-            缩小
+        <div className="pdf-stage__pager">
+          <button type="button" className="toolbar-pill" aria-label="上一页" title="上一页" disabled={!canGoPrev} onClick={onPrevPage}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
           </button>
-          {!isReadonly && onOpenPdf ? (
-            <button type="button" className="toolbar-pill" onClick={onOpenPdf}>
-              打开 PDF
-            </button>
-          ) : null}
-          <button type="button" className="toolbar-pill">
-            {zoomLabel}
-          </button>
-          <button type="button" className="toolbar-pill" onClick={onZoomIn}>
-            放大
-          </button>
-          <button type="button" className="toolbar-pill" onClick={onFitWidth}>
-            适应宽度
+          <strong>{currentPage}{pageCount ? ` / ${pageCount}` : ''}</strong>
+          <button type="button" className="toolbar-pill" aria-label="下一页" title="下一页" disabled={!canGoNext} onClick={onNextPage}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
           </button>
         </div>
-      </div>
-
-      <div className="pdf-stage__pager">
-        <button type="button" className="toolbar-pill" disabled={!canGoPrev} onClick={onPrevPage}>
-          上一页
-        </button>
-        <strong>
-          第 {currentPage} 页{pageCount ? ` / 共 ${pageCount} 页` : ''}
-        </strong>
-        <button type="button" className="toolbar-pill" disabled={!canGoNext} onClick={onNextPage}>
-          下一页
-        </button>
+        <div className="pdf-stage__controls">
+          {!isReadonly && onOpenPdf ? (
+            <button type="button" className="toolbar-pill" onClick={onOpenPdf} title="打开其他 PDF">
+              打开
+            </button>
+          ) : null}
+          <div className="pdf-stage__control-group">
+            <button type="button" className="toolbar-pill" aria-label="缩小" title="缩小" onClick={onZoomOut}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" /></svg>
+            </button>
+            <span className="pdf-stage__zoom-value" aria-label={`当前缩放 ${zoomLabel}`}>{zoomLabel}</span>
+            <button type="button" className="toolbar-pill" aria-label="放大" title="放大" onClick={onZoomIn}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12M12 6v12" /></svg>
+            </button>
+            <button type="button" className="toolbar-pill" onClick={onFitWidth} title="适应宽度">适应</button>
+          </div>
+        </div>
       </div>
 
       {!isReadonly && selectedHomeworkQuestion && pdfController ? (

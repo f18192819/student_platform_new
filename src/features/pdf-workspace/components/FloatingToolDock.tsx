@@ -21,38 +21,39 @@ function DockIcon({ id }: { id: WorkspacePanelId }) {
 
 export function FloatingToolDock({
   items,
-  activePanel,
-  pinnedPanel,
+  activePanels,
+  pinnedPanels,
   onPreview,
   onLeave,
   onTogglePin,
 }: {
   items: DockItem[]
-  activePanel: WorkspacePanelId | null
-  pinnedPanel: WorkspacePanelId | null
+  activePanels: Set<WorkspacePanelId>
+  pinnedPanels: Set<WorkspacePanelId>
   onPreview: (panel: WorkspacePanelId) => void
-  onLeave: () => void
+  onLeave: (panel: WorkspacePanelId) => void
   onTogglePin: (panel: WorkspacePanelId) => void
 }) {
   return (
     <nav className="reader-tool-dock" aria-label="阅读工具">
       {items.map((item) => {
-        const active = activePanel === item.id
+        const active = activePanels.has(item.id)
+        const accessibleLabel = item.badge ? `${item.label}${item.badge}` : item.label
         return (
           <motion.button
             key={item.id}
             type="button"
             className={active ? 'is-active' : ''}
-            aria-label={item.label}
-            aria-pressed={pinnedPanel === item.id}
+            aria-label={accessibleLabel}
+            aria-pressed={pinnedPanels.has(item.id)}
             disabled={item.disabled}
             onMouseEnter={() => onPreview(item.id)}
-            onMouseLeave={onLeave}
+            onMouseLeave={() => onLeave(item.id)}
             onFocus={() => onPreview(item.id)}
-            onBlur={onLeave}
+            onBlur={() => onLeave(item.id)}
             onClick={() => onTogglePin(item.id)}
-            animate={{ scale: active ? 1.14 : 1 }}
-            transition={{ type: 'spring', stiffness: 440, damping: 32 }}
+            animate={{ y: active ? -2 : 0 }}
+            transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
           >
             <span className="reader-tool-dock__icon"><DockIcon id={item.id} /></span>
             <span className="reader-tool-dock__label">{item.label}</span>

@@ -12,7 +12,7 @@ export function ReaderEdgeTrigger({
   panel: WorkspacePanelId
   label: string
   onPreview: (panel: WorkspacePanelId) => void
-  onLeave: () => void
+  onLeave: (panel: WorkspacePanelId) => void
   onPin: (panel: WorkspacePanelId) => void
 }) {
   return (
@@ -21,11 +21,10 @@ export function ReaderEdgeTrigger({
       className={`reader-edge-trigger reader-edge-trigger--${side}`}
       aria-label={label}
       onMouseEnter={() => onPreview(panel)}
-      onMouseLeave={onLeave}
+      onMouseLeave={() => onLeave(panel)}
       onFocus={() => onPreview(panel)}
-      onBlur={onLeave}
+      onBlur={() => onLeave(panel)}
       onClick={() => onPin(panel)}
     ><span>{label}</span></button>
   )
 }
-

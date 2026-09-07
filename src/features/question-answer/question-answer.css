@@ -157,6 +157,31 @@
 .reader-floating-panel .question-answer-history__delete { position: absolute; top: 12px; right: 4px; display: grid; width: 28px; height: 28px; padding: 0; place-items: center; border: 0; border-radius: 50%; color: var(--reader-text-secondary); background: transparent; font-size: 18px; cursor: pointer; }
 .reader-floating-panel .question-answer-history__delete:hover { color: #b42318; background: rgba(180, 35, 24, 0.07); }
 
+.reader-workspace .reader-workspace-panel--bottom .reader-workspace-panel__content {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.reader-workspace .reader-workspace-panel--bottom .question-answer-history {
+  display: flex;
+  min-width: max-content;
+  height: 100%;
+  align-items: stretch;
+  gap: 0;
+  padding: 10px 16px 16px;
+}
+
+.reader-workspace .reader-workspace-panel--bottom .question-answer-history article {
+  width: clamp(220px, 22vw, 300px);
+  border-right: 1px solid var(--reader-border-subtle);
+  border-bottom: 0;
+}
+
+.reader-workspace .reader-workspace-panel--bottom .question-answer-history__select {
+  height: 100%;
+  align-content: center;
+}
+
 @media (max-width: 640px) {
   .reader-segmented-control button { padding: 0 11px; }
   .question-answer-viewer__answer { padding: 14px 12px 82px; }

@@ -1,9 +1,9 @@
 import { AnimatePresence, motion } from 'motion/react'
 import type { ReactNode } from 'react'
 
-export function FloatingWorkspacePanel({
-  open,
-  side,
+export function WorkspacePanel({
+  panelKey,
+  placement,
   title,
   pinned,
   role = 'complementary',
@@ -14,8 +14,8 @@ export function FloatingWorkspacePanel({
   onPin,
   children,
 }: {
-  open: boolean
-  side: 'left' | 'right' | 'bottom'
+  panelKey: string | null
+  placement: 'left' | 'right' | 'bottom'
   title: string
   pinned: boolean
   role?: 'dialog' | 'complementary' | 'region'
@@ -26,30 +26,31 @@ export function FloatingWorkspacePanel({
   onPin: () => void
   children: ReactNode
 }) {
-  const axis = side === 'left' ? -24 : side === 'right' ? 24 : 0
+  const offset = placement === 'left' ? -12 : placement === 'right' ? 12 : 0
   return (
-    <AnimatePresence>
-      {open ? (
+    <AnimatePresence mode="popLayout" initial={false}>
+      {panelKey ? (
         <motion.aside
-          className={`reader-floating-panel reader-floating-panel--${side}`}
+          key={panelKey}
+          className={`reader-workspace-panel reader-floating-panel reader-workspace-panel--${placement}`}
           role={role}
           aria-label={title}
-          initial={{ opacity: 0, x: axis, y: side === 'bottom' ? 18 : 0, scale: 0.985 }}
-          animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
-          exit={{ opacity: 0, x: axis * 0.55, y: side === 'bottom' ? 10 : 0, scale: 0.99 }}
-          transition={{ type: 'spring', stiffness: 420, damping: 38, mass: 0.8 }}
+          initial={{ opacity: 0, x: offset, y: placement === 'bottom' ? 8 : 0 }}
+          animate={{ opacity: 1, x: 0, y: 0 }}
+          exit={{ opacity: 0, x: offset * 0.5, y: placement === 'bottom' ? 5 : 0 }}
+          transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
           onMouseEnter={onEnter}
           onMouseLeave={onLeave}
           onPointerDownCapture={autoPinOnInteract ? onPin : undefined}
           onFocusCapture={autoPinOnInteract ? onPin : undefined}
         >
-          <header className="reader-floating-panel__header">
-            <div><strong>{title}</strong>{pinned ? <span>已固定</span> : <span>预览</span>}</div>
+          <header className="reader-workspace-panel__header">
+            <div><strong>{title}</strong><span>{pinned ? '已固定' : '预览'}</span></div>
             <button type="button" aria-label={`关闭${title}`} onClick={onClose}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
             </button>
           </header>
-          <div className="reader-floating-panel__content">{children}</div>
+          <div className="reader-workspace-panel__content">{children}</div>
         </motion.aside>
       ) : null}
     </AnimatePresence>

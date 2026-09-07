@@ -58,9 +58,37 @@ export function AppHeader({
         <Link className="octopus-app-header__title" to="/">
           课程服务平台
         </Link>
+        {isReaderPage ? <><span className="octopus-app-header__separator" aria-hidden="true" /><span className="octopus-app-header__context">阅读工作区</span></> : null}
       </div>
       <div className="octopus-app-header__actions">
-        {rightContent ?? (
+        {rightContent ?? (isReaderPage ? (
+          <>
+            <nav className="octopus-app-header__primary-nav" aria-label="主要导航">
+              <Link className="octopus-header-link" to="/">课程</Link>
+              <Link className="octopus-header-link" to={knowledgeLibraryTarget}>知识库</Link>
+            </nav>
+            {lessonProcessingStatus ? <span className="octopus-status-pill">{lessonProcessingStatus}</span> : null}
+            <button
+              type="button"
+              className="octopus-primary-button octopus-primary-button--link"
+              onClick={handleToggleLesson}
+            >
+              {isLessonRecording ? '结束录音' : '开始上课'}
+            </button>
+            <details className="octopus-reader-more">
+              <summary aria-label="更多阅读器操作">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4" /><circle cx="12" cy="12" r="1.4" /><circle cx="19" cy="12" r="1.4" /></svg>
+                <span>更多</span>
+              </summary>
+              <div className="octopus-reader-more__menu">
+                <button type="button" onClick={handleUploadLessonAudio}>上传录音</button>
+                <button type="button" onClick={handleUploadLessonTranscript}>上传原文</button>
+                <Link to="/settings/api">API 配置</Link>
+                <Link to="/pdf" aria-current="page">PDF 阅读器</Link>
+              </div>
+            </details>
+          </>
+        ) : (
           <>
             <Link className="octopus-header-link" to="/">
               课程
@@ -71,39 +99,11 @@ export function AppHeader({
             <Link className="octopus-header-link" to="/settings/api">
               API 配置
             </Link>
-            {isReaderPage ? (
-              <>
-                {lessonProcessingStatus ? (
-                  <span className="octopus-status-pill">{lessonProcessingStatus}</span>
-                ) : null}
-                <button
-                  type="button"
-                  className="octopus-primary-button octopus-primary-button--link"
-                  onClick={handleToggleLesson}
-                >
-                  {isLessonRecording ? '结束录音' : '开始上课'}
-                </button>
-                <button
-                  type="button"
-                  className="octopus-header-link octopus-header-link--button"
-                  onClick={handleUploadLessonAudio}
-                >
-                  上传录音
-                </button>
-                <button
-                  type="button"
-                  className="octopus-header-link octopus-header-link--button"
-                  onClick={handleUploadLessonTranscript}
-                >
-                  上传原文
-                </button>
-              </>
-            ) : null}
             <Link className="octopus-primary-button octopus-primary-button--link" to="/pdf">
               PDF 阅读器
             </Link>
           </>
-        )}
+        ))}
       </div>
     </header>
   )
