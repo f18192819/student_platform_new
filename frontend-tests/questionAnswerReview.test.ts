@@ -34,8 +34,8 @@ test('only a review for the current grading revision changes the effective score
 })
 
 test('grading list styles do not target KaTeX internal spans', () => {
-  const css = readFileSync('src/App.css', 'utf8')
-  const component = readFileSync('src/features/question-answer/QuestionAnswerViewer.tsx', 'utf8')
+  const css = `${readFileSync('src/App.css', 'utf8')}\n${readFileSync('src/features/question-answer/question-answer.css', 'utf8')}`
+  const component = readFileSync('src/features/question-answer/GradingInspector.tsx', 'utf8')
 
   assert.doesNotMatch(css, /\.question-answer-grading\s+li\s+span\s*\{/)
   assert.match(css, /\.question-answer-grading__knowledge-status\s*\{/)

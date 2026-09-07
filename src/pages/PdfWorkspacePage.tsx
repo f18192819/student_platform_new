@@ -15,7 +15,6 @@ import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/Rela
 import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
 import { QuestionAnswerViewer } from '../features/question-answer/QuestionAnswerViewer'
 import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageLecturePlayback'
-import { useReaderPanelResize } from '../features/pdf-workspace/hooks/useReaderPanelResize'
 import { useRelatedMaterials } from '../features/pdf-workspace/hooks/useRelatedMaterials'
 import type {
   ComposerAttachment,
@@ -123,7 +122,6 @@ export function PdfWorkspacePage() {
   const currentFolderType =
     searchParams.get('folder') === 'past-exam' ? 'past-exam' : ('homework' as KnowledgeHomeworkFolderType)
   const [questionInput, setQuestionInput] = useState('')
-  const { readerGridRef, leftPanelWidth, rightPanelWidth, beginResize } = useReaderPanelResize()
   const [documentText, setDocumentText] = useState('')
   const [documentName, setDocumentName] = useState(DEFAULT_DOCUMENT_NAME)
   const [pdfPageCount, setPdfPageCount] = useState<number | null>(null)
@@ -2474,34 +2472,7 @@ export function PdfWorkspacePage() {
         onChange={handleLessonTranscriptUploadChange}
         hidden
       />
-      <section
-        ref={readerGridRef}
-        className="pdf-workspace__reader-grid"
-        style={
-          {
-            '--reader-left-width': `${leftPanelWidth}px`,
-            '--reader-right-width': `${rightPanelWidth}px`,
-          } as React.CSSProperties
-        }
-        >
-          <aside className="pdf-workspace__homework pdf-workspace__homework--fixed">
-            <RelatedMaterialsPanel
-              mode={viewerSource.kind === 'lecture' ? 'lecture' : 'question'}
-              currentPage={currentPage}
-              currentQuestionTitle={selectedHomeworkQuestion?.title ?? null}
-              cards={relatedMaterialCards}
-              isLoading={isLoadingRelatedMaterials}
-              onOpenCard={handleOpenRelatedMaterial}
-            />
-          </aside>
-
-        <button
-          type="button"
-          className="panel-resizer panel-resizer--left"
-          aria-label="调整关联资料宽度"
-          onPointerDown={(event) => beginResize('left', event.clientX)}
-        />
-
+      <section className="pdf-workspace__reader-grid">
         <div className="pdf-workspace__viewer">
           {isLectureViewer && activeKnowledgeCourseId && currentKnowledgeFileId ? (
             <LectureMasteryTest
@@ -2516,6 +2487,55 @@ export function PdfWorkspacePage() {
             sourceDocumentId={viewerSource.kind === 'homework' ? selectedHomework?.id ?? null : null}
             questionId={viewerSource.kind === 'homework' ? selectedHomeworkQuestion?.id ?? null : null}
             sourceType={currentFolderType}
+            relatedPanel={(
+              <RelatedMaterialsPanel
+                mode={viewerSource.kind === 'lecture' ? 'lecture' : 'question'}
+                currentPage={currentPage}
+                currentQuestionTitle={selectedHomeworkQuestion?.title ?? null}
+                cards={relatedMaterialCards}
+                isLoading={isLoadingRelatedMaterials}
+                onOpenCard={handleOpenRelatedMaterial}
+              />
+            )}
+            chatPanel={(
+              <ChatPanel
+                messages={visibleConversationMessages}
+                isAsking={isAsking}
+                latestAssistantMessageId={latestAssistantMessageId}
+                messagesContainerRef={messagesContainerRef}
+                composerAttachments={composerAttachments}
+                onRemoveAttachment={removeComposerAttachment}
+                questionInput={questionInput}
+                currentPage={currentPage}
+                pageFilter={pageFilter}
+                pageAnnotations={pageFilter === null ? [] : visibleAnnotations}
+                draftDoubt={draftDoubt}
+                selectedAnnotation={selectedAnnotation}
+                onCreateDoubt={() => {
+                  setDraftDoubt(createDraftDoubt(pageFilter ?? currentPage))
+                  setSelectedAnnotationId(null)
+                  setQuestionInput('')
+                  setComposerAttachments([])
+                  setIsCaptureMode(false)
+                }}
+                onSelectAnnotation={handleSelectAnnotation}
+                onQuestionInputChange={setQuestionInput}
+                onQuestionInputKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    void runQuestion()
+                  }
+                }}
+                onToggleCapture={() => void handleCaptureFromClipboard()}
+                onOpenUpload={() => chatUploadInputRef.current?.click()}
+                availableModels={availableDoubtModels}
+                activeModel={apiConfig.doubtModel}
+                onModelChange={handleModelChange}
+                onSend={() => void runQuestion()}
+                isSavingDoubt={isSavingDoubt}
+                canSend={!(isAsking || isSavingDoubt || !questionInput.trim() || !documentText.trim())}
+              />
+            )}
           >
             <PdfPreviewCanvas
               fileName={currentViewerName}
@@ -2558,51 +2578,6 @@ export function PdfWorkspacePage() {
             />
           </QuestionAnswerViewer>
         </div>
-
-        <button
-          type="button"
-          className="panel-resizer panel-resizer--right"
-          aria-label="调整 AI 对话宽度"
-          onPointerDown={(event) => beginResize('right', event.clientX)}
-        />
-
-        <ChatPanel
-          messages={visibleConversationMessages}
-          isAsking={isAsking}
-          latestAssistantMessageId={latestAssistantMessageId}
-          messagesContainerRef={messagesContainerRef}
-          composerAttachments={composerAttachments}
-          onRemoveAttachment={removeComposerAttachment}
-          questionInput={questionInput}
-          currentPage={currentPage}
-          pageFilter={pageFilter}
-          pageAnnotations={pageFilter === null ? [] : visibleAnnotations}
-          draftDoubt={draftDoubt}
-          selectedAnnotation={selectedAnnotation}
-          onCreateDoubt={() => {
-            setDraftDoubt(createDraftDoubt(pageFilter ?? currentPage))
-            setSelectedAnnotationId(null)
-            setQuestionInput('')
-            setComposerAttachments([])
-            setIsCaptureMode(false)
-          }}
-          onSelectAnnotation={handleSelectAnnotation}
-          onQuestionInputChange={setQuestionInput}
-          onQuestionInputKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault()
-              void runQuestion()
-            }
-          }}
-          onToggleCapture={() => void handleCaptureFromClipboard()}
-          onOpenUpload={() => chatUploadInputRef.current?.click()}
-          availableModels={availableDoubtModels}
-          activeModel={apiConfig.doubtModel}
-          onModelChange={handleModelChange}
-          onSend={() => void runQuestion()}
-          isSavingDoubt={isSavingDoubt}
-          canSend={!(isAsking || isSavingDoubt || !questionInput.trim() || !documentText.trim())}
-        />
       </section>
       {isLectureViewer ? (
         <PageLecturePlayer

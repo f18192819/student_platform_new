@@ -47,9 +47,7 @@ test('single Attempt deletion exposes structured backend detail', async () => {
 })
 
 test('Attempt card delete control is separate and stops card selection', () => {
-  const component = readFileSync(
-    'src/features/question-answer/QuestionAnswerViewer.tsx', 'utf8',
-  )
+  const component = readFileSync('src/features/question-answer/AttemptHistoryTray.tsx', 'utf8')
   assert.match(component, /className="question-answer-history__delete"/)
   assert.match(component, /event\.stopPropagation\(\)/)
   assert.match(component, /原始答案文件将保留/)

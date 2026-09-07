@@ -21,17 +21,16 @@ export function RelatedMaterialsPanel({
       : currentQuestionTitle || `习题第 ${currentPage} 页`
 
   return (
-    <section className="pdf-text-dock related-materials-panel">
-      <div className="pdf-text-dock__head">
+    <section className="related-materials-panel">
+      <div className="related-materials-panel__head">
         <div>
-          <span>Related</span>
           <strong>相关知识点与习题</strong>
         </div>
         <span className="related-materials-panel__context" title={contextLabel}>
           {contextLabel}
         </span>
       </div>
-      <div className="pdf-text-dock__body related-materials-panel__body">
+      <div className="related-materials-panel__body">
         {isLoading ? (
           <div className="empty-state">正在加载当前内容的关联资料...</div>
         ) : cards.length ? (

@@ -80,7 +80,6 @@ export function ChatPanel({
   }
 
   return (
-    <aside className="pdf-workspace__qa pdf-workspace__qa--fixed">
       <div className={`pdf-chat pdf-chat--reader${pageFilter !== null ? ' pdf-chat--with-doubt-sessions' : ''}`}>
         {pageFilter !== null ? (
           <section className="doubt-session-list" aria-label={`第 ${pageFilter} 页疑点会话`}>
@@ -217,6 +216,5 @@ export function ChatPanel({
           </div>
         </div>
       </div>
-    </aside>
   )
 }
