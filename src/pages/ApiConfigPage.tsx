@@ -7,6 +7,7 @@ import {
   openDeepSeekWebBridge,
   saveApiConfig,
   saveApiConfigToServer,
+  startDeepSeekWebBridge,
 } from '../lib/apiConfig'
 import type { DeepSeekWebBridgeStatus } from '../lib/apiConfig'
 import {
@@ -147,6 +148,7 @@ function DeepSeekBridgePanel({
   status,
   message,
   checking,
+  opening,
   onUrlChange,
   onCheck,
   onOpen,
@@ -155,6 +157,7 @@ function DeepSeekBridgePanel({
   status: DeepSeekWebBridgeStatus | null
   message: string
   checking: boolean
+  opening: boolean
   onUrlChange: (value: string) => void
   onCheck: () => void
   onOpen: () => void
@@ -172,11 +175,11 @@ function DeepSeekBridgePanel({
         <p>{message}</p>
       </div>
       <div className="model-config-actions">
-        <button type="button" className="ghost-button" onClick={onCheck} disabled={checking}>
+        <button type="button" className="ghost-button" onClick={onCheck} disabled={checking || opening}>
           {checking ? '正在检测...' : '检测连接'}
         </button>
-        <button type="button" className="ghost-button" onClick={onOpen} disabled={checking}>
-          打开 DeepSeek 登录
+        <button type="button" className="ghost-button" onClick={onOpen} disabled={checking || opening}>
+          {opening ? '正在启动...' : '打开 DeepSeek 登录'}
         </button>
       </div>
       <small className="settings-field__hint">
@@ -196,6 +199,7 @@ export function ApiConfigPage() {
   const [bridgeStatus, setBridgeStatus] = useState<DeepSeekWebBridgeStatus | null>(null)
   const [bridgeMessage, setBridgeMessage] = useState('尚未检测本地 Bridge。')
   const [bridgeChecking, setBridgeChecking] = useState(false)
+  const [bridgeOpening, setBridgeOpening] = useState(false)
   const [status, setStatus] = useState(
     '配置会保存到当前项目后端。文本模型用于问答与映射；网络学堂账号仅保存在后端，不会回写到浏览器本地。',
   )
@@ -241,14 +245,18 @@ export function ApiConfigPage() {
   }
 
   const openDeepSeekLogin = async () => {
-    setBridgeChecking(true)
+    setBridgeOpening(true)
+    setBridgeMessage('正在启动 DeepSeek Web Bridge...')
     try {
+      await startDeepSeekWebBridge(form.deepseekWebBridgeUrl)
+      setBridgeMessage('Bridge 已启动，正在打开 DeepSeek 登录窗口...')
       await openDeepSeekWebBridge(form.deepseekWebBridgeUrl)
       setBridgeMessage('已打开独立 DeepSeek 调试浏览器，请在窗口中手动完成登录。')
+      setBridgeOpening(false)
       window.setTimeout(() => void checkDeepSeekBridge(), 1000)
     } catch (error) {
       setBridgeMessage(error instanceof Error ? error.message : '无法打开 DeepSeek 调试浏览器。')
-      setBridgeChecking(false)
+      setBridgeOpening(false)
     }
   }
 
@@ -850,6 +858,7 @@ export function ApiConfigPage() {
                 status={bridgeStatus}
                 message={bridgeMessage}
                 checking={bridgeChecking}
+                opening={bridgeOpening}
                 onUrlChange={(value) => updateField('deepseekWebBridgeUrl', value)}
                 onCheck={() => void checkDeepSeekBridge()}
                 onOpen={() => void openDeepSeekLogin()}
@@ -983,6 +992,7 @@ export function ApiConfigPage() {
                 status={bridgeStatus}
                 message={bridgeMessage}
                 checking={bridgeChecking}
+                opening={bridgeOpening}
                 onUrlChange={(value) => updateField('deepseekWebBridgeUrl', value)}
                 onCheck={() => void checkDeepSeekBridge()}
                 onOpen={() => void openDeepSeekLogin()}

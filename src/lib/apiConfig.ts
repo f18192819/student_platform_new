@@ -349,6 +349,15 @@ export async function openDeepSeekWebBridge(bridgeUrl: string) {
   return readBridgeResponse(response)
 }
 
+export async function startDeepSeekWebBridge(bridgeUrl: string) {
+  const response = await fetch(resolveBackendApiUrl('/api/deepseek-web/start'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bridge_url: bridgeUrl.trim() }),
+  })
+  return readBridgeResponse(response)
+}
+
 export function hasUsableAsrConfig(config: ApiConfig) {
   return Boolean(config.asrBaseUrl.trim() && config.asrApiKey.trim() && config.asrModel.trim())
 }

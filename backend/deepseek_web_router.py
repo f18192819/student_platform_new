@@ -6,13 +6,20 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException
 
 from .deepseek_web_bridge import DeepSeekWebBridgeClient, DeepSeekWebBridgeError
+from .deepseek_web_process import (
+  DeepSeekWebProcessManager,
+  DeepSeekWebStartupError,
+  deepseek_web_process_manager,
+)
 from .runtime_config import load_api_config
 
 
 def create_deepseek_web_router(
   client: DeepSeekWebBridgeClient | None = None,
+  process_manager: DeepSeekWebProcessManager | None = None,
 ) -> APIRouter:
   bridge = client or DeepSeekWebBridgeClient()
+  manager = process_manager or deepseek_web_process_manager
   router = APIRouter(prefix='/api/deepseek-web', tags=['deepseek-web-debug'])
 
   def bridge_url(payload: dict[str, Any] | None = None) -> str:
@@ -33,6 +40,17 @@ def create_deepseek_web_router(
   @router.post('/open')
   async def open_browser(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
     return await execute(bridge.open_browser, bridge_url(payload))
+
+  @router.post('/start')
+  async def start_bridge(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    try:
+      return await asyncio.to_thread(manager.ensure_started, bridge_url(payload))
+    except (DeepSeekWebBridgeError, DeepSeekWebStartupError) as exc:
+      message = str(exc) or 'DeepSeek Web Bridge 启动失败。'
+      raise HTTPException(
+        status_code=503,
+        detail={'code': 'bridge_start_failed', 'message': message},
+      ) from exc
 
   @router.post('/chat')
   async def chat(payload: dict[str, Any] = Body(...)) -> dict[str, str]:

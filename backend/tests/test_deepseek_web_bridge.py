@@ -145,6 +145,29 @@ class DeepSeekWebRouterTest(unittest.TestCase):
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
   })
+  def test_start_endpoint_launches_configured_local_bridge(self, _load):
+    class FakeManager:
+      def __init__(self):
+        self.urls = []
+
+      def ensure_started(self, url):
+        self.urls.append(url)
+        return {'started': True, 'ready': True, 'pid': 123}
+
+    manager = FakeManager()
+    client = TestClient(create_app_with_router(
+      create_deepseek_web_router(self.FakeClient(), manager),
+    ))
+
+    response = client.post('/api/deepseek-web/start', json={})
+
+    self.assertEqual(200, response.status_code)
+    self.assertTrue(response.json()['ready'])
+    self.assertEqual(['http://127.0.0.1:8765'], manager.urls)
+
+  @patch('backend.deepseek_web_router.load_api_config', return_value={
+    'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
+  })
   def test_proxy_forwards_structured_response_mode(self, _load):
     fake = self.FakeClient()
     client = TestClient(create_app_with_router(create_deepseek_web_router(fake)))
