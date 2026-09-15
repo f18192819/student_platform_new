@@ -17,7 +17,7 @@ from backend.audio_alignment import (
   SequentialPageAligner,
   TranscriptSegment,
 )
-from backend.media_router import transcribe_audio
+from backend.media_router import list_lecture_recordings, transcribe_audio
 
 
 class PendingAudioAlignmentTest(unittest.TestCase):
@@ -221,6 +221,23 @@ class PendingAudioAlignmentTest(unittest.TestCase):
         self.assertTrue((root / recording['audio_path']).is_file())
         stored = AudioAlignmentStore().read(UNASSIGNED_AUDIO_COURSE_ID, recording['id'])
         self.assertEqual('transcribed', stored['status'])
+
+  def test_unassigned_recordings_can_be_listed_before_a_course_is_selected(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      with patch('backend.audio_alignment.AUDIO_ALIGNMENT_ROOT', Path(temporary)):
+        store = AudioAlignmentStore()
+        recording = LectureRecording(
+          id='recording-unassigned',
+          course_id=UNASSIGNED_AUDIO_COURSE_ID,
+          audio_path='audio/unassigned.webm',
+          duration=5,
+        )
+        store.save(recording, [], {'status': 'transcribed', 'updated_at': 1})
+
+        result = asyncio.run(list_lecture_recordings(course_id=None, document_id=None))
+
+        self.assertEqual(1, len(result['recordings']))
+        self.assertEqual('recording-unassigned', result['recordings'][0]['recording']['id'])
 
 
 if __name__ == '__main__':

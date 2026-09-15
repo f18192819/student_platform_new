@@ -10,7 +10,19 @@ import './question-answer.css'
 
 const ACCEPTED_ANSWERS = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
 
-export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, questionId, sourceType, relatedPanel, chatPanel }: {
+export function QuestionAnswerViewer({
+  children,
+  courseId,
+  sourceDocumentId,
+  questionId,
+  sourceType,
+  relatedPanel,
+  chatPanel,
+  workspaceHistoryPanel,
+  workspaceHistoryBadge,
+  workspaceHistoryTitle,
+  workspaceHistoryLabel,
+}: {
   children: ReactNode
   courseId: string | null
   sourceDocumentId: string | null
@@ -18,6 +30,10 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
   sourceType: 'homework' | 'past-exam'
   relatedPanel: ReactNode
   chatPanel: ReactNode
+  workspaceHistoryPanel?: ReactNode
+  workspaceHistoryBadge?: string | number | null
+  workspaceHistoryTitle?: string
+  workspaceHistoryLabel?: string
 }) {
   const enabled = Boolean(courseId && sourceDocumentId && questionId)
   const identity: QuestionAnswerIdentity = {
@@ -146,9 +162,11 @@ export function QuestionAnswerViewer({ children, courseId, sourceDocumentId, que
       relatedPanel={relatedPanel}
       chatPanel={chatPanel}
       gradingPanel={gradingPanel}
-      historyPanel={historyPanel}
+      historyPanel={enabled ? historyPanel : workspaceHistoryPanel}
       gradingBadge={gradingSummary ? `${Math.round(gradingSummary.score * 100)}%` : selected ? '…' : null}
-      historyBadge={attempts.length || null}
+      historyBadge={enabled ? attempts.length || null : workspaceHistoryBadge}
+      historyTitle={enabled ? '历史作答' : workspaceHistoryTitle}
+      historyLabel={enabled ? '历史' : workspaceHistoryLabel}
     >{viewer}</ReaderWorkspaceLayout>
   )
 }

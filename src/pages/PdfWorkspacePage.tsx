@@ -13,6 +13,16 @@ import { ChatPanel } from '../features/pdf-workspace/components/ChatPanel'
 import { PageLecturePlayer } from '../features/pdf-workspace/components/PageLecturePlayer'
 import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/RelatedMaterialsPanel'
 import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
+import { LessonRecordingPanel } from '../features/lesson-recording/LessonRecordingPanel'
+import {
+  appendLessonRecordingChunk,
+  createLessonRecordingDraft,
+  getLessonRecordingOwnerId,
+  markLessonRecordingPending,
+  readLessonRecordingDrafts,
+  removeLessonRecordingDraft,
+} from '../features/lesson-recording/recordingDraftStore'
+import { useLessonRecordings } from '../features/lesson-recording/useLessonRecordings'
 import { QuestionAnswerViewer } from '../features/question-answer/QuestionAnswerViewer'
 import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageLecturePlayback'
 import { useRelatedMaterials } from '../features/pdf-workspace/hooks/useRelatedMaterials'
@@ -176,6 +186,10 @@ export function PdfWorkspacePage() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const lessonChunksRef = useRef<Blob[]>([])
   const lessonStreamRef = useRef<MediaStream | null>(null)
+  const lessonDraftIdRef = useRef<string | null>(null)
+  const lessonChunkOrderRef = useRef(0)
+  const lessonChunkWritesRef = useRef<Promise<void>>(Promise.resolve())
+  const lessonRecoveryStartedRef = useRef(false)
   const pdfInputRef = useRef<HTMLInputElement | null>(null)
   const chatUploadInputRef = useRef<HTMLInputElement | null>(null)
   const homeworkUploadInputRef = useRef<HTMLInputElement | null>(null)
@@ -376,6 +390,12 @@ export function PdfWorkspacePage() {
   const currentViewerStructuredBlocks =
     viewerSource.kind === 'homework' ? homeworkPreviewLayoutBlocks : lectureLayoutBlocks
   const isLectureViewer = viewerSource.kind === 'lecture'
+  const {
+    records: lessonRecordingRecords,
+    isLoading: isLoadingLessonRecordings,
+    error: lessonRecordingsError,
+    refresh: refreshLessonRecordings,
+  } = useLessonRecordings(activeKnowledgeCourseId, isLectureViewer)
   const activeHomeworkDocumentId =
     viewerSource.kind === 'homework' ? viewerSource.documentId : null
 
@@ -1415,14 +1435,21 @@ export function PdfWorkspacePage() {
   )
 
   const processLessonAudio = useCallback(
-    async (audioBlob: Blob, sourceLabel: string) => {
-      const targetCourseId = activeKnowledgeCourseIdRef.current
-      const targetDocumentId = knowledgeFileIdRef.current
+    async (
+      audioBlob: Blob,
+      sourceLabel: string,
+      storedContext?: { courseId: string | null; documentId: string | null },
+    ) => {
+      const currentCourseId = activeKnowledgeCourseIdRef.current
+      const targetCourseId = storedContext?.courseId?.trim() || currentCourseId
+      const targetDocumentId = storedContext?.documentId
+        || (targetCourseId === currentCourseId ? knowledgeFileIdRef.current : null)
       if (!audioBlob.size) {
         return
       }
 
       setIsProcessingLesson(true)
+      let recordingPersisted = false
       try {
         const config = loadApiConfig()
         emitLessonProcessingState('ASR 转写中')
@@ -1433,6 +1460,7 @@ export function PdfWorkspacePage() {
             ? { courseId: targetCourseId, documentId: targetDocumentId }
             : undefined,
         )
+        recordingPersisted = Boolean(transcript.recording)
         const targetDocument = targetDocumentId ? getKnowledgeFile(targetDocumentId) : null
         if (targetCourseId && targetDocumentId && targetDocument?.pipelineStatus === 'completed') {
           await persistLessonTranscript(transcript, sourceLabel, config, targetDocumentId)
@@ -1451,6 +1479,8 @@ export function PdfWorkspacePage() {
           ])
           emitLessonProcessingState(targetCourseId ? '等待上传讲义' : '等待选择课程或上传讲义')
         }
+        void refreshLessonRecordings()
+        return true
       } catch (error) {
         const message = error instanceof Error ? error.message : `${sourceLabel}处理失败`
         setChatMessages((current) => [
@@ -1458,25 +1488,78 @@ export function PdfWorkspacePage() {
           createMessage('system', `${sourceLabel}处理失败：${message}`),
         ])
         emitLessonProcessingState('处理失败')
+        if (recordingPersisted) void refreshLessonRecordings()
+        return recordingPersisted
       } finally {
         setIsProcessingLesson(false)
         window.setTimeout(() => emitLessonProcessingState(''), 1800)
       }
     },
-    [persistLessonTranscript],
+    [persistLessonTranscript, refreshLessonRecordings],
   )
+
+  useEffect(() => {
+    if (lessonRecoveryStartedRef.current) return
+    lessonRecoveryStartedRef.current = true
+
+    const recoverInterruptedRecordings = async () => {
+      try {
+        const drafts = await readLessonRecordingDrafts(getLessonRecordingOwnerId())
+        const recoverable = drafts.filter((item) => item.blob.size > 0)
+        if (!recoverable.length) return
+        emitLessonProcessingState(`正在恢复 ${recoverable.length} 段未提交录音`)
+        for (const item of recoverable) {
+          await markLessonRecordingPending(item.draft.id)
+          const saved = await processLessonAudio(
+            item.blob,
+            '刷新前的课堂录音',
+            { courseId: item.draft.courseId, documentId: item.draft.documentId },
+          )
+          if (saved) await removeLessonRecordingDraft(item.draft.id)
+        }
+      } catch (error) {
+        console.warn('Interrupted classroom recording recovery failed:', error)
+        emitLessonProcessingState('录音恢复失败，可刷新重试')
+      }
+    }
+
+    void recoverInterruptedRecordings()
+  }, [processLessonAudio])
 
   const startLessonRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       const recorder = new MediaRecorder(stream)
+      let draftId: string | null = null
+      try {
+        const draft = await createLessonRecordingDraft({
+          ownerId: getLessonRecordingOwnerId(),
+          courseId: activeKnowledgeCourseId,
+          documentId: knowledgeFileId,
+          mimeType: recorder.mimeType || 'audio/webm',
+        })
+        draftId = draft.id
+      } catch (error) {
+        console.warn('Recording draft persistence is unavailable:', error)
+      }
       lessonChunksRef.current = []
+      lessonDraftIdRef.current = draftId
+      lessonChunkOrderRef.current = 0
+      lessonChunkWritesRef.current = Promise.resolve()
       lessonStreamRef.current = stream
       mediaRecorderRef.current = recorder
 
       recorder.addEventListener('dataavailable', (event) => {
         if (event.data.size > 0) {
           lessonChunksRef.current.push(event.data)
+          if (draftId) {
+            const order = lessonChunkOrderRef.current++
+            lessonChunkWritesRef.current = lessonChunkWritesRef.current
+              .then(() => appendLessonRecordingChunk(draftId, order, event.data))
+              .catch((error) => {
+                console.warn('Failed to persist a classroom recording chunk:', error)
+              })
+          }
         }
       })
 
@@ -1494,23 +1577,41 @@ export function PdfWorkspacePage() {
           lessonStreamRef.current = null
           mediaRecorderRef.current = null
 
-          const audioBlob = new Blob(lessonChunksRef.current, {
+          await lessonChunkWritesRef.current
+          let audioBlob = new Blob(lessonChunksRef.current, {
             type: recorder.mimeType || 'audio/webm',
           })
           lessonChunksRef.current = []
+
+          if (draftId) {
+            try {
+              await markLessonRecordingPending(draftId)
+              const recovered = (await readLessonRecordingDrafts(getLessonRecordingOwnerId()))
+                .find((item) => item.draft.id === draftId)
+              if (recovered?.blob.size) audioBlob = recovered.blob
+            } catch (error) {
+              console.warn('Failed to finalize the persistent recording draft:', error)
+            }
+          }
 
           if (!audioBlob.size) {
             return
           }
 
-          await processLessonAudio(audioBlob, '课堂录音')
+          const saved = await processLessonAudio(audioBlob, '课堂录音')
+          if (saved && draftId) {
+            await removeLessonRecordingDraft(draftId).catch((error) => {
+              console.warn('Failed to remove a submitted recording draft:', error)
+            })
+          }
+          if (lessonDraftIdRef.current === draftId) lessonDraftIdRef.current = null
         },
         { once: true },
       )
 
-      recorder.start()
+      recorder.start(1000)
       setIsLessonRecording(true)
-      emitLessonProcessingState('录音中')
+      emitLessonProcessingState(draftId ? '录音中 · 已开启防丢保护' : '录音中 · 本地保护不可用')
       window.dispatchEvent(
         new CustomEvent('student-platform:lesson-recording-state', {
           detail: { isRecording: true },
@@ -2520,13 +2621,32 @@ export function PdfWorkspacePage() {
       lessonTranscriptUploadInputRef.current?.click()
     }
 
+    const persistLatestRecordingSlice = () => {
+      const recorder = mediaRecorderRef.current
+      if (recorder?.state === 'recording') {
+        try {
+          recorder.requestData()
+        } catch (error) {
+          console.warn('Unable to flush the latest recording slice:', error)
+        }
+      }
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') persistLatestRecordingSlice()
+    }
+
     window.addEventListener('student-platform:lesson-recording-toggle', handleToggle)
     window.addEventListener('student-platform:lesson-audio-upload', handleAudioUpload)
     window.addEventListener('student-platform:lesson-transcript-upload', handleTranscriptUpload)
+    window.addEventListener('pagehide', persistLatestRecordingSlice)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
       window.removeEventListener('student-platform:lesson-recording-toggle', handleToggle)
       window.removeEventListener('student-platform:lesson-audio-upload', handleAudioUpload)
       window.removeEventListener('student-platform:lesson-transcript-upload', handleTranscriptUpload)
+      window.removeEventListener('pagehide', persistLatestRecordingSlice)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
       lessonStreamRef.current?.getTracks().forEach((track) => track.stop())
     }
   }, [currentDocumentText, currentKnowledgeFileId, startLessonRecording, stopLessonRecording])
@@ -2633,6 +2753,19 @@ export function PdfWorkspacePage() {
                 canSend={!(isAsking || isSavingDoubt || !questionInput.trim() || !documentText.trim())}
               />
             )}
+            workspaceHistoryPanel={isLectureViewer ? (
+              <LessonRecordingPanel
+                records={lessonRecordingRecords}
+                isLoading={isLoadingLessonRecordings}
+                error={lessonRecordingsError}
+                onRefresh={() => void refreshLessonRecordings()}
+              />
+            ) : undefined}
+            workspaceHistoryBadge={isLectureViewer
+              ? isLessonRecording ? 'REC' : lessonRecordingRecords.length || null
+              : null}
+            workspaceHistoryTitle="课堂录音与 ASR"
+            workspaceHistoryLabel="课堂记录"
           >
             <PdfPreviewCanvas
               fileName={currentViewerName}

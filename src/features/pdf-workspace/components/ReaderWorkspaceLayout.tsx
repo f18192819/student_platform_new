@@ -13,6 +13,8 @@ export function ReaderWorkspaceLayout({
   historyPanel,
   gradingBadge,
   historyBadge,
+  historyTitle = '历史作答',
+  historyLabel = '历史',
   gradingPinRequest = 0,
 }: {
   children: ReactNode
@@ -22,6 +24,8 @@ export function ReaderWorkspaceLayout({
   historyPanel?: ReactNode
   gradingBadge?: string | number | null
   historyBadge?: string | number | null
+  historyTitle?: string
+  historyLabel?: string
   gradingPinRequest?: number
 }) {
   const panels = useFloatingWorkspacePanels()
@@ -55,7 +59,7 @@ export function ReaderWorkspaceLayout({
     { id: 'related' as const, label: '关联资料' },
     { id: 'chat' as const, label: 'AI 助手' },
     { id: 'grading' as const, label: '批改', badge: gradingBadge, disabled: !gradingPanel },
-    { id: 'history' as const, label: '历史', badge: historyBadge, disabled: !historyPanel },
+    { id: 'history' as const, label: historyLabel, badge: historyBadge, disabled: !historyPanel },
   ]
 
   return (
@@ -113,7 +117,7 @@ export function ReaderWorkspaceLayout({
         <WorkspacePanel
           panelKey={historyPanel ? bottom.panel : null}
           placement="bottom"
-          title="历史作答"
+          title={historyTitle}
           pinned={bottom.pinned}
           role="region"
           onEnter={() => panels.keepPanelOpen('history')}

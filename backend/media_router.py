@@ -2555,13 +2555,14 @@ async def align_lecture_recording(
 
 
 @media_router.get('/api/audio/recordings')
-async def list_lecture_recordings(course_id: str, document_id: str | None = None) -> dict[str, Any]:
+async def list_lecture_recordings(
+  course_id: str | None = None,
+  document_id: str | None = None,
+) -> dict[str, Any]:
   normalized_course_id = str(course_id or '').strip()
-  if not normalized_course_id:
-    raise HTTPException(status_code=422, detail='course_id is required.')
   normalized_document_id = str(document_id or '').strip()
   store = AudioAlignmentService().store
-  records = store.for_course(normalized_course_id)
+  records = store.for_course(normalized_course_id) if normalized_course_id else []
   if not normalized_document_id:
     known_ids = {
       str((item.get('recording') or {}).get('id') or '')
