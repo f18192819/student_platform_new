@@ -27,6 +27,7 @@ class LearnSyncSession:
   course_entries: list[dict[str, str]] = field(default_factory=list)
   imported_courses: list[dict[str, str]] = field(default_factory=list)
   downloaded_courseware: list[dict[str, Any]] = field(default_factory=list)
+  downloaded_homework: list[dict[str, Any]] = field(default_factory=list)
   last_error: str | None = None
   closed: bool = False
 

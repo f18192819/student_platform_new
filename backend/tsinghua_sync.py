@@ -35,6 +35,11 @@ from .tsinghua_courseware_state import (
   restore_deleted_synced_courseware,
 )
 from .knowledge_storage import restore_knowledge_file_source_keys
+from .tsinghua_homework import (
+  download_homework_files,
+  fetch_homework_catalog,
+  public_homework_file,
+)
 
 COURSE_HOME_URL = 'https://learn.tsinghua.edu.cn/f/wlxt/index/course/student'
 LEARN_HOST = 'learn.tsinghua.edu.cn'
@@ -3140,6 +3145,83 @@ def _list_courseware_by_course_identity(
   }
 
 
+def _resolve_course_identity_for_materials(
+  session: LearnSyncSession,
+  *,
+  course_name: str,
+  semester_id: str,
+  course_code: str,
+  wlkcid: str,
+  strict_identity: bool,
+) -> tuple[dict[str, str], dict[str, Any] | None]:
+  entries, matched_semester = _load_course_entries_for_session(session, semester_id)
+  entry = _find_course_entry_by_identity(
+    entries,
+    course_name=course_name,
+    semester_id=semester_id,
+    course_code=course_code,
+    wlkcid=wlkcid,
+    strict_identity=strict_identity,
+  )
+  if entry is None:
+    raise HTTPException(status_code=404, detail=f'未在指定学期找到课程“{course_name}”。')
+  if not _extract_wlkcid_from_course_entry(entry):
+    raise HTTPException(status_code=422, detail='当前课程缺少 wlkcid，无法读取作业。')
+  return entry, matched_semester
+
+
+def _homework_catalog_by_course_identity(
+  session: LearnSyncSession,
+  *,
+  course_name: str,
+  semester_id: str = '',
+  course_code: str = '',
+  wlkcid: str = '',
+  strict_identity: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+  entry, matched_semester = _resolve_course_identity_for_materials(
+    session,
+    course_name=course_name,
+    semester_id=semester_id,
+    course_code=course_code,
+    wlkcid=wlkcid,
+    strict_identity=strict_identity,
+  )
+  resolved_wlkcid = _extract_wlkcid_from_course_entry(entry)
+  records = fetch_homework_catalog(
+    _ensure_api_ready_session(session),
+    course_name=_normalize_text(entry.get('name')),
+    course_code=_normalize_text(entry.get('courseCode')),
+    wlkcid=resolved_wlkcid,
+    semester_id=_normalize_text(entry.get('semesterId')),
+    semester_name=_normalize_text(entry.get('semesterName')),
+  )
+  session.updated_at = _utc_now()
+  return records, matched_semester
+
+
+def _homework_result_payload(
+  session: LearnSyncSession,
+  course_name: str,
+  matched_semester: dict[str, Any] | None,
+  files: list[dict[str, Any]],
+  skipped: list[dict[str, str]] | None = None,
+  batch_id: str = '',
+) -> dict[str, Any]:
+  semester = matched_semester or {}
+  return {
+    'sessionId': session.session_id,
+    'batchId': batch_id,
+    'courseName': course_name,
+    'semesterId': _normalize_text(str(semester.get('id') or semester.get('semesterId') or '')),
+    'semesterName': _normalize_text(str(semester.get('semesterName') or '')),
+    'files': [public_homework_file(item) for item in files],
+    'skipped': skipped or [],
+    'count': len(files),
+    'updatedAt': session.updated_at,
+  }
+
+
 @tsinghua_router.post('/start')
 def start_tsinghua_sync() -> dict[str, Any]:
   session = _registry.create()
@@ -3331,12 +3413,86 @@ def list_tsinghua_courseware_by_course(
   )
 
 
+def _homework_identity_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+  course_name = _normalize_text(payload.get('courseName', ''))
+  if not course_name:
+    raise HTTPException(status_code=422, detail='courseName is required.')
+  strict_identity = bool(payload.get('strictIdentity'))
+  wlkcid = _normalize_text(payload.get('wlkcid', ''))
+  semester_id = _normalize_text(payload.get('semesterId', ''))
+  if strict_identity and not wlkcid:
+    raise HTTPException(status_code=422, detail='strictIdentity requires wlkcid.')
+  if strict_identity and not semester_id:
+    raise HTTPException(status_code=422, detail='strictIdentity requires the course semesterId.')
+  return {
+    'course_name': course_name,
+    'semester_id': semester_id,
+    'course_code': _normalize_text(payload.get('courseCode', '')),
+    'wlkcid': wlkcid,
+    'strict_identity': strict_identity,
+  }
+
+
+@tsinghua_router.post('/{session_id}/homework/list-by-course')
+def list_tsinghua_homework_by_course(
+  session_id: str,
+  payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+  session = _registry.get(session_id)
+  identity = _homework_identity_from_payload(payload)
+  files, semester = _homework_catalog_by_course_identity(session, **identity)
+  return _homework_result_payload(session, identity['course_name'], semester, files)
+
+
+@tsinghua_router.post('/{session_id}/homework/pull-by-course')
+def pull_tsinghua_homework_by_course(
+  session_id: str,
+  payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+  session = _registry.get(session_id)
+  identity = _homework_identity_from_payload(payload)
+  catalog, semester = _homework_catalog_by_course_identity(session, **identity)
+  batch_id = f'homework-{int(time.time() * 1000)}'
+  known_file_ids = {
+    _normalize_text(item) for item in payload.get('knownFileIds') or []
+    if isinstance(item, str) and _normalize_text(item)
+  }
+  known_file_names = {
+    _normalize_text(item).casefold() for item in payload.get('knownFileNames') or []
+    if isinstance(item, str) and _normalize_text(item)
+  }
+  requested_file_ids = {
+    _normalize_text(item) for item in payload.get('requestedFileIds') or []
+    if isinstance(item, str) and _normalize_text(item)
+  }
+  files, skipped = download_homework_files(
+    _ensure_api_ready_session(session),
+    catalog,
+    session.runtime_dir / 'downloads' / batch_id,
+    batch_id=batch_id,
+    requested_file_ids=requested_file_ids or None,
+    known_file_ids=known_file_ids,
+    known_file_names=known_file_names,
+  )
+  session.downloaded_homework.extend(files)
+  session.updated_at = _utc_now()
+  return _homework_result_payload(
+    session,
+    identity['course_name'],
+    semester,
+    files,
+    skipped,
+    batch_id,
+  )
+
+
 @tsinghua_router.post('/courseware/restore')
 def restore_tsinghua_courseware(payload: dict[str, Any] = Body(...)) -> dict[str, int]:
   source_keys = [
     _normalize_text(item)
     for item in payload.get('sourceKeys') or []
-    if isinstance(item, str) and _normalize_text(item).startswith('tsinghua-courseware:')
+    if isinstance(item, str)
+    and _normalize_text(item).startswith(('tsinghua-courseware:', 'tsinghua-homework:'))
   ]
   restore_deleted_synced_courseware(source_keys)
   restore_knowledge_file_source_keys(source_keys)
@@ -3361,6 +3517,25 @@ def read_tsinghua_courseware_file(session_id: str, download_id: str) -> FileResp
     path=local_path,
     filename=str(record.get('fileName') or local_path.name),
     media_type=str(record.get('mimeType') or 'application/octet-stream'),
+  )
+
+
+@tsinghua_router.get('/{session_id}/homework/{download_id}')
+def read_tsinghua_homework_file(session_id: str, download_id: str) -> FileResponse:
+  session = _registry.get(session_id)
+  record = next(
+    (item for item in session.downloaded_homework if str(item.get('id')) == download_id),
+    None,
+  )
+  if not record:
+    raise HTTPException(status_code=404, detail='未找到指定的作业下载记录。')
+  local_path = Path(str(record.get('path') or ''))
+  if not local_path.is_file():
+    raise HTTPException(status_code=404, detail='作业文件已不存在，请重新拉取。')
+  return FileResponse(
+    path=local_path,
+    filename=str(record.get('fileName') or local_path.name),
+    media_type=str(record.get('mimeType') or 'application/pdf'),
   )
 
 

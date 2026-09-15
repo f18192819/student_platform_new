@@ -3,7 +3,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from backend.tsinghua_courseware_state import (
+  load_suppressed_courseware,
+  mark_deleted_synced_homework,
+  restore_deleted_synced_courseware,
+)
 from backend.tsinghua_sync_state import LearnSyncRegistry, LearnSyncRegistryDeps
 
 
@@ -54,6 +60,21 @@ class TsinghuaSyncStateTest(unittest.TestCase):
     self.assertTrue(self.registry.close(session.session_id))
     self.assertTrue(self.registry.close(session.session_id))
     self.assertFalse(session.runtime_dir.exists())
+
+  def test_synced_homework_uses_same_suppression_and_restore_policy(self):
+    state_path = Path(self.temporary_directory.name) / 'auto-sync-state.json'
+    with patch('backend.tsinghua_courseware_state.STATE_PATH', state_path):
+      mark_deleted_synced_homework({
+        'sourceKey': 'tsinghua-homework:homework-1',
+        'courseId': 'course-1',
+        'fileName': '第一次作业.pdf',
+      })
+      suppressed = load_suppressed_courseware()
+      self.assertEqual('tsinghua-homework:homework-1', suppressed[0]['sourceKey'])
+      self.assertEqual('course-1', suppressed[0]['courseId'])
+
+      restore_deleted_synced_courseware({'tsinghua-homework:homework-1'})
+      self.assertEqual([], load_suppressed_courseware())
 
 
 if __name__ == '__main__':

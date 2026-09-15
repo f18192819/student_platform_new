@@ -79,6 +79,16 @@ export type TsinghuaCoursewareFile = {
   batchId: string
 }
 
+export type TsinghuaHomeworkFile = TsinghuaCoursewareFile & {
+  resourceType: 'homework'
+  assignmentId: string
+  studentAssignmentId?: string
+  assignmentTitle: string
+  description?: string
+  dueAt?: string
+  state?: 'pending' | 'submitted' | 'graded'
+}
+
 export type TsinghuaCoursewarePullResult = {
   sessionId: string
   batchId: string
@@ -96,6 +106,10 @@ export type TsinghuaCoursewarePullResult = {
 
 export type TsinghuaCoursewarePullByCourseResult = TsinghuaCoursewarePullResult & {
   courseName: string
+}
+
+export type TsinghuaHomeworkPullResult = Omit<TsinghuaCoursewarePullByCourseResult, 'files'> & {
+  files: TsinghuaHomeworkFile[]
 }
 
 export type TsinghuaCoursewareAutoSyncState = {
@@ -229,6 +243,43 @@ export async function listTsinghuaCoursewareByCourse(
   return parseResponse<TsinghuaCoursewarePullByCourseResult>(response)
 }
 
+function homeworkRequestPayload(course: TsinghuaCourseIdentity) {
+  return {
+    courseName: course.courseName,
+    semesterId: course.semesterId || '',
+    courseCode: course.courseCode || '',
+    wlkcid: course.wlkcid || '',
+    knownFileIds: course.knownFileIds || [],
+    knownFileNames: course.knownFileNames || [],
+    requestedFileIds: course.requestedFileIds || [],
+    strictIdentity: Boolean(course.strictIdentity),
+  }
+}
+
+export async function listTsinghuaHomeworkByCourse(
+  sessionId: string,
+  course: TsinghuaCourseIdentity,
+) {
+  const response = await fetch(resolveTsinghuaSyncApiUrl(`/${sessionId}/homework/list-by-course`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(homeworkRequestPayload(course)),
+  })
+  return parseResponse<TsinghuaHomeworkPullResult>(response)
+}
+
+export async function pullTsinghuaHomeworkByCourse(
+  sessionId: string,
+  course: TsinghuaCourseIdentity,
+) {
+  const response = await fetch(resolveTsinghuaSyncApiUrl(`/${sessionId}/homework/pull-by-course`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(homeworkRequestPayload(course)),
+  })
+  return parseResponse<TsinghuaHomeworkPullResult>(response)
+}
+
 export async function restoreTsinghuaCourseware(sourceKeys: string[]) {
   const response = await fetch(resolveTsinghuaSyncApiUrl('/courseware/restore'), {
     method: 'POST',
@@ -243,6 +294,15 @@ export async function fetchTsinghuaCoursewareFile(sessionId: string, downloadId:
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as { detail?: string }
     throw new Error(payload.detail || `课件下载读取失败 (HTTP ${response.status})`)
+  }
+  return response.blob()
+}
+
+export async function fetchTsinghuaHomeworkFile(sessionId: string, downloadId: string) {
+  const response = await fetch(resolveTsinghuaSyncApiUrl(`/${sessionId}/homework/${downloadId}`))
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { detail?: string }
+    throw new Error(payload.detail || `作业下载读取失败 (HTTP ${response.status})`)
   }
   return response.blob()
 }

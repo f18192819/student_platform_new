@@ -3,11 +3,13 @@ import { parseTsinghuaCourseDisplayName } from '../../lib/tsinghuaCourseLabels'
 import {
   closeTsinghuaSync,
   fetchTsinghuaCoursewareFile,
+  fetchTsinghuaHomeworkFile,
   getTsinghuaSyncStatus,
   importTsinghuaCourses,
   loadTsinghuaSemesters,
   loadTsinghuaCoursewareAutoSyncState,
   pullTsinghuaCoursewareByCourse,
+  pullTsinghuaHomeworkByCourse,
   startTsinghuaSync,
   type TsinghuaCourseCandidate,
 } from '../../lib/tsinghuaCourses'
@@ -15,11 +17,17 @@ import {
   ensureKnowledgeLibraryLoaded,
   getKnowledgeCourse,
   getKnowledgeFilesByCourse,
+  getKnowledgeHomeworkDocumentsByCourseFolder,
 } from '../../lib/knowledgeBase'
 import {
   buildCoursewareImportName,
   importCoursewareFiles,
 } from './coursewareImport'
+import {
+  buildHomeworkImportName,
+  homeworkSourceKey,
+  importHomeworkFiles,
+} from './homeworkImport'
 import {
   COURSEWARE_AUTO_SYNC_DELETION_EVENT,
   notifyCoursewareAutoSyncStatus,
@@ -28,6 +36,7 @@ import {
 
 const DEFAULT_COURSE_ID = 'general-course'
 const SOURCE_KEY_PREFIX = 'tsinghua-courseware:'
+const HOMEWORK_SOURCE_KEY_PREFIX = 'tsinghua-homework:'
 const READY_TIMEOUT_MS = 180_000
 
 let runningAutoCoursewareSync: Promise<void> | null = null
@@ -274,11 +283,71 @@ async function syncCoursewareForCourse(
   }
 }
 
+async function syncHomeworkForCourse(
+  sessionId: string,
+  course: KnowledgeCourse,
+  remoteCourse: TsinghuaCourseCandidate,
+  suppressed: Array<{ sourceKey: string; courseId: string; fileName: string }>,
+  suppressedDuringRun: Set<string>,
+) {
+  const currentDocuments = getKnowledgeHomeworkDocumentsByCourseFolder(course.id, 'homework')
+  const suppressedSourceKeys = new Set(suppressed.map((item) => item.sourceKey))
+  const suppressedFileNames = new Set(
+    suppressed.map((item) => normalizeFileName(item.fileName)).filter(Boolean),
+  )
+  const existingSourceKeys = new Set(currentDocuments.map((document) => document.sourceKey).filter(Boolean))
+  const existingFileNames = new Set(currentDocuments.map((document) => normalizeFileName(document.fileName)))
+  const knownFileIds = [
+    ...currentDocuments
+      .map((document) => document.sourceKey)
+      .filter((key): key is string => Boolean(key?.startsWith(HOMEWORK_SOURCE_KEY_PREFIX)))
+      .map((key) => key.slice(HOMEWORK_SOURCE_KEY_PREFIX.length)),
+    ...[...suppressedSourceKeys]
+      .filter((key) => key.startsWith(HOMEWORK_SOURCE_KEY_PREFIX))
+      .map((key) => key.slice(HOMEWORK_SOURCE_KEY_PREFIX.length)),
+  ]
+
+  const result = await pullTsinghuaHomeworkByCourse(sessionId, {
+    courseName: remoteCourse.name,
+    semesterId: remoteCourse.semesterId || course.semesterId || '',
+    courseCode: remoteCourse.courseCode || '',
+    wlkcid: remoteCourse.wlkcid || '',
+    knownFileIds,
+    knownFileNames: [...existingFileNames, ...suppressedFileNames],
+    strictIdentity: true,
+  })
+  const newFiles = result.files.filter((remoteFile) => {
+    const sourceKey = homeworkSourceKey(remoteFile.id)
+    const importName = normalizeFileName(buildHomeworkImportName(remoteFile))
+    return !suppressedSourceKeys.has(sourceKey)
+      && !suppressedFileNames.has(importName)
+      && !existingSourceKeys.has(sourceKey)
+      && !existingFileNames.has(importName)
+  })
+  if (!newFiles.length) {
+    notifyCoursewareAutoSyncStatus({ state: 'syncing', message: `已检查《${course.name}》，没有新的作业。` })
+    return
+  }
+  notifyCoursewareAutoSyncStatus({ state: 'syncing', message: `正在导入《${course.name}》的 ${newFiles.length} 份新作业。` })
+  const outcome = await importHomeworkFiles({
+    remoteFiles: newFiles,
+    fetchFile: (remoteFile) => fetchTsinghuaHomeworkFile(sessionId, remoteFile.id),
+    courseId: course.id,
+    onProgressMessage: (message) => notifyCoursewareAutoSyncStatus({ state: 'syncing', message }),
+    shouldImport: (remoteFile) => Boolean(getKnowledgeCourse(course.id))
+      && !suppressedDuringRun.has(homeworkSourceKey(remoteFile.id)),
+  })
+  if (outcome.importFailedCount) {
+    console.warn('[homework auto sync] course import failed:', course.name, outcome.failureReasons)
+  }
+}
+
 async function runAutoCoursewareSync() {
   const suppressedDuringRun = new Set<string>()
   const handleCoursewareDeletion = (event: Event) => {
     const detail = (event as CustomEvent<CoursewareAutoSyncDeletionDetail>).detail
-    if (!detail?.sourceKey.startsWith(SOURCE_KEY_PREFIX)) {
+    if (!detail?.sourceKey.startsWith(SOURCE_KEY_PREFIX)
+      && !detail?.sourceKey.startsWith(HOMEWORK_SOURCE_KEY_PREFIX)) {
       return
     }
     if (detail.action === 'suppress') {
@@ -290,11 +359,11 @@ async function runAutoCoursewareSync() {
   window.addEventListener(COURSEWARE_AUTO_SYNC_DELETION_EVENT, handleCoursewareDeletion)
 
   try {
-    notifyCoursewareAutoSyncStatus({ state: 'syncing', message: '正在检查网络学堂的新课件…' })
+    notifyCoursewareAutoSyncStatus({ state: 'syncing', message: '正在检查网络学堂的新课件和作业…' })
     const library = await ensureKnowledgeLibraryLoaded()
     const courses = library.courses.filter(isSynchronizableCourse)
     if (!courses.length) {
-      notifyCoursewareAutoSyncStatus({ state: 'completed', message: '当前没有需要检查的课程课件。' })
+      notifyCoursewareAutoSyncStatus({ state: 'completed', message: '当前没有需要检查的课程资料。' })
       return
     }
 
@@ -331,7 +400,7 @@ async function runAutoCoursewareSync() {
       if (!currentSemesterCourses.length) {
         notifyCoursewareAutoSyncStatus({
           state: 'completed',
-          message: '当前学期没有已同步的课程，无需检查新课件。',
+          message: '当前学期没有已同步的课程，无需检查新课件或作业。',
         })
         return
       }
@@ -356,10 +425,21 @@ async function runAutoCoursewareSync() {
             suppressedDuringRun,
           )
         } catch (error) {
-          console.warn('[courseware auto sync] skipped course after sync error:', course.name, error)
+          console.warn('[courseware auto sync] skipped courseware after sync error:', course.name, error)
+        }
+        try {
+          await syncHomeworkForCourse(
+            sessionId,
+            course,
+            remoteCourse,
+            autoSyncState.suppressed,
+            suppressedDuringRun,
+          )
+        } catch (error) {
+          console.warn('[homework auto sync] skipped homework after sync error:', course.name, error)
         }
       }
-      notifyCoursewareAutoSyncStatus({ state: 'completed', message: '网络学堂课件检查完成。' })
+      notifyCoursewareAutoSyncStatus({ state: 'completed', message: '网络学堂课件与作业检查完成。' })
     } finally {
       if (sessionId) {
         await closeTsinghuaSync(sessionId).catch((error) => {

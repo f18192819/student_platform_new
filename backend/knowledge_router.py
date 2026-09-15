@@ -27,7 +27,10 @@ from .knowledge_storage import (
   write_pdf_bytes,
 )
 from .study_plan_storage import read_course_study_plan, write_course_study_plan
-from .tsinghua_courseware_state import mark_deleted_synced_courseware
+from .tsinghua_courseware_state import (
+  mark_deleted_synced_courseware,
+  mark_deleted_synced_homework,
+)
 
 
 class KnowledgeLibraryService:
@@ -64,6 +67,13 @@ class KnowledgeLibraryService:
 
   def delete_course(self, course_id: str) -> dict[str, Any]:
     library = read_knowledge_library()
+    course_record = next(
+      (
+        item for item in library.get('courses') or []
+        if isinstance(item, dict) and str(item.get('id') or '') == course_id
+      ),
+      None,
+    )
     course_files = [
       item for item in library.get('files') or []
       if isinstance(item, dict) and str(item.get('courseId') or '') == course_id
@@ -82,6 +92,12 @@ class KnowledgeLibraryService:
       self.user_answers.delete_course(course_id)
       for file_record in course_files:
         mark_deleted_synced_courseware(file_record)
+      for folder in (course_record or {}).get('homeworkFolders') or []:
+        if not isinstance(folder, dict):
+          continue
+        for document in folder.get('homeworkDocuments') or []:
+          if isinstance(document, dict):
+            mark_deleted_synced_homework({**document, 'courseId': course_id})
     return result
 
 

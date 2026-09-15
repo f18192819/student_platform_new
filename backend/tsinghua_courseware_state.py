@@ -83,6 +83,38 @@ def mark_deleted_synced_courseware(file_record: dict[str, Any] | None) -> None:
     _write_state(state)
 
 
+def mark_deleted_synced_homework(document_record: dict[str, Any] | None) -> None:
+  """Persist a deleted synced homework document using the shared material policy."""
+  if not isinstance(document_record, dict):
+    return
+  source_key = str(document_record.get('sourceKey') or '').strip()
+  if not source_key.startswith('tsinghua-homework:'):
+    return
+  course_id = str(document_record.get('courseId') or '').strip()
+  file_name = _normalize_file_name(document_record.get('fileName'))
+  marker = {
+    'sourceKey': source_key,
+    'courseId': course_id,
+    'fileName': file_name,
+    'deletedAt': datetime.now(timezone.utc).isoformat(),
+  }
+  with _state_lock:
+    state = _read_state()
+    state['suppressed'] = [
+      item
+      for item in state['suppressed']
+      if str(item.get('sourceKey') or '') != source_key
+      and not (
+        course_id
+        and file_name
+        and str(item.get('courseId') or '') == course_id
+        and _normalize_file_name(item.get('fileName')) == file_name
+      )
+    ]
+    state['suppressed'].append(marker)
+    _write_state(state)
+
+
 def restore_deleted_synced_courseware(source_keys: list[str] | set[str]) -> None:
   """Remove suppression only after the user explicitly chooses to re-download."""
   normalized = {str(value or '').strip() for value in source_keys if str(value or '').strip()}

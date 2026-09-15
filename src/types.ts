@@ -115,6 +115,7 @@ export type StructuredDocumentBlock = {
 
 export type HomeworkDocument = {
   id: string
+  sourceKey?: string
   lectureDocumentId: string | null
   assetId: string | null
   fileName: string

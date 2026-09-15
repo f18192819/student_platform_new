@@ -11,9 +11,11 @@ from .application_runtime import ApplicationRuntime
 from .knowledge_storage import (
   delete_knowledge_homework_document,
   is_knowledge_file_deleted,
+  read_knowledge_library,
   sync_knowledge_homework_pipeline_result,
 )
 from .question_pipeline import QUESTION_UPLOAD_EXTENSIONS
+from .tsinghua_courseware_state import mark_deleted_synced_homework
 
 
 class PipelineRuntime(Protocol):
@@ -167,6 +169,19 @@ class PipelineApiService:
     return result
 
   async def delete_homework_document(self, course_id: str, document_id: str) -> dict[str, Any]:
+    library = await asyncio.to_thread(read_knowledge_library)
+    deleted_document = next(
+      (
+        document
+        for course in library.get('courses') or []
+        if isinstance(course, dict) and str(course.get('id') or '') == course_id
+        for folder in course.get('homeworkFolders') or []
+        if isinstance(folder, dict)
+        for document in folder.get('homeworkDocuments') or []
+        if isinstance(document, dict) and str(document.get('id') or '') == document_id
+      ),
+      None,
+    )
     result = await self.runtime.run_pipeline_task(
       delete_knowledge_homework_document,
       course_id,
@@ -174,6 +189,8 @@ class PipelineApiService:
       self.coordinator.delete_question_with_relations,
     )
     if result.get('deleted'):
+      if deleted_document is not None:
+        mark_deleted_synced_homework({**deleted_document, 'courseId': course_id})
       await asyncio.to_thread(delete_learning_document, course_id, document_id)
       await asyncio.to_thread(self.user_answers.delete_document, course_id, document_id)
     return result

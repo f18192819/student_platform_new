@@ -29,16 +29,20 @@ import { parseTsinghuaCourseDisplayName } from '../lib/tsinghuaCourseLabels'
 import {
   closeTsinghuaSync,
   fetchTsinghuaCoursewareFile,
+  fetchTsinghuaHomeworkFile,
   getTsinghuaSyncStatus,
   importTsinghuaCourses,
   listTsinghuaCoursewareByCourse,
+  listTsinghuaHomeworkByCourse,
   loadTsinghuaSemesters,
   loadTsinghuaCoursewareAutoSyncState,
   pullTsinghuaCoursewareByCourse,
+  pullTsinghuaHomeworkByCourse,
   restoreTsinghuaCourseware,
   startTsinghuaSync,
   type TsinghuaCourseCandidate,
   type TsinghuaCoursewareFile,
+  type TsinghuaHomeworkFile,
   type TsinghuaSemesterOption,
 } from '../lib/tsinghuaCourses'
 import {
@@ -46,6 +50,11 @@ import {
   formatCoursewareImportSummary,
   importCoursewareFiles,
 } from '../features/knowledge-library/coursewareImport'
+import {
+  buildHomeworkImportName,
+  homeworkSourceKey,
+  importHomeworkFiles,
+} from '../features/knowledge-library/homeworkImport'
 import { useKnowledgeLibraryState } from '../features/knowledge-library/useKnowledgeLibraryState'
 import {
   applyQuestionPipelineResult,
@@ -56,6 +65,7 @@ import type { HomeworkDocument, KnowledgeFile, KnowledgeLibraryFolderType } from
 
 type LibraryFolderType = KnowledgeLibraryFolderType | 'homework' | 'past-exam'
 type CoursewarePickerItem = TsinghuaCoursewareFile & { wasDeleted: boolean }
+type HomeworkPickerItem = TsinghuaHomeworkFile & { wasDeleted: boolean }
 
 const LIBRARY_FOLDER_NAMES: Record<KnowledgeLibraryFolderType, string> = {
   courseware: '课件',
@@ -263,6 +273,9 @@ export function KnowledgeLibraryPage() {
   const [isCoursewarePickerOpen, setIsCoursewarePickerOpen] = useState(false)
   const [coursewarePickerFiles, setCoursewarePickerFiles] = useState<CoursewarePickerItem[]>([])
   const [selectedCoursewareIds, setSelectedCoursewareIds] = useState<Set<string>>(() => new Set())
+  const [isHomeworkPickerOpen, setIsHomeworkPickerOpen] = useState(false)
+  const [homeworkPickerFiles, setHomeworkPickerFiles] = useState<HomeworkPickerItem[]>([])
+  const [selectedHomeworkIds, setSelectedHomeworkIds] = useState<Set<string>>(() => new Set())
   const uploadInputRef = useRef<HTMLInputElement>(null)
   const [uploadError, setUploadError] = useState('')
   const [isDraggingPdf, setIsDraggingPdf] = useState(false)
@@ -700,6 +713,7 @@ export function KnowledgeLibraryPage() {
         }))
       setCoursewarePickerFiles(available)
       setSelectedCoursewareIds(new Set())
+      setIsHomeworkPickerOpen(false)
       setIsCoursewarePickerOpen(true)
       setSyncMessage(available.length
         ? `找到 ${available.length} 份可下载课件，请勾选后下载。`
@@ -771,6 +785,109 @@ export function KnowledgeLibraryPage() {
       setIsCoursewarePickerOpen(false)
     } catch (error) {
       setSyncMessage(error instanceof Error ? error.message : '下载网络学堂课件失败。')
+    } finally {
+      setSyncBusy(false)
+      await closeCurrentSyncSession()
+    }
+  }
+
+  const handleOpenHomeworkPicker = async () => {
+    if (!activeCourse) return
+    if (isHomeworkPickerOpen) {
+      setIsHomeworkPickerOpen(false)
+      return
+    }
+    const courseIdentity = getActiveCoursewareIdentity()
+    if (!courseIdentity) return
+    setSyncBusy(true)
+    setSyncMessage(`正在读取“${courseIdentity.courseName}”的可下载作业…`)
+    try {
+      const sessionId = await ensureSyncSession()
+      if (!sessionId || !(await waitUntilReady(sessionId))) return
+      const [catalog, autoSyncState] = await Promise.all([
+        listTsinghuaHomeworkByCourse(sessionId, courseIdentity),
+        loadTsinghuaCoursewareAutoSyncState(),
+      ])
+      const documents = getKnowledgeHomeworkDocumentsByCourseFolder(activeCourse.id, 'homework')
+      const existingSourceKeys = new Set(documents.map((document) => document.sourceKey).filter(Boolean))
+      const existingNames = new Set(documents.map((document) => normalizeCoursewareFileName(document.fileName)))
+      const suppressedSourceKeys = new Set(autoSyncState.suppressed.map((item) => item.sourceKey))
+      const available = catalog.files
+        .filter((remoteFile) => (
+          !existingSourceKeys.has(homeworkSourceKey(remoteFile.id))
+          && !existingNames.has(normalizeCoursewareFileName(buildHomeworkImportName(remoteFile)))
+        ))
+        .map((remoteFile) => ({
+          ...remoteFile,
+          wasDeleted: suppressedSourceKeys.has(homeworkSourceKey(remoteFile.id)),
+        }))
+      setHomeworkPickerFiles(available)
+      setSelectedHomeworkIds(new Set())
+      setIsCoursewarePickerOpen(false)
+      setIsHomeworkPickerOpen(true)
+      setSyncMessage(available.length
+        ? `找到 ${available.length} 份可下载作业，请勾选后下载。`
+        : `“${courseIdentity.courseName}”没有未下载的作业附件。`)
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : '读取网络学堂作业失败。')
+    } finally {
+      setSyncBusy(false)
+      await closeCurrentSyncSession()
+    }
+  }
+
+  const toggleHomeworkSelection = (fileId: string) => {
+    setSelectedHomeworkIds((current) => {
+      const next = new Set(current)
+      if (next.has(fileId)) next.delete(fileId)
+      else next.add(fileId)
+      return next
+    })
+  }
+
+  const toggleSelectAllHomework = () => {
+    const selectable = homeworkPickerFiles.filter((file) => file.kind === 'pdf')
+    setSelectedHomeworkIds((current) => (
+      selectable.length && selectable.every((file) => current.has(file.id))
+        ? new Set()
+        : new Set(selectable.map((file) => file.id))
+    ))
+  }
+
+  const handleDownloadSelectedHomework = async () => {
+    if (!activeCourse || !selectedHomeworkIds.size) return
+    const courseIdentity = getActiveCoursewareIdentity()
+    if (!courseIdentity) return
+    const selected = homeworkPickerFiles.filter(
+      (file) => file.kind === 'pdf' && selectedHomeworkIds.has(file.id),
+    )
+    if (!selected.length) return
+    setSyncBusy(true)
+    setSyncMessage(`正在下载 ${selected.length} 份作业…`)
+    try {
+      const sessionId = await ensureSyncSession()
+      if (!sessionId || !(await waitUntilReady(sessionId))) return
+      await restoreTsinghuaCourseware(selected.map((file) => homeworkSourceKey(file.id)))
+      const result = await pullTsinghuaHomeworkByCourse(sessionId, {
+        ...courseIdentity,
+        requestedFileIds: selected.map((file) => file.id),
+      })
+      const outcome = await importHomeworkFiles({
+        remoteFiles: result.files,
+        fetchFile: (remoteFile) => fetchTsinghuaHomeworkFile(sessionId, remoteFile.id),
+        courseId: activeCourse.id,
+        onProgressMessage: setSyncMessage,
+      })
+      const failures = [
+        ...result.skipped.map((item) => `${item.fileName || '未命名作业'}：${item.reason}`),
+        ...outcome.failureReasons,
+      ]
+      setSyncMessage(failures.length
+        ? `下载 ${result.count} 份，成功处理 ${outcome.importedCount} 份；${failures.slice(0, 3).join('；')}`
+        : `已下载并处理 ${outcome.importedCount} 份作业，可在“作业题”文件夹查看。`)
+      setIsHomeworkPickerOpen(false)
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : '下载网络学堂作业失败。')
     } finally {
       setSyncBusy(false)
       await closeCurrentSyncSession()
@@ -1107,6 +1224,7 @@ export function KnowledgeLibraryPage() {
             </Link>
           ) : null}
           {activeCourse && !activeFolderType ? (
+            <>
             <div className="octopus-courseware-picker">
               <button
                 type="button"
@@ -1202,6 +1320,94 @@ export function KnowledgeLibraryPage() {
                 </section>
               ) : null}
             </div>
+            <div className="octopus-courseware-picker">
+              <button
+                type="button"
+                className="ghost-button octopus-ghost-button--link"
+                onClick={handleOpenHomeworkPicker}
+                disabled={syncBusy}
+                aria-expanded={isHomeworkPickerOpen}
+                aria-controls="homework-download-picker"
+              >
+                {syncBusy ? '正在读取资料…' : '下载作业'}
+              </button>
+              {isHomeworkPickerOpen ? (
+                <section
+                  id="homework-download-picker"
+                  className="octopus-courseware-picker__panel"
+                  aria-label="选择要下载的作业"
+                >
+                  <div className="octopus-courseware-picker__head">
+                    <div>
+                      <strong>选择作业</strong>
+                      <p>读取网络学堂作业题附件，下载后自动解析并写入作业题库。</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="octopus-courseware-picker__close"
+                      onClick={() => setIsHomeworkPickerOpen(false)}
+                      aria-label="关闭作业列表"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="octopus-courseware-picker__tools">
+                    <button
+                      type="button"
+                      onClick={toggleSelectAllHomework}
+                      disabled={!homeworkPickerFiles.some((file) => file.kind === 'pdf')}
+                    >
+                      {homeworkPickerFiles.some((file) => file.kind === 'pdf')
+                        && homeworkPickerFiles.filter((file) => file.kind === 'pdf').every((file) => selectedHomeworkIds.has(file.id))
+                        ? '取消全选'
+                        : '一键全选'}
+                    </button>
+                    <span>{homeworkPickerFiles.filter((file) => file.kind === 'pdf').length} 份可处理</span>
+                  </div>
+                  <div className="octopus-courseware-picker__list">
+                    {homeworkPickerFiles.length ? homeworkPickerFiles.map((file) => {
+                      const supported = file.kind === 'pdf'
+                      const content = (
+                        <>
+                          {supported ? (
+                            <input
+                              type="checkbox"
+                              checked={selectedHomeworkIds.has(file.id)}
+                              onChange={() => toggleHomeworkSelection(file.id)}
+                            />
+                          ) : <span className="octopus-courseware-picker__checkbox-placeholder" aria-hidden="true" />}
+                          <span className="octopus-courseware-picker__item-copy">
+                            <strong>{file.assignmentTitle}</strong>
+                            <small>{[file.fileName, file.dueAt ? `截止 ${file.dueAt}` : '', formatCoursewareSize(file.byteSize)].filter(Boolean).join(' · ')}</small>
+                          </span>
+                          {supported && file.wasDeleted ? <em>已删除，可重新下载</em> : null}
+                          {!supported ? <em className="octopus-courseware-picker__unsupported">仅支持 PDF 作业附件</em> : null}
+                        </>
+                      )
+                      return supported ? (
+                        <label key={file.id} className="octopus-courseware-picker__item">{content}</label>
+                      ) : (
+                        <div key={file.id} className="octopus-courseware-picker__item is-unsupported" aria-disabled="true">{content}</div>
+                      )
+                    }) : (
+                      <p className="octopus-courseware-picker__empty">当前课程没有未下载的作业附件。</p>
+                    )}
+                  </div>
+                  <div className="octopus-courseware-picker__footer">
+                    <span>已选 {homeworkPickerFiles.filter((file) => file.kind === 'pdf' && selectedHomeworkIds.has(file.id)).length} 份</span>
+                    <button
+                      type="button"
+                      className="octopus-primary-button"
+                      disabled={!selectedHomeworkIds.size || syncBusy}
+                      onClick={handleDownloadSelectedHomework}
+                    >
+                      下载并处理作业
+                    </button>
+                  </div>
+                </section>
+              ) : null}
+            </div>
+            </>
           ) : null}
           <input
             ref={uploadInputRef}

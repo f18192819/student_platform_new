@@ -495,6 +495,9 @@ function normalizeHomeworkDocument(document: Partial<HomeworkDocument>): Homewor
 
   return {
     id: documentId,
+    ...(typeof document.sourceKey === 'string' && document.sourceKey.trim()
+      ? { sourceKey: document.sourceKey.trim() }
+      : {}),
     lectureDocumentId:
       typeof document.lectureDocumentId === 'string' && document.lectureDocumentId.trim()
         ? document.lectureDocumentId.trim()
@@ -970,6 +973,12 @@ export async function deleteKnowledgeCourse(courseId: string) {
   const syncedSourceKeys = courseFiles
     .map((file) => file.sourceKey)
     .filter((sourceKey) => sourceKey.startsWith('tsinghua-courseware:'))
+  const course = knowledgeLibraryCache.courses.find((item) => item.id === courseId)
+  const syncedHomeworkSourceKeys = (course?.homeworkFolders ?? [])
+    .flatMap((folder) => folder.homeworkDocuments)
+    .map((document) => document.sourceKey || '')
+    .filter((sourceKey) => sourceKey.startsWith('tsinghua-homework:'))
+  syncedSourceKeys.push(...syncedHomeworkSourceKeys)
   for (const sourceKey of syncedSourceKeys) {
     notifyCoursewareAutoSyncDeletion({ sourceKey, action: 'suppress' })
   }
@@ -1131,10 +1140,17 @@ export async function loadKnowledgeHomeworkAsset(assetId: string) {
 
 export async function deleteKnowledgeHomeworkDocument(
   courseId: string,
-  _folderType: KnowledgeHomeworkFolderType,
+  folderType: KnowledgeHomeworkFolderType,
   homeworkDocumentId: string,
 ) {
   await ensureKnowledgeLibraryLoaded()
+  const document = getKnowledgeHomeworkDocumentsByCourseFolder(courseId, folderType)
+    .find((item) => item.id === homeworkDocumentId)
+  const sourceKey = document?.sourceKey || ''
+  const isSyncedHomework = sourceKey.startsWith('tsinghua-homework:')
+  if (isSyncedHomework) {
+    notifyCoursewareAutoSyncDeletion({ sourceKey, action: 'suppress' })
+  }
   const response = await fetch(
     resolveBackendApiUrl(
       `/api/knowledge/courses/${encodeURIComponent(courseId)}/homework-documents/${encodeURIComponent(homeworkDocumentId)}`,
@@ -1142,6 +1158,9 @@ export async function deleteKnowledgeHomeworkDocument(
     { method: 'DELETE' },
   )
   if (!response.ok) {
+    if (isSyncedHomework) {
+      notifyCoursewareAutoSyncDeletion({ sourceKey, action: 'restore' })
+    }
     throw new Error(
       await readResponseError(response, `删除题目文档失败 (HTTP ${response.status})`),
     )
@@ -1152,6 +1171,9 @@ export async function deleteKnowledgeHomeworkDocument(
   }
   if (payload.library) {
     setKnowledgeLibraryCache(payload.library)
+  }
+  if (payload.deleted !== true && isSyncedHomework) {
+    notifyCoursewareAutoSyncDeletion({ sourceKey, action: 'restore' })
   }
   return payload.deleted === true
 }
