@@ -1406,7 +1406,7 @@ export function PdfWorkspacePage() {
     async (audioBlob: Blob, sourceLabel: string) => {
       const targetCourseId = activeKnowledgeCourseIdRef.current
       const targetDocumentId = knowledgeFileIdRef.current
-      if (!audioBlob.size || !targetCourseId) {
+      if (!audioBlob.size) {
         return
       }
 
@@ -1414,12 +1414,15 @@ export function PdfWorkspacePage() {
       try {
         const config = loadApiConfig()
         emitLessonProcessingState('ASR 转写中')
-        const transcript = await transcribeAudioWithConfiguredAsr(audioBlob, config, {
-          courseId: targetCourseId,
-          documentId: targetDocumentId,
-        })
+        const transcript = await transcribeAudioWithConfiguredAsr(
+          audioBlob,
+          config,
+          targetCourseId
+            ? { courseId: targetCourseId, documentId: targetDocumentId }
+            : undefined,
+        )
         const targetDocument = targetDocumentId ? getKnowledgeFile(targetDocumentId) : null
-        if (targetDocumentId && targetDocument?.pipelineStatus === 'completed') {
+        if (targetCourseId && targetDocumentId && targetDocument?.pipelineStatus === 'completed') {
           await persistLessonTranscript(transcript, sourceLabel, config, targetDocumentId)
           emitLessonProcessingState('已完成')
         } else {
@@ -1429,10 +1432,12 @@ export function PdfWorkspacePage() {
               'system',
               targetDocumentId
                 ? `${sourceLabel}已完成 ASR 转写并保存。讲义处理完成后，后台会自动继续页码映射。`
-                : `${sourceLabel}已完成 ASR 转写并保存。上传本课程讲义后，后台会自动继续页码映射。`,
+                : targetCourseId
+                  ? `${sourceLabel}已完成 ASR 转写并保存。上传本课程讲义后，后台会自动继续页码映射。`
+                  : `${sourceLabel}已完成 ASR 转写并暂存。进入课程或上传讲义后，后台会自动绑定并继续页码映射。`,
             ),
           ])
-          emitLessonProcessingState('等待上传讲义')
+          emitLessonProcessingState(targetCourseId ? '等待上传讲义' : '等待选择课程或上传讲义')
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : `${sourceLabel}处理失败`
@@ -1450,14 +1455,6 @@ export function PdfWorkspacePage() {
   )
 
   const startLessonRecording = useCallback(async () => {
-    if (!activeKnowledgeCourseId) {
-      setChatMessages((current) => [
-        ...current,
-        createMessage('system', '请先从课程页面进入 PDF 阅读器，再开始上课录音。'),
-      ])
-      return
-    }
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       const recorder = new MediaRecorder(stream)
@@ -1513,12 +1510,15 @@ export function PdfWorkspacePage() {
           'system',
           knowledgeFileId
             ? '已开始录音。结束后系统会自动转写并映射到当前讲义。'
-            : '已开始录音。结束后先完成 ASR 转写；上传本课程讲义后会自动继续映射。',
+            : activeKnowledgeCourseId
+              ? '已开始录音。结束后先完成 ASR 转写；上传本课程讲义后会自动继续映射。'
+              : '已开始录音。结束后先完成 ASR 转写；进入课程或上传讲义后会自动绑定并继续映射。',
         ),
       ])
     } catch (error) {
       const message = error instanceof Error ? error.message : '无法启动录音'
-      emitLessonProcessingState('')
+      emitLessonProcessingState('麦克风启动失败')
+      window.setTimeout(() => emitLessonProcessingState(''), 3000)
       setChatMessages((current) => [
         ...current,
         createMessage('system', `录音启动失败：${message}`),
@@ -1533,22 +1533,15 @@ export function PdfWorkspacePage() {
       return
     }
 
-    if (!activeKnowledgeCourseId) {
-      setChatMessages((current) => [
-        ...current,
-        createMessage('system', '请先从课程页面进入 PDF 阅读器，再上传录音文件。'),
-      ])
-      event.target.value = ''
-      return
-    }
-
     setChatMessages((current) => [
       ...current,
       createMessage(
         'system',
         knowledgeFileId
           ? `已上传录音文件《${file.name}》，正在进行转写与课堂映射。`
-          : `已上传录音文件《${file.name}》，正在转写；上传讲义后会自动继续映射。`,
+          : activeKnowledgeCourseId
+            ? `已上传录音文件《${file.name}》，正在转写；上传讲义后会自动继续映射。`
+            : `已上传录音文件《${file.name}》，正在转写；进入课程或上传讲义后会自动绑定并继续映射。`,
       ),
     ])
 

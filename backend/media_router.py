@@ -19,7 +19,12 @@ from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
 from .application_runtime import ApplicationRuntime
-from .audio_alignment import AudioAlignmentService, LectureRecording, TranscriptSegment
+from .audio_alignment import (
+  UNASSIGNED_AUDIO_COURSE_ID,
+  AudioAlignmentService,
+  LectureRecording,
+  TranscriptSegment,
+)
 from .config import (
   ASR_DEBUG_DIR,
   ASR_DEBUG_TRANSCRIPT_LIMIT,
@@ -2456,48 +2461,49 @@ async def transcribe_audio(
     normalized_document_id = str(document_id or '').strip()
     if normalized_document_id and not normalized_course_id:
       raise HTTPException(status_code=422, detail='course_id is required when document_id is provided.')
-    if normalized_course_id:
-      recording_id = str(uuid.uuid4())
-      recording_dir = PROJECT_ROOT / '.runtime' / 'audio-recordings' / normalized_course_id / recording_id
-      recording_dir.mkdir(parents=True, exist_ok=True)
-      saved_audio_path = recording_dir / f'source{source_path.suffix or ".bin"}'
-      shutil.copy2(source_path, saved_audio_path)
-      recording = LectureRecording(
-        id=recording_id,
-        course_id=normalized_course_id,
-        document_id=normalized_document_id or None,
-        audio_path=str(saved_audio_path.relative_to(PROJECT_ROOT)),
-        duration=float(result.get('duration_seconds') or 0),
-      )
-      transcript_segments: list[TranscriptSegment] = []
-      for chunk_index, chunk in enumerate(result.get('chunks') or [], start=1):
-        if not isinstance(chunk, dict):
-          continue
-        raw_segments = chunk.get('segments')
-        if isinstance(raw_segments, list) and raw_segments:
-          for segment_index, segment in enumerate(raw_segments, start=1):
-            if not isinstance(segment, dict) or not str(segment.get('text') or '').strip():
-              continue
-            transcript_segments.append(TranscriptSegment(
-              id=f'{recording_id}:segment:{chunk_index}:{segment_index}',
-              recording_id=recording_id,
-              start_time=float(segment.get('start_seconds') or chunk.get('start_seconds') or 0),
-              end_time=float(segment.get('end_seconds') or chunk.get('end_seconds') or 0),
-              text=str(segment.get('text') or '').strip(),
-            ))
-        elif str(chunk.get('text') or '').strip():
+    storage_course_id = normalized_course_id or UNASSIGNED_AUDIO_COURSE_ID
+    recording_id = str(uuid.uuid4())
+    recording_dir = PROJECT_ROOT / '.runtime' / 'audio-recordings' / storage_course_id / recording_id
+    recording_dir.mkdir(parents=True, exist_ok=True)
+    saved_audio_path = recording_dir / f'source{source_path.suffix or ".bin"}'
+    shutil.copy2(source_path, saved_audio_path)
+    recording = LectureRecording(
+      id=recording_id,
+      course_id=storage_course_id,
+      document_id=normalized_document_id or None,
+      audio_path=str(saved_audio_path.relative_to(PROJECT_ROOT)),
+      duration=float(result.get('duration_seconds') or 0),
+    )
+    transcript_segments: list[TranscriptSegment] = []
+    for chunk_index, chunk in enumerate(result.get('chunks') or [], start=1):
+      if not isinstance(chunk, dict):
+        continue
+      raw_segments = chunk.get('segments')
+      if isinstance(raw_segments, list) and raw_segments:
+        for segment_index, segment in enumerate(raw_segments, start=1):
+          if not isinstance(segment, dict) or not str(segment.get('text') or '').strip():
+            continue
           transcript_segments.append(TranscriptSegment(
-            id=f'{recording_id}:chunk:{chunk_index}',
+            id=f'{recording_id}:segment:{chunk_index}:{segment_index}',
             recording_id=recording_id,
-            start_time=float(chunk.get('start_seconds') or 0),
-            end_time=float(chunk.get('end_seconds') or 0),
-            text=str(chunk.get('text') or '').strip(),
+            start_time=float(segment.get('start_seconds') or chunk.get('start_seconds') or 0),
+            end_time=float(segment.get('end_seconds') or chunk.get('end_seconds') or 0),
+            text=str(segment.get('text') or '').strip(),
           ))
-      if not transcript_segments:
-        raise HTTPException(status_code=502, detail='ASR returned text but no timestamped transcript segments.')
-      AudioAlignmentService().register(recording, transcript_segments)
-      result['recording'] = recording.model_dump()
-      result['transcript_segment_count'] = len(transcript_segments)
+      elif str(chunk.get('text') or '').strip():
+        transcript_segments.append(TranscriptSegment(
+          id=f'{recording_id}:chunk:{chunk_index}',
+          recording_id=recording_id,
+          start_time=float(chunk.get('start_seconds') or 0),
+          end_time=float(chunk.get('end_seconds') or 0),
+          text=str(chunk.get('text') or '').strip(),
+        ))
+    if not transcript_segments:
+      raise HTTPException(status_code=502, detail='ASR returned text but no timestamped transcript segments.')
+    AudioAlignmentService().register(recording, transcript_segments)
+    result['recording'] = recording.model_dump()
+    result['transcript_segment_count'] = len(transcript_segments)
+    result['pending_course_assignment'] = not normalized_course_id
     return result
   finally:
     if source_dir is not None:
@@ -2554,7 +2560,17 @@ async def list_lecture_recordings(course_id: str, document_id: str | None = None
   if not normalized_course_id:
     raise HTTPException(status_code=422, detail='course_id is required.')
   normalized_document_id = str(document_id or '').strip()
-  records = AudioAlignmentService().store.for_course(normalized_course_id)
+  store = AudioAlignmentService().store
+  records = store.for_course(normalized_course_id)
+  if not normalized_document_id:
+    known_ids = {
+      str((item.get('recording') or {}).get('id') or '')
+      for item in records
+    }
+    records.extend(
+      item for item in store.for_course(UNASSIGNED_AUDIO_COURSE_ID)
+      if str((item.get('recording') or {}).get('id') or '') not in known_ids
+    )
   if normalized_document_id:
     records = [
       item for item in records

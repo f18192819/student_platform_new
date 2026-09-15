@@ -17,6 +17,7 @@ from .runtime_config import load_api_config
 
 
 AUDIO_ALIGNMENT_ROOT = PROJECT_ROOT / '.runtime' / 'audio-alignment'
+UNASSIGNED_AUDIO_COURSE_ID = '__unassigned__'
 AlignmentCaller = Callable[[dict[str, Any]], dict[str, Any]]
 
 
@@ -113,6 +114,12 @@ class AudioAlignmentStore:
     if not isinstance(value, dict):
       raise ValueError('Stored recording is invalid.')
     return value
+
+  def delete(self, course_id: str, recording_id: str) -> None:
+    """Remove recording metadata without deleting its separately stored source audio."""
+    path = self._path(course_id, recording_id)
+    if path.is_file():
+      path.unlink()
 
   def for_course(self, course_id: str) -> list[dict[str, Any]]:
     directory = AUDIO_ALIGNMENT_ROOT / 'courses' / _course_key(course_id)
@@ -429,31 +436,41 @@ class AudioAlignmentService:
       return {'checked': 0, 'aligned': 0, 'failed': 0}
 
     candidates = []
-    for stored in self.store.for_course(normalized_course_id):
-      recording = LectureRecording.model_validate(stored.get('recording') or {})
-      status = str(stored.get('status') or '')
-      is_unbound = not recording.document_id and status == 'transcribed'
-      is_bound_retry = recording.document_id == normalized_document_id and status in {
-        'transcribed',
-        'aligning',
-        'alignment_failed',
-      }
-      if is_unbound or is_bound_retry:
-        candidates.append((recording, stored))
+    seen_recording_ids: set[str] = set()
+    for source_course_id in (normalized_course_id, UNASSIGNED_AUDIO_COURSE_ID):
+      for stored in self.store.for_course(source_course_id):
+        recording = LectureRecording.model_validate(stored.get('recording') or {})
+        if recording.id in seen_recording_ids:
+          continue
+        status = str(stored.get('status') or '')
+        is_unbound = not recording.document_id and status == 'transcribed'
+        is_bound_retry = (
+          source_course_id == normalized_course_id
+          and recording.document_id == normalized_document_id
+          and status in {'transcribed', 'aligning', 'alignment_failed'}
+        )
+        if is_unbound or is_bound_retry:
+          candidates.append((source_course_id, recording, stored))
+          seen_recording_ids.add(recording.id)
 
     result = {'checked': len(candidates), 'aligned': 0, 'failed': 0}
-    for recording, stored in candidates:
+    for source_course_id, recording, stored in candidates:
       segments = [
         TranscriptSegment.model_validate(item)
         for item in (stored.get('transcript_segments') or [])
       ]
-      bound = recording.model_copy(update={'document_id': normalized_document_id})
+      bound = recording.model_copy(update={
+        'course_id': normalized_course_id,
+        'document_id': normalized_document_id,
+      })
       self.store.save(bound, segments, {
         **{key: value for key, value in stored.items() if key not in {'recording', 'transcript_segments'}},
         'status': 'aligning',
         'alignment_error': '',
         'updated_at': time.time(),
       })
+      if source_course_id != normalized_course_id:
+        self.store.delete(source_course_id, recording.id)
       try:
         self.align(normalized_course_id, bound.id, pages, normalized_document_id)
         result['aligned'] += 1
