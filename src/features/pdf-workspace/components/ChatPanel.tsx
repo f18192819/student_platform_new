@@ -30,6 +30,7 @@ export function ChatPanel({
   onQuestionInputKeyDown,
   onToggleCapture,
   onOpenUpload,
+  showModelSelector = true,
   availableModels,
   activeModel,
   onModelChange,
@@ -55,6 +56,7 @@ export function ChatPanel({
   onQuestionInputKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void
   onToggleCapture: () => void
   onOpenUpload: () => void
+  showModelSelector?: boolean
   availableModels: string[]
   activeModel: string
   onModelChange: (model: string) => void
@@ -190,20 +192,22 @@ export function ChatPanel({
               <button type="button" className="chat-tool-button" onClick={onOpenUpload}>
                 上传图片/文档
               </button>
-              <label className="chat-model-select">
-                <span>模型</span>
-                <select value={activeModel} onChange={(event) => onModelChange(event.target.value)}>
-                  {availableModels.length ? (
-                    availableModels.map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))
-                  ) : (
-                    <option value="">未配置模型</option>
-                  )}
-                </select>
-              </label>
+              {showModelSelector ? (
+                <label className="chat-model-select">
+                  <span>模型</span>
+                  <select value={activeModel} onChange={(event) => onModelChange(event.target.value)}>
+                    {availableModels.length ? (
+                      availableModels.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))
+                    ) : (
+                      <option value="">未配置模型</option>
+                    )}
+                  </select>
+                </label>
+              ) : null}
             </div>
             <button
               type="button"

@@ -2745,6 +2745,7 @@ export function PdfWorkspacePage() {
                 }}
                 onToggleCapture={() => void handleCaptureFromClipboard()}
                 onOpenUpload={() => chatUploadInputRef.current?.click()}
+                showModelSelector={apiConfig.doubtProvider === 'api'}
                 availableModels={availableDoubtModels}
                 activeModel={apiConfig.doubtModel}
                 onModelChange={handleModelChange}
