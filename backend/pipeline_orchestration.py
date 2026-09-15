@@ -36,6 +36,7 @@ class PipelineCoordinator:
     relation_executor: Executor,
     queue_assessments: Callable[[set[str] | None], dict[str, int]],
     resume_assessments: Callable[[], dict[str, int]],
+    align_pending_recordings: Callable[[str, str], dict[str, int]] | None = None,
   ) -> None:
     self.documents = documents
     self.questions = questions
@@ -43,6 +44,7 @@ class PipelineCoordinator:
     self.relation_executor = relation_executor
     self.queue_assessments = queue_assessments
     self.resume_assessments = resume_assessments
+    self.align_pending_recordings = align_pending_recordings
 
   @staticmethod
   def _relation_question_ids(result: dict[str, Any]) -> set[str]:
@@ -57,12 +59,33 @@ class PipelineCoordinator:
     state = self.documents.run(document_id)
     if state.get('status') != 'completed' or state.get('document_type') != 'lecture':
       return state
+    self.queue_pending_audio_alignment(
+      str(state.get('course_id') or ''),
+      str(state.get('document_id') or document_id),
+    )
     try:
       result = self.relations.link_course(str(state.get('course_id') or ''))
       self.queue_assessments(self._relation_question_ids(result))
     except Exception as exc:  # Relation refresh is an optional projection.
       state['relation_refresh_error'] = str(getattr(exc, 'detail', exc))
     return state
+
+  def queue_pending_audio_alignment(self, course_id: str, document_id: str) -> None:
+    if not self.align_pending_recordings or not course_id or not document_id:
+      return
+    future = self.relation_executor.submit(
+      self.align_pending_recordings,
+      course_id,
+      document_id,
+    )
+
+    def report_failure(completed_future) -> None:
+      try:
+        completed_future.result()
+      except Exception as exc:
+        print(f'Pending classroom audio alignment failed for {document_id}: {exc}')
+
+    future.add_done_callback(report_failure)
 
   def refresh_question_document_relations(self, document_id: str) -> str:
     try:

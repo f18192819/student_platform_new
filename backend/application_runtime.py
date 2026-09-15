@@ -10,6 +10,7 @@ from .adaptive_testing import (
   queue_related_assessment_preparations,
   resume_assessment_preparations,
 )
+from .audio_alignment import AudioAlignmentService
 from .chat_retrieval import ChatContextRetriever
 from .document_pipeline import DocumentPipeline, QDRANT_COLLECTION, local_mineru_service
 from .pipeline_orchestration import PipelineCoordinator
@@ -41,6 +42,7 @@ class ApplicationRuntime:
       self.learning_state,
       self.user_answer_contexts,
     )
+    self.audio_alignment = AudioAlignmentService()
     self.document_pipeline: DocumentPipeline | None = None
     self.question_pipeline: QuestionPipeline | None = None
     self.question_relations: QuestionRelationPipeline | None = None
@@ -124,6 +126,11 @@ class ApplicationRuntime:
       relation_executor=self._relation_executor,
       queue_assessments=queue_related_assessment_preparations,
       resume_assessments=resume_assessment_preparations,
+      align_pending_recordings=lambda course_id, document_id: self.audio_alignment.align_pending_for_document(
+        course_id,
+        document_id,
+        documents.pages(document_id),
+      ),
     )
     try:
       relations.rebuild_lecture_document_indexes()

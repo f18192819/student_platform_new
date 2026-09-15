@@ -75,7 +75,7 @@ class FakeRelations:
 
 
 class PipelineCoordinatorTest(unittest.TestCase):
-  def build(self, *, documents=None, questions=None, relations=None):
+  def build(self, *, documents=None, questions=None, relations=None, align_pending=None):
     queued = []
     coordinator = PipelineCoordinator(
       documents=documents or FakeDocuments(),
@@ -84,6 +84,7 @@ class PipelineCoordinatorTest(unittest.TestCase):
       relation_executor=ImmediateExecutor(),
       queue_assessments=lambda ids: queued.append(set(ids or set())) or {'queued': len(ids or [])},
       resume_assessments=lambda: {'resumed': 0},
+      align_pending_recordings=align_pending,
     )
     return coordinator, queued
 
@@ -102,6 +103,18 @@ class PipelineCoordinatorTest(unittest.TestCase):
       calls,
     )
     self.assertEqual([{'q1', 'q2'}], queued)
+
+  def test_completed_lecture_queues_pending_audio_alignment(self):
+    aligned = []
+    coordinator, _ = self.build(
+      align_pending=lambda course_id, document_id: aligned.append(
+        (course_id, document_id),
+      ) or {'checked': 1, 'aligned': 1, 'failed': 0},
+    )
+
+    coordinator.run_document_with_relations('lecture-1')
+
+    self.assertEqual([('c1', 'lecture-1')], aligned)
 
   def test_relation_projection_failure_does_not_fail_indexing(self):
     coordinator, queued = self.build(relations=FakeRelations(fail_link=True))

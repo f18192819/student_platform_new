@@ -23,9 +23,10 @@ AlignmentCaller = Callable[[dict[str, Any]], dict[str, Any]]
 class LectureRecording(BaseModel):
   id: str
   course_id: str
-  document_id: str
+  document_id: str | None = None
   audio_path: str
   duration: float = Field(ge=0)
+  created_at: float = Field(default_factory=time.time)
 
 
 class TranscriptSegment(BaseModel):
@@ -112,6 +113,28 @@ class AudioAlignmentStore:
     if not isinstance(value, dict):
       raise ValueError('Stored recording is invalid.')
     return value
+
+  def for_course(self, course_id: str) -> list[dict[str, Any]]:
+    directory = AUDIO_ALIGNMENT_ROOT / 'courses' / _course_key(course_id)
+    if not directory.is_dir():
+      return []
+    records: list[dict[str, Any]] = []
+    for path in directory.glob('*.json'):
+      try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+      except (OSError, json.JSONDecodeError):
+        continue
+      if not isinstance(value, dict):
+        continue
+      recording = value.get('recording')
+      if not isinstance(recording, dict) or str(recording.get('course_id') or '') != course_id:
+        continue
+      records.append(value)
+    return sorted(
+      records,
+      key=lambda item: float(item.get('updated_at') or 0),
+      reverse=True,
+    )
 
 
 def build_transcript_windows(
@@ -364,9 +387,21 @@ class AudioAlignmentService:
     })
     return self.store.read(recording.course_id, recording.id)
 
-  def align(self, course_id: str, recording_id: str, pages: list[dict[str, Any]]) -> dict[str, Any]:
+  def align(
+    self,
+    course_id: str,
+    recording_id: str,
+    pages: list[dict[str, Any]],
+    document_id: str | None = None,
+  ) -> dict[str, Any]:
     stored = self.store.read(course_id, recording_id)
     recording = LectureRecording.model_validate(stored['recording'])
+    normalized_document_id = str(document_id or recording.document_id or '').strip()
+    if not normalized_document_id:
+      raise ValueError('document_id is required before audio alignment.')
+    if recording.document_id and recording.document_id != normalized_document_id:
+      raise ValueError('Recording is already bound to another lecture document.')
+    recording = recording.model_copy(update={'document_id': normalized_document_id})
     segments = [TranscriptSegment.model_validate(item) for item in stored.get('transcript_segments') or []]
     windows = build_transcript_windows(segments)
     aligner = self.aligner or SequentialPageAligner.from_runtime_config()
@@ -381,3 +416,54 @@ class AudioAlignmentService:
       'updated_at': time.time(),
     })
     return self.store.read(course_id, recording_id)
+
+  def align_pending_for_document(
+    self,
+    course_id: str,
+    document_id: str,
+    pages: list[dict[str, Any]],
+  ) -> dict[str, int]:
+    normalized_course_id = str(course_id or '').strip()
+    normalized_document_id = str(document_id or '').strip()
+    if not normalized_course_id or not normalized_document_id:
+      return {'checked': 0, 'aligned': 0, 'failed': 0}
+
+    candidates = []
+    for stored in self.store.for_course(normalized_course_id):
+      recording = LectureRecording.model_validate(stored.get('recording') or {})
+      status = str(stored.get('status') or '')
+      is_unbound = not recording.document_id and status == 'transcribed'
+      is_bound_retry = recording.document_id == normalized_document_id and status in {
+        'transcribed',
+        'aligning',
+        'alignment_failed',
+      }
+      if is_unbound or is_bound_retry:
+        candidates.append((recording, stored))
+
+    result = {'checked': len(candidates), 'aligned': 0, 'failed': 0}
+    for recording, stored in candidates:
+      segments = [
+        TranscriptSegment.model_validate(item)
+        for item in (stored.get('transcript_segments') or [])
+      ]
+      bound = recording.model_copy(update={'document_id': normalized_document_id})
+      self.store.save(bound, segments, {
+        **{key: value for key, value in stored.items() if key not in {'recording', 'transcript_segments'}},
+        'status': 'aligning',
+        'alignment_error': '',
+        'updated_at': time.time(),
+      })
+      try:
+        self.align(normalized_course_id, bound.id, pages, normalized_document_id)
+        result['aligned'] += 1
+      except Exception as exc:  # A failed mapping remains retryable without rerunning ASR.
+        latest = self.store.read(normalized_course_id, bound.id)
+        self.store.save(bound, segments, {
+          **{key: value for key, value in latest.items() if key not in {'recording', 'transcript_segments'}},
+          'status': 'alignment_failed',
+          'alignment_error': str(exc),
+          'updated_at': time.time(),
+        })
+        result['failed'] += 1
+    return result

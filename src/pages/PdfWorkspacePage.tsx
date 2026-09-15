@@ -47,6 +47,7 @@ import {
 import {
   buildClassroomSessionWithApi,
   buildClassroomSessionFromSequentialAlignment,
+  loadCourseLectureRecordings,
   askWithConfiguredVisionApi,
   loadLatestDebugClassroomSession,
   summarizeChatMemoryWithConfiguredApi,
@@ -240,6 +241,12 @@ export function PdfWorkspacePage() {
     homeworkDocuments[0] ??
     null
   const activeKnowledgeCourseId = currentCourseId ?? knowledgeCourseId
+  const activeKnowledgeCourseIdRef = useRef(activeKnowledgeCourseId)
+  const knowledgeFileIdRef = useRef(knowledgeFileId)
+  useEffect(() => {
+    activeKnowledgeCourseIdRef.current = activeKnowledgeCourseId
+    knowledgeFileIdRef.current = knowledgeFileId
+  }, [activeKnowledgeCourseId, knowledgeFileId])
   const activeAnnotations = useMemo(
     () => (viewerSource.kind === 'homework' ? selectedHomework?.annotations ?? [] : annotations),
     [annotations, selectedHomework, viewerSource.kind],
@@ -1136,6 +1143,64 @@ export function PdfWorkspacePage() {
     }
   }, [knowledgeFileId])
 
+  useEffect(() => {
+    if (!knowledgeFileId || !activeKnowledgeCourseId) {
+      return
+    }
+    let cancelled = false
+    let pollTimer: number | null = null
+
+    const refreshMappedRecordings = async () => {
+      try {
+        const result = await loadCourseLectureRecordings(
+          activeKnowledgeCourseId,
+          knowledgeFileId,
+        )
+        if (cancelled) return
+        if (result.sessions.length) {
+          const storedSessions = result.sessions.map((session) =>
+            saveKnowledgeClassroomSession(knowledgeFileId, session),
+          )
+          setClassroomSessions((current) => {
+            const importedIds = new Set(storedSessions.map((session) => session.id))
+            return [
+              ...storedSessions,
+              ...current.filter((session) => !importedIds.has(session.id)),
+            ]
+          })
+        }
+        if (result.failed) {
+          setChatMessages((current) => current.some((message) =>
+            message.content.includes('课堂录音已转写，但自动页码映射失败'),
+          ) ? current : [
+            ...current,
+            createMessage(
+              'system',
+              '课堂录音已转写，但自动页码映射失败。录音和 ASR 结果仍已保留，可稍后重试。',
+            ),
+          ])
+        }
+        if (result.waiting) {
+          emitLessonProcessingState('课堂录音等待映射')
+          pollTimer = window.setTimeout(refreshMappedRecordings, 2500)
+        } else if (result.sessions.length) {
+          emitLessonProcessingState('课堂映射已完成')
+          window.setTimeout(() => emitLessonProcessingState(''), 1800)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.warn('Pending classroom recording refresh failed:', error)
+        }
+      }
+    }
+
+    void refreshMappedRecordings()
+    return () => {
+      cancelled = true
+      if (pollTimer !== null) window.clearTimeout(pollTimer)
+    }
+  }, [activeKnowledgeCourseId, knowledgeFileId])
+
   const handlePdfChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (!file) {
@@ -1302,9 +1367,10 @@ export function PdfWorkspacePage() {
         | AsrTranscriptionResult,
       sourceLabel: string,
       config: ApiConfig,
+      targetDocumentId = knowledgeFileId,
     ) => {
       const transcriptText = typeof transcript === 'string' ? transcript : transcript.text
-      if (!transcriptText.trim() || !knowledgeFileId) {
+      if (!transcriptText.trim() || !targetDocumentId) {
         return
       }
 
@@ -1314,7 +1380,7 @@ export function PdfWorkspacePage() {
           ? await buildClassroomSessionFromSequentialAlignment(
               transcript,
               activeKnowledgeCourseId,
-              knowledgeFileId,
+              targetDocumentId,
             )
           : await buildClassroomSessionWithApi(transcript, documentText, config)
       const mappedPageCount = new Set(
@@ -1323,7 +1389,7 @@ export function PdfWorkspacePage() {
       if (!session.segments.length || mappedPageCount === 0) {
         throw new Error('课堂映射未得到任何有效讲义页，请检查转写内容或模型输出。')
       }
-      const storedSession = saveKnowledgeClassroomSession(knowledgeFileId, session)
+      const storedSession = saveKnowledgeClassroomSession(targetDocumentId, session)
       setClassroomSessions((current) => [
         storedSession,
         ...current.filter((item) => item.id !== storedSession.id),
@@ -1338,7 +1404,9 @@ export function PdfWorkspacePage() {
 
   const processLessonAudio = useCallback(
     async (audioBlob: Blob, sourceLabel: string) => {
-      if (!audioBlob.size || !knowledgeFileId || !activeKnowledgeCourseId) {
+      const targetCourseId = activeKnowledgeCourseIdRef.current
+      const targetDocumentId = knowledgeFileIdRef.current
+      if (!audioBlob.size || !targetCourseId) {
         return
       }
 
@@ -1347,11 +1415,25 @@ export function PdfWorkspacePage() {
         const config = loadApiConfig()
         emitLessonProcessingState('ASR 转写中')
         const transcript = await transcribeAudioWithConfiguredAsr(audioBlob, config, {
-          courseId: activeKnowledgeCourseId,
-          documentId: knowledgeFileId,
+          courseId: targetCourseId,
+          documentId: targetDocumentId,
         })
-        await persistLessonTranscript(transcript, sourceLabel, config)
-        emitLessonProcessingState('已完成')
+        const targetDocument = targetDocumentId ? getKnowledgeFile(targetDocumentId) : null
+        if (targetDocumentId && targetDocument?.pipelineStatus === 'completed') {
+          await persistLessonTranscript(transcript, sourceLabel, config, targetDocumentId)
+          emitLessonProcessingState('已完成')
+        } else {
+          setChatMessages((current) => [
+            ...current,
+            createMessage(
+              'system',
+              targetDocumentId
+                ? `${sourceLabel}已完成 ASR 转写并保存。讲义处理完成后，后台会自动继续页码映射。`
+                : `${sourceLabel}已完成 ASR 转写并保存。上传本课程讲义后，后台会自动继续页码映射。`,
+            ),
+          ])
+          emitLessonProcessingState('等待上传讲义')
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : `${sourceLabel}处理失败`
         setChatMessages((current) => [
@@ -1364,14 +1446,14 @@ export function PdfWorkspacePage() {
         window.setTimeout(() => emitLessonProcessingState(''), 1800)
       }
     },
-    [activeKnowledgeCourseId, knowledgeFileId, persistLessonTranscript],
+    [persistLessonTranscript],
   )
 
   const startLessonRecording = useCallback(async () => {
-    if (!knowledgeFileId) {
+    if (!activeKnowledgeCourseId) {
       setChatMessages((current) => [
         ...current,
-        createMessage('system', '请先打开一份讲义 PDF，再开始上课录音。'),
+        createMessage('system', '请先从课程页面进入 PDF 阅读器，再开始上课录音。'),
       ])
       return
     }
@@ -1408,7 +1490,7 @@ export function PdfWorkspacePage() {
           })
           lessonChunksRef.current = []
 
-          if (!audioBlob.size || !knowledgeFileId) {
+          if (!audioBlob.size) {
             return
           }
 
@@ -1427,7 +1509,12 @@ export function PdfWorkspacePage() {
       )
       setChatMessages((current) => [
         ...current,
-        createMessage('system', '已开始录音。结束录音后，系统会自动转写并生成课堂讲解片段。'),
+        createMessage(
+          'system',
+          knowledgeFileId
+            ? '已开始录音。结束后系统会自动转写并映射到当前讲义。'
+            : '已开始录音。结束后先完成 ASR 转写；上传本课程讲义后会自动继续映射。',
+        ),
       ])
     } catch (error) {
       const message = error instanceof Error ? error.message : '无法启动录音'
@@ -1437,7 +1524,7 @@ export function PdfWorkspacePage() {
         createMessage('system', `录音启动失败：${message}`),
       ])
     }
-  }, [knowledgeFileId, processLessonAudio])
+  }, [activeKnowledgeCourseId, knowledgeFileId, processLessonAudio])
 
   const handleLessonAudioUploadChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -1446,10 +1533,10 @@ export function PdfWorkspacePage() {
       return
     }
 
-    if (!knowledgeFileId) {
+    if (!activeKnowledgeCourseId) {
       setChatMessages((current) => [
         ...current,
-        createMessage('system', '请先打开一份讲义 PDF，再上传录音文件。'),
+        createMessage('system', '请先从课程页面进入 PDF 阅读器，再上传录音文件。'),
       ])
       event.target.value = ''
       return
@@ -1457,7 +1544,12 @@ export function PdfWorkspacePage() {
 
     setChatMessages((current) => [
       ...current,
-      createMessage('system', `已上传录音文件《${file.name}》，正在进行转写与课堂映射。`),
+      createMessage(
+        'system',
+        knowledgeFileId
+          ? `已上传录音文件《${file.name}》，正在进行转写与课堂映射。`
+          : `已上传录音文件《${file.name}》，正在转写；上传讲义后会自动继续映射。`,
+      ),
     ])
 
     try {

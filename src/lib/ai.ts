@@ -49,12 +49,13 @@ const STREAM_IDLE_TIMEOUT_MS = 90000
 const CLASSROOM_SLIDING_MATCH_SCORE_THRESHOLD = 0.1
 const CLASSROOM_SLIDING_SKIP_MISS_LIMIT = 4
 
-type StoredLectureRecording = {
+export type StoredLectureRecording = {
   id: string
   course_id: string
-  document_id: string
+  document_id: string | null
   audio_path: string
   duration: number
+  created_at?: number
 }
 
 type PageTranscriptPayload = {
@@ -802,7 +803,7 @@ export async function askWithConfiguredApi(
 export async function transcribeAudioWithConfiguredAsr(
   audioBlob: Blob,
   _config: ApiConfig,
-  context?: { courseId: string; documentId: string },
+  context?: { courseId: string; documentId?: string | null },
 ): Promise<AsrTranscriptionResult> {
   const formData = new FormData()
   const extension = audioBlob.type.includes('mpeg')
@@ -826,9 +827,11 @@ export async function transcribeAudioWithConfiguredAsr(
         })
 
   formData.append('file', file, originalName)
-  if (context?.courseId.trim() && context.documentId.trim()) {
+  if (context?.courseId.trim()) {
     formData.append('course_id', context.courseId.trim())
-    formData.append('document_id', context.documentId.trim())
+    if (context.documentId?.trim()) {
+      formData.append('document_id', context.documentId.trim())
+    }
   }
 
   const response = await fetch(resolveAudioDebugApiUrl(), {
@@ -921,7 +924,7 @@ export async function buildClassroomSessionFromSequentialAlignment(
   if (!recording) {
     throw new Error('ASR response did not create a persistent lecture recording.')
   }
-  if (recording.course_id !== courseId || recording.document_id !== documentId) {
+  if (recording.course_id !== courseId || (recording.document_id && recording.document_id !== documentId)) {
     throw new Error('The recording does not belong to the currently open lecture.')
   }
 
@@ -941,7 +944,15 @@ export async function buildClassroomSessionFromSequentialAlignment(
     throw new Error(String(payload.detail || `Audio page alignment HTTP ${response.status}`))
   }
 
-  const segments = (payload.page_transcripts ?? [])
+  return buildClassroomSessionFromAlignedRecording(recording, transcript.text, payload.page_transcripts ?? [])
+}
+
+function buildClassroomSessionFromAlignedRecording(
+  recording: StoredLectureRecording,
+  transcript: string,
+  pageTranscripts: PageTranscriptPayload[],
+): ClassroomSession {
+  const segments = pageTranscripts
     .filter((item) => Number.isFinite(item.page_number) && item.page_number > 0 && item.text.trim())
     .map((item, index) => ({
       id: `${recording.id}:page-transcript:${index + 1}`,
@@ -963,12 +974,69 @@ export async function buildClassroomSessionFromSequentialAlignment(
   const now = new Date().toISOString()
   return {
     id: recording.id,
-    transcript: transcript.text,
+    transcript,
     polishedOverview: '',
     segments,
     createdAt: now,
     updatedAt: now,
   }
+}
+
+export async function loadCourseLectureRecordings(
+  courseId: string,
+  documentId: string,
+): Promise<{
+  sessions: ClassroomSession[]
+  waiting: boolean
+  failed: boolean
+}> {
+  const response = await fetch(
+    resolveBackendApiUrl(`/api/audio/recordings?course_id=${encodeURIComponent(courseId)}`),
+  )
+  const payload = (await response.json().catch(() => ({}))) as {
+    recordings?: Array<{
+      recording?: StoredLectureRecording
+      transcript_segments?: Array<{ text?: string }>
+      page_transcripts?: PageTranscriptPayload[]
+      status?: string
+    }>
+    detail?: string
+  }
+  if (!response.ok) {
+    throw new Error(String(payload.detail || `Lecture recording HTTP ${response.status}`))
+  }
+
+  const sessions: ClassroomSession[] = []
+  let waiting = false
+  let failed = false
+  for (const item of payload.recordings ?? []) {
+    const recording = item.recording
+    const status = String(item.status || '')
+    const belongsToCurrentDocument =
+      !recording?.document_id || recording.document_id === documentId
+    if (belongsToCurrentDocument && (status === 'transcribed' || status === 'aligning')) {
+      waiting = true
+    }
+    if (recording?.document_id === documentId && status === 'alignment_failed') {
+      failed = true
+    }
+    if (
+      !recording
+      || recording.document_id !== documentId
+      || status !== 'aligned'
+      || !Array.isArray(item.page_transcripts)
+    ) continue
+    const transcript = (item.transcript_segments ?? [])
+      .map((segment) => String(segment.text || '').trim())
+      .filter(Boolean)
+      .join('\n')
+    sessions.push(buildClassroomSessionFromAlignedRecording(
+      recording,
+      transcript,
+      item.page_transcripts,
+    ))
+  }
+  return { sessions, waiting, failed }
 }
 
 export async function loadLatestDebugClassroomSession() {

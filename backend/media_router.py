@@ -2454,9 +2454,9 @@ async def transcribe_audio(
     result = transcribe_audio_file_with_chunking(source_path)
     normalized_course_id = str(course_id or '').strip()
     normalized_document_id = str(document_id or '').strip()
-    if bool(normalized_course_id) != bool(normalized_document_id):
-      raise HTTPException(status_code=422, detail='course_id and document_id must be provided together.')
-    if normalized_course_id and normalized_document_id:
+    if normalized_document_id and not normalized_course_id:
+      raise HTTPException(status_code=422, detail='course_id is required when document_id is provided.')
+    if normalized_course_id:
       recording_id = str(uuid.uuid4())
       recording_dir = PROJECT_ROOT / '.runtime' / 'audio-recordings' / normalized_course_id / recording_id
       recording_dir.mkdir(parents=True, exist_ok=True)
@@ -2465,7 +2465,7 @@ async def transcribe_audio(
       recording = LectureRecording(
         id=recording_id,
         course_id=normalized_course_id,
-        document_id=normalized_document_id,
+        document_id=normalized_document_id or None,
         audio_path=str(saved_audio_path.relative_to(PROJECT_ROOT)),
         duration=float(result.get('duration_seconds') or 0),
       )
@@ -2537,9 +2537,30 @@ async def align_lecture_recording(
   if any(str(page.get('course_id') or '') != course_id for page in pages):
     raise HTTPException(status_code=422, detail='Document does not belong to the requested course.')
   try:
-    return await run_pipeline_task(AudioAlignmentService().align, course_id, recording_id, pages)
+    return await run_pipeline_task(
+      AudioAlignmentService().align,
+      course_id,
+      recording_id,
+      pages,
+      document_id,
+    )
   except (FileNotFoundError, ValueError) as exc:
     raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@media_router.get('/api/audio/recordings')
+async def list_lecture_recordings(course_id: str, document_id: str | None = None) -> dict[str, Any]:
+  normalized_course_id = str(course_id or '').strip()
+  if not normalized_course_id:
+    raise HTTPException(status_code=422, detail='course_id is required.')
+  normalized_document_id = str(document_id or '').strip()
+  records = AudioAlignmentService().store.for_course(normalized_course_id)
+  if normalized_document_id:
+    records = [
+      item for item in records
+      if str((item.get('recording') or {}).get('document_id') or '') == normalized_document_id
+    ]
+  return {'recordings': records}
 
 
 @media_router.get('/api/audio/recordings/{recording_id}')
@@ -2588,4 +2609,3 @@ __all__ = [
   'media_router',
   'transcribe_audio_file_with_chunking',
 ]
-

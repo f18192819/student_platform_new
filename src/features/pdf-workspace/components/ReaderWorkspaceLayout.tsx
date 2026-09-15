@@ -26,10 +26,11 @@ export function ReaderWorkspaceLayout({
 }) {
   const panels = useFloatingWorkspacePanels()
   const { left, right, bottom } = panels.layout
+  const { pinPanel } = panels
 
   useEffect(() => {
-    if (gradingPinRequest > 0 && gradingPanel) panels.pinPanel('grading')
-  }, [gradingPanel, gradingPinRequest, panels.pinPanel])
+    if (gradingPinRequest > 0 && gradingPanel) pinPanel('grading')
+  }, [gradingPanel, gradingPinRequest, pinPanel])
 
   const rightContent = right.panel === 'grading' ? gradingPanel : right.panel === 'chat' ? chatPanel : null
   const rightTitle = right.panel === 'grading' ? '批改详情' : 'AI 助手'
