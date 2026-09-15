@@ -247,6 +247,18 @@ export function PdfWorkspacePage() {
     activeKnowledgeCourseIdRef.current = activeKnowledgeCourseId
     knowledgeFileIdRef.current = knowledgeFileId
   }, [activeKnowledgeCourseId, knowledgeFileId])
+  useEffect(() => {
+    if (!knowledgeCourseId) return
+    const fileCourseMismatch = Boolean(
+      knowledgeFileId && currentCourseId && currentCourseId !== knowledgeCourseId,
+    )
+    if (currentCourseId && !fileCourseMismatch) return
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      next.set('course', knowledgeCourseId)
+      return next
+    }, { replace: true })
+  }, [currentCourseId, knowledgeCourseId, knowledgeFileId, setSearchParams])
   const activeAnnotations = useMemo(
     () => (viewerSource.kind === 'homework' ? selectedHomework?.annotations ?? [] : annotations),
     [annotations, selectedHomework, viewerSource.kind],

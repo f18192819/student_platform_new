@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
+import {
+  buildCourseScopedPath,
+  readRememberedCourseId,
+  rememberCourseId,
+} from '../lib/courseContext'
 
 export function AppHeader({
   rightContent,
@@ -8,12 +13,18 @@ export function AppHeader({
 }) {
   const location = useLocation()
   const isReaderPage = location.pathname === '/pdf'
-  const currentCourseId = new URLSearchParams(location.search).get('course')
-  const knowledgeLibraryTarget = currentCourseId
-    ? `/library?course=${encodeURIComponent(currentCourseId)}`
-    : '/library'
+  const routeCourseId = new URLSearchParams(location.search).get('course')
+  const [rememberedCourseId, setRememberedCourseId] = useState(readRememberedCourseId)
+  const currentCourseId = routeCourseId ?? rememberedCourseId
+  const knowledgeLibraryTarget = buildCourseScopedPath('/library', currentCourseId)
+  const pdfReaderTarget = buildCourseScopedPath('/pdf', currentCourseId)
   const [isLessonRecording, setIsLessonRecording] = useState(false)
   const [lessonProcessingStatus, setLessonProcessingStatus] = useState('')
+
+  useEffect(() => {
+    const remembered = rememberCourseId(routeCourseId)
+    if (remembered) setRememberedCourseId(remembered)
+  }, [routeCourseId])
 
   useEffect(() => {
     const handleState = (event: Event) => {
@@ -84,7 +95,7 @@ export function AppHeader({
                 <button type="button" onClick={handleUploadLessonAudio}>上传录音</button>
                 <button type="button" onClick={handleUploadLessonTranscript}>上传原文</button>
                 <Link to="/settings/api">API 配置</Link>
-                <Link to="/pdf" aria-current="page">PDF 阅读器</Link>
+                <Link to={pdfReaderTarget} aria-current="page">PDF 阅读器</Link>
               </div>
             </details>
           </>
@@ -99,7 +110,7 @@ export function AppHeader({
             <Link className="octopus-header-link" to="/settings/api">
               API 配置
             </Link>
-            <Link className="octopus-primary-button octopus-primary-button--link" to="/pdf">
+            <Link className="octopus-primary-button octopus-primary-button--link" to={pdfReaderTarget}>
               PDF 阅读器
             </Link>
           </>
