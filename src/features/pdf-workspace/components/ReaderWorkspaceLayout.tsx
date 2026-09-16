@@ -1,8 +1,7 @@
 import { useEffect, type CSSProperties, type ReactNode } from 'react'
-import { FloatingToolDock } from './FloatingToolDock'
-import { ReaderEdgeTrigger } from './ReaderEdgeTrigger'
+import { ReaderActivityBar } from './ReaderActivityBar'
 import { WorkspacePanel } from './WorkspacePanel'
-import { useFloatingWorkspacePanels, type WorkspacePanelId } from '../hooks/useFloatingWorkspacePanels'
+import { useReaderWorkspacePanels } from '../hooks/useReaderWorkspacePanels'
 import '../styles/reader-floating-ui.css'
 
 export function ReaderWorkspaceLayout({
@@ -28,103 +27,86 @@ export function ReaderWorkspaceLayout({
   historyLabel?: string
   gradingPinRequest?: number
 }) {
-  const panels = useFloatingWorkspacePanels()
-  const { left, right, bottom } = panels.layout
-  const { pinPanel } = panels
+  const panels = useReaderWorkspacePanels()
+  const { left, right } = panels.layout
+  const { openPanel } = panels
 
   useEffect(() => {
-    if (gradingPinRequest > 0 && gradingPanel) pinPanel('grading')
-  }, [gradingPanel, gradingPinRequest, pinPanel])
+    if (gradingPinRequest > 0 && gradingPanel) openPanel('grading')
+  }, [gradingPanel, gradingPinRequest, openPanel])
 
-  const rightContent = right.panel === 'grading' ? gradingPanel : right.panel === 'chat' ? chatPanel : null
-  const rightTitle = right.panel === 'grading' ? '批改详情' : 'AI 助手'
-  const rightWidth = right.panel === 'grading'
-    ? 'clamp(420px, 32vw, 520px)'
-    : right.panel === 'chat'
-      ? 'clamp(380px, 28vw, 460px)'
-      : '0px'
+  const leftContent = left.panel === 'grading'
+    ? gradingPanel
+    : left.panel === 'history'
+      ? historyPanel
+      : left.panel === 'related'
+        ? relatedPanel
+        : null
+  const leftTitle = left.panel === 'grading'
+    ? '批改详情'
+    : left.panel === 'history'
+      ? historyTitle
+      : '习题关联'
   const style = {
-    '--reader-left-width': left.panel ? 'clamp(280px, 22vw, 360px)' : '0px',
-    '--reader-right-width': rightWidth,
-    '--reader-history-height': bottom.panel ? 'clamp(240px, 30vh, 310px)' : '0px',
+    '--reader-left-width': left.panel
+      ? left.panel === 'grading' ? 'clamp(360px, 27vw, 460px)' : 'clamp(280px, 22vw, 360px)'
+      : '0px',
+    '--reader-right-width': right.panel ? 'clamp(360px, 27vw, 460px)' : '0px',
   } as CSSProperties
-  const activePanels = new Set<WorkspacePanelId>(
-    [left.panel, right.panel, bottom.panel].filter(Boolean) as WorkspacePanelId[],
-  )
-  const pinnedPanels = new Set<WorkspacePanelId>(
-    [left.pinned ? left.panel : null, right.pinned ? right.panel : null, bottom.pinned ? bottom.panel : null]
-      .filter(Boolean) as WorkspacePanelId[],
-  )
-  const items = [
-    { id: 'related' as const, label: '关联资料' },
-    { id: 'chat' as const, label: 'AI 助手' },
+  const leftItems = [
+    { id: 'related' as const, label: '习题关联' },
     { id: 'grading' as const, label: '批改', badge: gradingBadge, disabled: !gradingPanel },
     { id: 'history' as const, label: historyLabel, badge: historyBadge, disabled: !historyPanel },
   ]
 
   return (
     <section
-      className={`reader-workspace${left.panel ? ' has-left' : ''}${right.panel ? ' has-right' : ''}${bottom.panel ? ' has-bottom' : ''}`}
+      className={`reader-workspace${left.panel ? ' has-left' : ''}${right.panel ? ' has-right' : ''}`}
       data-layout-mode={panels.mode}
       data-right-panel={right.panel ?? 'none'}
       style={style}
     >
       <div className="reader-workspace__main">
+        <div className="reader-workspace__activity reader-workspace__activity--left">
+          <ReaderActivityBar
+            side="left"
+            items={leftItems}
+            activePanel={left.panel}
+            onToggle={panels.togglePanel}
+            showSettings
+          />
+        </div>
         <div className="reader-workspace__left" data-open={Boolean(left.panel)}>
           <WorkspacePanel
-            panelKey={left.panel}
+            panelKey={leftContent ? left.panel : null}
             placement="left"
-            title="关联资料"
-            pinned={left.pinned}
-            onEnter={() => panels.keepPanelOpen('related')}
-            onLeave={() => panels.schedulePanelClose('related')}
-            onClose={() => panels.closePanel('related')}
-            onPin={() => panels.pinPanel('related')}
-          >{relatedPanel}</WorkspacePanel>
+            title={leftTitle}
+            eyebrow="工具"
+            onClose={() => left.panel && panels.closePanel(left.panel)}
+          >{leftContent}</WorkspacePanel>
         </div>
 
         <div className="reader-workspace__stage-frame">
           <div className="reader-workspace__stage">{children}</div>
-          <ReaderEdgeTrigger side="left" panel="related" label="打开关联资料" onPreview={panels.previewPanel} onLeave={panels.schedulePanelClose} onPin={panels.togglePinnedPanel} />
-          <ReaderEdgeTrigger side="right" panel="chat" label="打开 AI 助手" onPreview={panels.previewPanel} onLeave={panels.schedulePanelClose} onPin={panels.togglePinnedPanel} />
-          <FloatingToolDock
-            items={items}
-            activePanels={activePanels}
-            pinnedPanels={pinnedPanels}
-            onPreview={panels.previewPanel}
-            onLeave={panels.schedulePanelClose}
-            onTogglePin={panels.togglePinnedPanel}
-          />
         </div>
 
         <div className="reader-workspace__right" data-open={Boolean(right.panel)}>
           <WorkspacePanel
-            panelKey={rightContent ? right.panel : null}
+            panelKey={right.panel}
             placement="right"
-            title={rightTitle}
-            pinned={right.pinned}
-            role={right.panel === 'grading' ? 'dialog' : 'complementary'}
-            autoPinOnInteract={right.panel === 'grading'}
-            onEnter={() => right.panel && panels.keepPanelOpen(right.panel)}
-            onLeave={() => right.panel && panels.schedulePanelClose(right.panel)}
-            onClose={() => right.panel && panels.closePanel(right.panel)}
-            onPin={() => right.panel && panels.pinPanel(right.panel)}
-          >{rightContent}</WorkspacePanel>
+            title="AI 助手"
+            eyebrow="对话"
+            onClose={() => panels.closePanel('chat')}
+          >{chatPanel}</WorkspacePanel>
         </div>
-      </div>
-
-      <div className="reader-workspace__bottom" data-open={Boolean(bottom.panel)}>
-        <WorkspacePanel
-          panelKey={historyPanel ? bottom.panel : null}
-          placement="bottom"
-          title={historyTitle}
-          pinned={bottom.pinned}
-          role="region"
-          onEnter={() => panels.keepPanelOpen('history')}
-          onLeave={() => panels.schedulePanelClose('history')}
-          onClose={() => panels.closePanel('history')}
-          onPin={() => panels.pinPanel('history')}
-        >{historyPanel}</WorkspacePanel>
+        <div className="reader-workspace__activity reader-workspace__activity--right">
+          <ReaderActivityBar
+            side="right"
+            items={[{ id: 'chat', label: 'AI 助手' }]}
+            activePanel={right.panel}
+            onToggle={panels.togglePanel}
+          />
+        </div>
       </div>
     </section>
   )

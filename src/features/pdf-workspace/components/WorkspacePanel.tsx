@@ -5,25 +5,17 @@ export function WorkspacePanel({
   panelKey,
   placement,
   title,
-  pinned,
+  eyebrow,
   role = 'complementary',
-  autoPinOnInteract = false,
-  onEnter,
-  onLeave,
   onClose,
-  onPin,
   children,
 }: {
   panelKey: string | null
   placement: 'left' | 'right' | 'bottom'
   title: string
-  pinned: boolean
+  eyebrow?: string
   role?: 'dialog' | 'complementary' | 'region'
-  autoPinOnInteract?: boolean
-  onEnter: () => void
-  onLeave: () => void
   onClose: () => void
-  onPin: () => void
   children: ReactNode
 }) {
   const offset = placement === 'left' ? -12 : placement === 'right' ? 12 : 0
@@ -39,13 +31,9 @@ export function WorkspacePanel({
           animate={{ opacity: 1, x: 0, y: 0 }}
           exit={{ opacity: 0, x: offset * 0.5, y: placement === 'bottom' ? 5 : 0 }}
           transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-          onMouseEnter={onEnter}
-          onMouseLeave={onLeave}
-          onPointerDownCapture={autoPinOnInteract ? onPin : undefined}
-          onFocusCapture={autoPinOnInteract ? onPin : undefined}
         >
           <header className="reader-workspace-panel__header">
-            <div><strong>{title}</strong><span>{pinned ? '已固定' : '预览'}</span></div>
+            <div><strong>{title}</strong>{eyebrow ? <span>{eyebrow}</span> : null}</div>
             <button type="button" aria-label={`关闭${title}`} onClick={onClose}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
             </button>
