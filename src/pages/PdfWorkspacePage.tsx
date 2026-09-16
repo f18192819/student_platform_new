@@ -2504,14 +2504,6 @@ export function PdfWorkspacePage() {
       />
       <section className="pdf-workspace__reader-grid">
         <div className="pdf-workspace__viewer">
-          {isLectureViewer && activeKnowledgeCourseId && currentKnowledgeFileId ? (
-            <LectureMasteryTest
-              courseId={activeKnowledgeCourseId}
-              lectureDocumentId={currentKnowledgeFileId}
-              lectureName={currentViewerName}
-              onOpenPage={handleVisiblePageChange}
-            />
-          ) : null}
           <QuestionAnswerViewer
             courseId={viewerSource.kind === 'homework' ? activeKnowledgeCourseId : null}
             sourceDocumentId={viewerSource.kind === 'homework' ? selectedHomework?.id ?? null : null}
@@ -2592,9 +2584,18 @@ export function PdfWorkspacePage() {
             workspaceHistoryBadge={isLectureViewer
               ? isLessonRecording ? 'REC' : lessonRecordingRecords.length || null
               : null}
+            classroomBadge={isLessonRecording ? 'REC' : null}
             workspaceHistoryTitle="课堂录音与 ASR"
             workspaceHistoryLabel="课堂记录"
           >
+            {isLectureViewer && activeKnowledgeCourseId && currentKnowledgeFileId ? (
+              <LectureMasteryTest
+                courseId={activeKnowledgeCourseId}
+                lectureDocumentId={currentKnowledgeFileId}
+                lectureName={currentViewerName}
+                onOpenPage={handleVisiblePageChange}
+              />
+            ) : null}
             <PdfPreviewCanvas
               fileName={currentViewerName}
               pdfController={currentViewerController}

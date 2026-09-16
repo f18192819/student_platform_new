@@ -13,6 +13,7 @@ export function ReaderWorkspaceLayout({
   historyPanel,
   gradingBadge,
   historyBadge,
+  classroomBadge,
   historyTitle = '历史作答',
   historyLabel = '历史',
   gradingPinRequest = 0,
@@ -25,6 +26,7 @@ export function ReaderWorkspaceLayout({
   historyPanel?: ReactNode
   gradingBadge?: string | number | null
   historyBadge?: string | number | null
+  classroomBadge?: string | number | null
   historyTitle?: string
   historyLabel?: string
   gradingPinRequest?: number
@@ -60,7 +62,7 @@ export function ReaderWorkspaceLayout({
     '--reader-right-width': right.panel ? 'clamp(360px, 27vw, 460px)' : '0px',
   } as CSSProperties
   const leftItems = [
-    { id: 'classroom' as const, label: '课堂工具' },
+    { id: 'classroom' as const, label: '课堂工具', badge: classroomBadge },
     { id: 'related' as const, label: '习题关联' },
     { id: 'grading' as const, label: '批改', badge: gradingBadge, disabled: !gradingPanel },
     { id: 'history' as const, label: historyLabel, badge: historyBadge, disabled: !historyPanel },

@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
 import {
   isLessonRecordingActive,
+  LESSON_RECORDING_TOGGLE_EVENT,
   LESSON_RECORDING_STATE_EVENT,
+  requestLessonRecordingState,
 } from '../lesson-recording/lessonRecordingState'
 import { PDF_ANNOTATION_COLORS } from './usePdfAnnotations'
 import type { PdfAnnotationTool } from './pdfAnnotationStore'
@@ -48,6 +50,7 @@ export function ClassroomToolsPanel({
     }
     window.addEventListener(LESSON_RECORDING_STATE_EVENT, handleRecordingState)
     window.addEventListener('student-platform:lesson-processing-state', handleProcessingState)
+    requestLessonRecordingState()
     return () => {
       window.removeEventListener(LESSON_RECORDING_STATE_EVENT, handleRecordingState)
       window.removeEventListener('student-platform:lesson-processing-state', handleProcessingState)
@@ -55,8 +58,8 @@ export function ClassroomToolsPanel({
   }, [])
 
   const toggleRecording = () => {
-    window.dispatchEvent(new CustomEvent('student-platform:lesson-recording-toggle', {
-      detail: { nextRecording: !isRecording },
+    window.dispatchEvent(new CustomEvent(LESSON_RECORDING_TOGGLE_EVENT, {
+      detail: { action: 'toggle' },
     }))
   }
 

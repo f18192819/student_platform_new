@@ -19,6 +19,8 @@ import {
   removeLessonRecordingDraft,
 } from './recordingDraftStore'
 import {
+  LESSON_RECORDING_QUERY_EVENT,
+  LESSON_RECORDING_TOGGLE_EVENT,
   publishLessonRecordingState,
   publishLessonRecordingUpdated,
 } from './lessonRecordingState'
@@ -228,9 +230,16 @@ export function LessonRecordingController() {
 
   useEffect(() => {
     const handleToggle = (event: Event) => {
-      const detail = (event as CustomEvent<{ nextRecording?: boolean }>).detail
-      if (detail?.nextRecording) void startRecording()
+      const detail = (event as CustomEvent<{ nextRecording?: boolean; action?: 'toggle' }>).detail
+      const isRecording = mediaRecorderRef.current?.state === 'recording'
+      const shouldRecord = detail?.action === 'toggle'
+        ? !isRecording
+        : Boolean(detail?.nextRecording)
+      if (shouldRecord) void startRecording()
       else stopRecording()
+    }
+    const handleStateQuery = () => {
+      publishLessonRecordingState(mediaRecorderRef.current?.state === 'recording')
     }
     const persistLatestSlice = () => {
       const recorder = mediaRecorderRef.current
@@ -245,11 +254,13 @@ export function LessonRecordingController() {
       if (document.visibilityState === 'hidden') persistLatestSlice()
     }
 
-    window.addEventListener('student-platform:lesson-recording-toggle', handleToggle)
+    window.addEventListener(LESSON_RECORDING_TOGGLE_EVENT, handleToggle)
+    window.addEventListener(LESSON_RECORDING_QUERY_EVENT, handleStateQuery)
     window.addEventListener('pagehide', persistLatestSlice)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
-      window.removeEventListener('student-platform:lesson-recording-toggle', handleToggle)
+      window.removeEventListener(LESSON_RECORDING_TOGGLE_EVENT, handleToggle)
+      window.removeEventListener(LESSON_RECORDING_QUERY_EVENT, handleStateQuery)
       window.removeEventListener('pagehide', persistLatestSlice)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       persistLatestSlice()

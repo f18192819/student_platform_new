@@ -21,6 +21,7 @@ export function QuestionAnswerViewer({
   chatPanel,
   workspaceHistoryPanel,
   workspaceHistoryBadge,
+  classroomBadge,
   workspaceHistoryTitle,
   workspaceHistoryLabel,
 }: {
@@ -34,6 +35,7 @@ export function QuestionAnswerViewer({
   chatPanel: ReactNode
   workspaceHistoryPanel?: ReactNode
   workspaceHistoryBadge?: string | number | null
+  classroomBadge?: string | number | null
   workspaceHistoryTitle?: string
   workspaceHistoryLabel?: string
 }) {
@@ -167,6 +169,7 @@ export function QuestionAnswerViewer({
       gradingPanel={gradingPanel}
       historyPanel={enabled ? historyPanel : workspaceHistoryPanel}
       gradingBadge={gradingSummary ? `${Math.round(gradingSummary.score * 100)}%` : selected ? '…' : null}
+      classroomBadge={classroomBadge}
       historyBadge={enabled ? attempts.length || null : workspaceHistoryBadge}
       historyTitle={enabled ? '历史作答' : workspaceHistoryTitle}
       historyLabel={enabled ? '历史' : workspaceHistoryLabel}

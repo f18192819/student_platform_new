@@ -8,15 +8,31 @@ const panelSource = readFileSync('src/features/pdf-annotations/ClassroomToolsPan
 const hookSource = readFileSync('src/features/pdf-annotations/usePdfAnnotations.ts', 'utf8')
 const storeSource = readFileSync('src/features/pdf-annotations/pdfAnnotationStore.ts', 'utf8')
 const headerSource = readFileSync('src/components/AppHeader.tsx', 'utf8')
+const recordingStateSource = readFileSync('src/features/lesson-recording/lessonRecordingState.ts', 'utf8')
+const recordingControllerSource = readFileSync('src/features/lesson-recording/LessonRecordingController.tsx', 'utf8')
 
 test('classroom tools own recording, uploads and annotation modes', () => {
-  assert.match(panelSource, /student-platform:lesson-recording-toggle/)
+  assert.match(panelSource, /LESSON_RECORDING_TOGGLE_EVENT/)
   assert.match(panelSource, /student-platform:lesson-audio-upload/)
   assert.match(panelSource, /student-platform:lesson-transcript-upload/)
   assert.match(panelSource, /\['highlight', '高亮'\]/)
   assert.match(panelSource, /\['text', '文本框'\]/)
   assert.match(pageSource, /classroomPanel=\{/)
+  assert.match(pageSource, /classroomBadge=\{isLessonRecording \? 'REC' : null\}/)
+  assert.match(panelSource, /requestLessonRecordingState\(\)/)
+  assert.match(panelSource, /detail: \{ action: 'toggle' \}/)
+  assert.match(recordingStateSource, /LESSON_RECORDING_QUERY_EVENT/)
+  assert.match(recordingControllerSource, /mediaRecorderRef\.current\?\.state === 'recording'/)
   assert.doesNotMatch(headerSource, /octopus-reader-more/)
+})
+
+test('mastery launcher is mounted inside the center reader stage', () => {
+  const viewerStart = pageSource.indexOf('<QuestionAnswerViewer')
+  const launcherStart = pageSource.indexOf('<LectureMasteryTest', viewerStart)
+  const canvasStart = pageSource.indexOf('<PdfPreviewCanvas', viewerStart)
+  assert.ok(viewerStart >= 0)
+  assert.ok(launcherStart > viewerStart)
+  assert.ok(canvasStart > launcherStart)
 })
 
 test('annotations are isolated by course and document and persisted locally', () => {

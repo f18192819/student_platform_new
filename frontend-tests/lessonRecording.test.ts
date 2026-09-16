@@ -20,7 +20,9 @@ test('recording controller survives route changes and only explicit stop ends ca
   assert.match(appSource, /<LessonRecordingController \/>/)
   assert.doesNotMatch(pageSource, /new MediaRecorder|lessonStreamRef|track\.stop\(\)/)
   assert.match(controllerSource, /routeContextRef\.current = contextFromLocation\(location\.search\)/)
-  assert.match(controllerSource, /if \(detail\?\.nextRecording\) void startRecording\(\)/)
+  assert.match(controllerSource, /detail\?\.action === 'toggle'/)
+  assert.match(controllerSource, /mediaRecorderRef\.current\?\.state === 'recording'/)
+  assert.match(controllerSource, /LESSON_RECORDING_QUERY_EVENT, handleStateQuery/)
   assert.match(controllerSource, /else stopRecording\(\)/)
   assert.doesNotMatch(
     controllerSource.match(/return \(\) => \{[\s\S]*?\n    \}/g)?.at(-1) ?? '',
