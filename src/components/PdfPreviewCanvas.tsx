@@ -93,6 +93,7 @@ type PdfPreviewCanvasProps = {
   variant?: 'workspace' | 'readonly'
   fileName: string
   pdfController: PdfController | null
+  pageImageUrl?: (pageNumber: number) => string | null
   imageUrl?: string | null
   currentPage: number
   pageCount: number | null
@@ -470,6 +471,7 @@ function resolveVisibleQuestionId(
 
 const PdfPageCanvas = memo(function PdfPageCanvas({
   pdfController,
+  fallbackImageUrl,
   pageNumber,
   displayScale,
   structuredBlocks = [],
@@ -488,6 +490,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   interactive = true,
 }: {
   pdfController: PdfController
+  fallbackImageUrl?: string | null
   pageNumber: number
   displayScale: number
   structuredBlocks?: StructuredDocumentBlock[]
@@ -638,12 +641,22 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       canvas.style.width = `${viewport.width}px`
       canvas.style.height = `${viewport.height}px`
 
-      renderTask = page.render({
-        canvas,
-        canvasContext: context,
-        viewport,
-      })
-      await renderTask.promise
+      const paintedPageData = {
+        pageNumber,
+        width: viewport.width,
+        height: viewport.height,
+        textLayer: [],
+      } satisfies RenderedPageData
+      setPageData(paintedPageData)
+      onRenderedRef.current(paintedPageData)
+
+      if (!fallbackImageUrl) {
+        renderTask = page.render({
+          canvas,
+          viewport,
+        })
+        await renderTask.promise
+      }
 
       if (cancelled) {
         return
@@ -660,11 +673,15 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         return
       }
 
+      if (!textContent) {
+        return
+      }
+
       const nextPageData = {
         pageNumber,
         width: viewport.width,
         height: viewport.height,
-        textLayer: textContent ? buildTextLayer(viewport, textContent) : [],
+        textLayer: buildTextLayer(viewport, textContent),
       } satisfies RenderedPageData
 
       setPageData(nextPageData)
@@ -683,7 +700,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       cancelled = true
       renderTask?.cancel()
     }
-  }, [interactive, pageNumber, pdfController])
+  }, [fallbackImageUrl, interactive, pageNumber, pdfController])
 
   const textBlocks = useMemo(() => {
     if (!pageData) {
@@ -1113,6 +1130,20 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
           : undefined
       }
     >
+      {fallbackImageUrl ? (
+        <img
+          className="pdf-stage__page-raster"
+          src={fallbackImageUrl}
+          alt={`第 ${pageNumber} 页`}
+          onLoad={(event) => {
+            const canvas = canvasRef.current
+            const context = canvas?.getContext('2d', { alpha: false })
+            if (canvas && context) {
+              context.drawImage(event.currentTarget, 0, 0, canvas.width, canvas.height)
+            }
+          }}
+        />
+      ) : null}
       <canvas
         ref={canvasRef}
         className="pdf-stage__page-canvas"
@@ -1123,7 +1154,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                 height: `${pageData.height}px`,
                 transform: `scale(${displayScale})`,
                 transformOrigin: 'top left',
-                visibility: 'visible',
+                visibility: fallbackImageUrl ? 'hidden' : 'visible',
               }
             : undefined
         }
@@ -1674,6 +1705,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   variant = 'workspace',
   fileName,
   pdfController,
+  pageImageUrl,
   imageUrl = null,
   currentPage,
   pageCount,
@@ -1728,7 +1760,6 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const [viewportWidth, setViewportWidth] = useState(0)
   const [isRendering, setIsRendering] = useState(false)
   const [renderError, setRenderError] = useState<string | null>(null)
-  const [isInitialPdfPaintPending, setIsInitialPdfPaintPending] = useState(false)
   const requestVisiblePageChange = useEffectEvent((pageNumber: number) => {
     onVisiblePageChange(pageNumber)
   })
@@ -1764,8 +1795,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     pageRefs.current.clear()
     renderedPagesRef.current.clear()
     setRenderError(null)
-    setIsRendering(Boolean(pdfController && !imageUrl))
-    setIsInitialPdfPaintPending(Boolean(controllerChanged && pdfController && !imageUrl))
+    setIsRendering(false)
   }, [imageUrl, pdfController])
 
   useEffect(() => () => {
@@ -1829,43 +1859,30 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     }
 
     const container = viewportRef.current
-    const activePage = pageRefs.current.get(currentPage)
-    if (!container || !activePage) {
+    if (!container || !pageRefs.current.has(currentPage)) {
       return
     }
 
-    if (pageChangeFromUserScrollRef.current === currentPage) {
-      pageChangeFromUserScrollRef.current = null
-      return
-    }
     pageChangeFromUserScrollRef.current = null
 
     isAutoScrollingRef.current = true
-    const containerBounds = container.getBoundingClientRect()
-    const pageBounds = activePage.getBoundingClientRect()
-    if (container.scrollHeight > container.clientHeight + 1) {
+    const layoutTimer = window.setTimeout(() => {
+      const activePage = pageRefs.current.get(currentPage)
+      if (!activePage) return
       container.scrollTo({
-        top: Math.max(
-          0,
-          container.scrollTop + pageBounds.top - containerBounds.top - 12,
-        ),
+        top: Math.max(0, activePage.offsetTop - 12),
         behavior: 'auto',
       })
-    } else {
-      window.scrollTo({
-        top: Math.max(0, window.scrollY + pageBounds.top - 12),
-        behavior: 'auto',
-      })
-    }
-
-    const timer = window.setTimeout(() => {
+    }, 0)
+    const releaseTimer = window.setTimeout(() => {
       isAutoScrollingRef.current = false
-    }, 160)
+    }, 180)
 
     return () => {
-      window.clearTimeout(timer)
+      window.clearTimeout(layoutTimer)
+      window.clearTimeout(releaseTimer)
     }
-  }, [currentPage, isRendering, pdfController])
+  }, [currentPage, isRendering, pdfController, viewportWidth])
 
   const scrollToQuestionAnchor = (
     question: HomeworkQuestion,
@@ -2038,16 +2055,19 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
 
   const handlePageRendered = (page: RenderedPageData) => {
     renderedPagesRef.current.set(page.pageNumber, page)
+    if (page.pageNumber === currentPage) {
+      const container = viewportRef.current
+      const activePage = pageRefs.current.get(page.pageNumber)
+      if (container && activePage) {
+        container.scrollTop = Math.max(0, activePage.offsetTop - 12)
+      }
+    }
     if (!isRendering && selectedHomeworkQuestion?.pageNumber === page.pageNumber) {
       window.requestAnimationFrame(() => {
         scrollToQuestionAnchor(selectedHomeworkQuestion, page)
       })
     }
-    if (page.pageNumber === 1) {
-      setIsInitialPdfPaintPending(false)
-    }
-
-    if (renderedPagesRef.current.size === pageNumbers.length) {
+    if (isRendering) {
       setIsRendering(false)
       setRenderError(null)
     }
@@ -2058,18 +2078,11 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const firstPageWidth =
     getFallbackRenderedPageWidth(pdfController, 1) ?? firstRenderedPage?.width ?? null
   const effectiveViewportWidth = viewportRef.current?.clientWidth || viewportWidth || 0
-  const isViewportMeasured = effectiveViewportWidth > 0
-  const hasRenderedFirstPage = renderedPagesRef.current.has(1) || renderedPagesRef.current.size > 0
   const fitScale =
     firstPageWidth && effectiveViewportWidth
       ? Math.min(1, Math.max(0.45, (effectiveViewportWidth - 52) / firstPageWidth))
       : 1
   const displayScale = Math.min(1, zoom * fitScale)
-  const isReaderReady =
-    !pdfController ||
-    Boolean(imageUrl) ||
-    (isViewportMeasured && Boolean(firstPageWidth) && hasRenderedFirstPage && !isInitialPdfPaintPending)
-
   return (
     <div className={`pdf-stage${isReadonly ? ' pdf-stage--readonly' : ''}`}>
       <div className="pdf-stage__toolbar">
@@ -2139,13 +2152,12 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
         ) : !pdfController ? (
           <div className="empty-state pdf-stage__empty">上传 PDF 后，这里会显示正式 PDF 页面。</div>
         ) : (
-          <div
-            className="pdf-stage__stack"
-            style={isReaderReady ? undefined : { visibility: 'hidden' }}
-          >
+          <div className="pdf-stage__stack">
             {pageNumbers.map((pageNumber) => {
               const pageLinks = lecturePageQuestionLinks.get(pageNumber) ?? []
               const lectureSegments = lectureSegmentsByPage.get(pageNumber) ?? []
+              const pageSize = pdfController.pageSizes?.[pageNumber - 1]
+              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1
               const hasLectureExplanation = lectureSegments.length > 0
               const hasPlayableLecture = lectureSegments.some(
                 (segment) =>
@@ -2250,34 +2262,42 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                       </button>
                     </div> : null}
                   </div>
-                  <PdfPageCanvas
-                    pdfController={pdfController}
-                    pageNumber={pageNumber}
-                    displayScale={displayScale}
-                    structuredBlocks={structuredBlocks}
-                    onRendered={handlePageRendered}
-                    isCaptureMode={isCaptureMode}
-                    onCaptureSelection={onCaptureSelection}
-                    onTextSelection={onTextSelection}
-                    referencedBlockIds={referencedBlockIds}
-                    onRemoveBlockReference={onRemoveBlockReference}
-                    annotationTool={annotationTool}
-                    annotationColor={annotationColor}
-                    annotations={annotations.filter((annotation) => annotation.pageNumber === pageNumber)}
-                    onAddAnnotation={onAddAnnotation}
-                    onUpdateAnnotation={onUpdateAnnotation}
-                    onRemoveAnnotation={onRemoveAnnotation}
-                    interactive={!isReadonly}
-                  />
+                  {shouldRenderPage ? (
+                    <PdfPageCanvas
+                      pdfController={pdfController}
+                      pageNumber={pageNumber}
+                      fallbackImageUrl={pageImageUrl?.(pageNumber) ?? null}
+                      displayScale={displayScale}
+                      structuredBlocks={structuredBlocks}
+                      onRendered={handlePageRendered}
+                      isCaptureMode={isCaptureMode}
+                      onCaptureSelection={onCaptureSelection}
+                      onTextSelection={onTextSelection}
+                      referencedBlockIds={referencedBlockIds}
+                      onRemoveBlockReference={onRemoveBlockReference}
+                      annotationTool={annotationTool}
+                      annotationColor={annotationColor}
+                      annotations={annotations.filter((annotation) => annotation.pageNumber === pageNumber)}
+                      onAddAnnotation={onAddAnnotation}
+                      onUpdateAnnotation={onUpdateAnnotation}
+                      onRemoveAnnotation={onRemoveAnnotation}
+                      interactive={!isReadonly}
+                    />
+                  ) : (
+                    <div
+                      className="pdf-stage__page-surface pdf-stage__page-surface--placeholder"
+                      aria-hidden="true"
+                      style={pageSize ? {
+                        width: `${pageSize.width * BASE_RENDER_SCALE * displayScale}px`,
+                        height: `${pageSize.height * BASE_RENDER_SCALE * displayScale}px`,
+                      } : undefined}
+                    />
+                  )}
                 </article>
               )
             })}
           </div>
         )}
-
-        {pdfController && !imageUrl && (isRendering || !isReaderReady) ? (
-          <div className="empty-state pdf-stage__rendering-overlay">正在渲染 PDF 页面，请稍候...</div>
-        ) : null}
 
         {renderError ? (
           <div className="empty-state pdf-stage__empty">PDF 渲染失败：{renderError}</div>

@@ -35,6 +35,7 @@ export function resolvePublicAssetUrl(relativePath: string) {
 
 export const PDFJS_CMAP_URL = resolvePublicAssetUrl('pdfjs/cmaps/')
 export const PDFJS_STANDARD_FONT_DATA_URL = resolvePublicAssetUrl('pdfjs/standard_fonts/')
+export const PDFJS_WASM_URL = resolvePublicAssetUrl('pdfjs/wasm/')
 
 export function normalizePdfData(buffer: ArrayBuffer) {
   return new Uint8Array(buffer.slice(0))

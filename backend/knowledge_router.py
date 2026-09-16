@@ -18,6 +18,7 @@ from .knowledge_storage import (
   read_annotation_asset,
   read_homework_asset,
   read_knowledge_library,
+  read_pdf_page_image,
   read_pdf_bytes,
   update_knowledge_course_settings,
   write_annotation_asset,
@@ -142,6 +143,15 @@ def create_knowledge_router(runtime: ApplicationRuntime) -> APIRouter:
   @router.get('/api/knowledge/pdf/{file_id}')
   async def get_pdf(file_id: str) -> Response:
     return Response(content=read_pdf_bytes(file_id), media_type='application/pdf')
+
+  @router.get('/api/knowledge/pdf/{file_id}/pages/{page_number}')
+  async def get_pdf_page(file_id: str, page_number: int) -> Response:
+    payload = await asyncio.to_thread(read_pdf_page_image, file_id, page_number)
+    return Response(
+      content=payload,
+      media_type='image/png',
+      headers={'Cache-Control': 'public, max-age=31536000, immutable'},
+    )
 
   @router.put('/api/knowledge/pdf/{file_id}')
   async def update_pdf(file_id: str, file: UploadFile = File(...)) -> dict[str, Any]:

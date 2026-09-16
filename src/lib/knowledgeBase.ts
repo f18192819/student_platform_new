@@ -1178,6 +1178,12 @@ export async function deleteKnowledgeHomeworkDocument(
   return payload.deleted === true
 }
 
+export function resolveKnowledgePdfPageImageUrl(fileId: string, pageNumber: number) {
+  return resolveBackendApiUrl(
+    `/api/knowledge/pdf/${encodeURIComponent(fileId)}/pages/${pageNumber}?v=3`,
+  )
+}
+
 export function touchKnowledgeFile(fileId: string) {
   const now = new Date().toISOString()
   updateLibraryFile(fileId, (file) => ({

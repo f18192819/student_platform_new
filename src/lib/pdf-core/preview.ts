@@ -5,6 +5,7 @@ import {
   normalizePdfData,
   PDFJS_CMAP_URL,
   PDFJS_STANDARD_FONT_DATA_URL,
+  PDFJS_WASM_URL,
 } from './assets'
 import { extractPageMarkdown, type PageExtraction } from './layout'
 
@@ -40,7 +41,35 @@ function createPdfDocumentTask(buffer: ArrayBuffer) {
     cMapUrl: PDFJS_CMAP_URL,
     cMapPacked: true,
     standardFontDataUrl: PDFJS_STANDARD_FONT_DATA_URL,
+    wasmUrl: PDFJS_WASM_URL,
   })
+}
+
+export async function openPdfPreviewFromBuffer(buffer: ArrayBuffer) {
+  const task = createPdfDocumentTask(buffer)
+  const pdf = await task.promise
+  const pageSizes = await Promise.all(
+    Array.from({ length: pdf.numPages }, async (_, index) => {
+      const page = await pdf.getPage(index + 1)
+      const viewport = page.getViewport({ scale: 1 })
+      return { width: viewport.width, height: viewport.height }
+    }),
+  )
+  const controller: PdfController = {
+    pageCount: pdf.numPages,
+    markdown: '',
+    pageSizes,
+    getPage: (pageNumber: number) => pdf.getPage(pageNumber),
+  }
+
+  return {
+    controller,
+    pageCount: pdf.numPages,
+    previewUrl: null,
+    markdown: '',
+    outlineBlocks: [],
+    pageTexts: [],
+  }
 }
 
 export async function probePdfPageCountFromBuffer(buffer: ArrayBuffer) {

@@ -65,6 +65,7 @@ class KnowledgeRouterTest(unittest.TestCase):
     self.assertIn('/api/knowledge/files/{file_id}', paths)
     self.assertIn('/api/knowledge/courses/{course_id}', paths)
     self.assertIn('/api/knowledge/pdf/{file_id}', paths)
+    self.assertIn('/api/knowledge/pdf/{file_id}/pages/{page_number}', paths)
     self.assertIn('/api/knowledge/homework-asset/{asset_id}', paths)
 
   @patch('backend.knowledge_router.mark_deleted_synced_courseware')

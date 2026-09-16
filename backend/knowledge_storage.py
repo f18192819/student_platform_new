@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import io
+import shutil
 import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -15,6 +17,7 @@ KNOWLEDGE_BASE_DIR = PROJECT_ROOT / ".runtime" / "knowledge-base"
 KNOWLEDGE_LIBRARY_PATH = KNOWLEDGE_BASE_DIR / "library.json"
 KNOWLEDGE_DELETED_FILES_PATH = KNOWLEDGE_BASE_DIR / "deleted-file-markers.json"
 KNOWLEDGE_PDF_DIR = KNOWLEDGE_BASE_DIR / "pdf-files"
+KNOWLEDGE_PDF_PAGE_DIR = KNOWLEDGE_BASE_DIR / "pdf-page-previews"
 KNOWLEDGE_ANNOTATION_DIR = KNOWLEDGE_BASE_DIR / "annotation-assets"
 KNOWLEDGE_HOMEWORK_DIR = KNOWLEDGE_BASE_DIR / "homework-assets"
 
@@ -23,6 +26,7 @@ _storage_lock = threading.RLock()
 
 def ensure_knowledge_storage_dirs() -> None:
   KNOWLEDGE_PDF_DIR.mkdir(parents=True, exist_ok=True)
+  KNOWLEDGE_PDF_PAGE_DIR.mkdir(parents=True, exist_ok=True)
   KNOWLEDGE_ANNOTATION_DIR.mkdir(parents=True, exist_ok=True)
   KNOWLEDGE_HOMEWORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -364,10 +368,133 @@ def read_pdf_bytes(file_id: str) -> bytes:
   return path.read_bytes()
 
 
+def read_pdf_page_image(file_id: str, page_number: int) -> bytes:
+  if page_number < 1:
+    raise HTTPException(status_code=422, detail="Invalid PDF page number.")
+  pdf_path = _asset_path(KNOWLEDGE_PDF_DIR, file_id, ".pdf")
+  if not pdf_path.is_file():
+    raise HTTPException(status_code=404, detail="Knowledge PDF source not found.")
+
+  safe_file_id = pdf_path.stem
+  preview_path = KNOWLEDGE_PDF_PAGE_DIR / safe_file_id / f"v3-{page_number}.png"
+  with _storage_lock:
+    if preview_path.is_file():
+      return preview_path.read_bytes()
+    try:
+      import fitz
+      with fitz.open(pdf_path) as document:
+        if page_number > document.page_count:
+          raise HTTPException(status_code=404, detail="PDF page not found.")
+        page = document[page_number - 1]
+        page_width = float(page.rect.width)
+        page_height = float(page.rect.height)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+        payload = pixmap.tobytes("png")
+    except HTTPException:
+      raise
+    except Exception as exc:
+      raise HTTPException(status_code=422, detail="PDF page preview could not be rendered.") from exc
+    try:
+      from PIL import Image
+      page_image = Image.open(io.BytesIO(payload)).convert('RGB')
+      file_record = next(
+        (
+          item for item in read_knowledge_library().get('files') or []
+          if isinstance(item, dict) and str(item.get('id') or '') == safe_file_id
+        ),
+        None,
+      )
+      artifact_root = (
+        PROJECT_ROOT / '.runtime' / 'document-pipeline' / 'documents'
+        / safe_file_id / 'mineru' / 'artifacts'
+      ).resolve()
+      overlaid_assets: set[Path] = set()
+      for block in (file_record or {}).get('layoutBlocks') or []:
+        if (
+          not isinstance(block, dict)
+          or int(block.get('pageNumber') or 0) != page_number
+          or str(block.get('kind') or '') != 'image'
+        ):
+          continue
+        asset_path = str(block.get('assetPath') or '').strip()
+        bbox = block.get('bbox')
+        if not asset_path or not isinstance(bbox, list) or len(bbox) != 4:
+          continue
+        candidate = (artifact_root / asset_path).resolve()
+        if not candidate.is_relative_to(artifact_root) or not candidate.is_file():
+          continue
+        left, top, right, bottom = (float(value) for value in bbox)
+        box = (
+          round(left / page_width * page_image.width),
+          round(top / page_height * page_image.height),
+          round(right / page_width * page_image.width),
+          round(bottom / page_height * page_image.height),
+        )
+        if box[2] <= box[0] or box[3] <= box[1]:
+          continue
+        with Image.open(candidate) as extracted:
+          replacement = extracted.convert('RGB').resize(
+            (box[2] - box[0], box[3] - box[1]),
+            Image.Resampling.LANCZOS,
+          )
+          page_image.paste(replacement, box[:2])
+        overlaid_assets.add(candidate)
+
+      content_root = artifact_root / 'mineru-source' / 'auto'
+      content_list_path = content_root / 'mineru-source_content_list.json'
+      if content_list_path.is_file():
+        content_items = json.loads(content_list_path.read_text(encoding='utf-8'))
+        for item in content_items if isinstance(content_items, list) else []:
+          if (
+            not isinstance(item, dict)
+            or item.get('type') != 'image'
+            or int(item.get('page_idx') or 0) != page_number - 1
+          ):
+            continue
+          image_path = str(item.get('img_path') or '').strip()
+          bbox = item.get('bbox')
+          candidate = (content_root / image_path).resolve()
+          if (
+            not image_path
+            or not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not candidate.is_relative_to(content_root)
+            or not candidate.is_file()
+            or candidate in overlaid_assets
+          ):
+            continue
+          left, top, right, bottom = (float(value) for value in bbox)
+          box = (
+            round(left / 1000 * page_image.width),
+            round(top / 1000 * page_image.height),
+            round(right / 1000 * page_image.width),
+            round(bottom / 1000 * page_image.height),
+          )
+          if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+          with Image.open(candidate) as extracted:
+            replacement = extracted.convert('RGB').resize(
+              (box[2] - box[0], box[3] - box[1]),
+              Image.Resampling.LANCZOS,
+            )
+            page_image.paste(replacement, box[:2])
+      output = io.BytesIO()
+      page_image.save(output, format='PNG', optimize=True)
+      payload = output.getvalue()
+    except Exception:
+      # The complete PDF page remains usable even if an optional MinerU asset
+      # is missing or malformed.
+      pass
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(payload)
+    return payload
+
+
 def write_pdf_bytes(file_id: str, payload: bytes) -> None:
   ensure_knowledge_storage_dirs()
   path = _asset_path(KNOWLEDGE_PDF_DIR, file_id, ".pdf")
   path.write_bytes(payload)
+  shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
 
 
 def delete_pdf_bytes(file_id: str) -> None:
@@ -377,6 +504,7 @@ def delete_pdf_bytes(file_id: str) -> None:
   except TypeError:
     if path.exists():
       path.unlink()
+  shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
 
 
 def read_annotation_asset(asset_id: str) -> str:

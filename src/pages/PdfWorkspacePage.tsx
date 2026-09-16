@@ -72,6 +72,7 @@ import {
   linkQuestionToHomeworkAnnotation,
   loadKnowledgeHomeworkAsset,
   loadKnowledgePdfSource,
+  resolveKnowledgePdfPageImageUrl,
   saveKnowledgeClassroomSession,
   saveKnowledgeHomeworkDocuments,
   saveKnowledgeAnnotation,
@@ -106,7 +107,7 @@ import {
 } from '../lib/mineru'
 import {
   extractPdfPreview,
-  extractPdfPreviewFromBuffer,
+  openPdfPreviewFromBuffer,
 } from '../lib/pdf'
 import type {
   ApiConfig,
@@ -391,6 +392,13 @@ export function PdfWorkspacePage() {
     (annotation) => annotation.pageNumber === currentPage,
   ).length
   const isLectureViewer = viewerSource.kind === 'lecture'
+  const resolveLecturePageImage = useCallback(
+    (pageNumber: number) =>
+      isLectureViewer && knowledgeFileId
+        ? resolveKnowledgePdfPageImageUrl(knowledgeFileId, pageNumber)
+        : null,
+    [isLectureViewer, knowledgeFileId],
+  )
   const {
     records: lessonRecordingRecords,
     isLoading: isLoadingLessonRecordings,
@@ -567,7 +575,7 @@ export function PdfWorkspacePage() {
                   pageCount: cachedPreview.pageCount ?? 1,
                   pageTexts: cachedPreview.pageTexts,
                 }
-              : await extractPdfPreviewFromBuffer(payload, targetDocument.fileName)
+              : await openPdfPreviewFromBuffer(payload)
           if (cancelled) {
             return
           }
@@ -658,7 +666,7 @@ export function PdfWorkspacePage() {
           ? await loadKnowledgePdfSource(storedFile.id)
           : null
         const extracted = pdfBuffer
-          ? await extractPdfPreviewFromBuffer(pdfBuffer, storedFile.fileName)
+          ? await openPdfPreviewFromBuffer(pdfBuffer)
           : null
 
         if (cancelled) {
@@ -2599,6 +2607,7 @@ export function PdfWorkspacePage() {
             <PdfPreviewCanvas
               fileName={currentViewerName}
               pdfController={currentViewerController}
+              pageImageUrl={resolveLecturePageImage}
               imageUrl={currentViewerImageUrl}
               currentPage={currentPage}
               pageCount={currentViewerPageCount}
