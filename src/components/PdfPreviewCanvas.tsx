@@ -135,7 +135,10 @@ type PdfPreviewCanvasProps = {
   annotationColor?: string
   annotations?: PdfAnnotation[]
   onAddAnnotation?: (annotation: Omit<PdfAnnotation, 'id' | 'createdAt' | 'updatedAt'>) => void
-  onUpdateAnnotation?: (id: string, patch: Partial<Pick<PdfAnnotation, 'text' | 'color'>>) => void
+  onUpdateAnnotation?: (
+    id: string,
+    patch: Partial<Pick<PdfAnnotation, 'text' | 'color' | 'x' | 'y' | 'width' | 'height'>>,
+  ) => void
   onRemoveAnnotation?: (id: string) => void
 }
 
@@ -503,7 +506,10 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   annotationColor?: string
   annotations?: PdfAnnotation[]
   onAddAnnotation?: (annotation: Omit<PdfAnnotation, 'id' | 'createdAt' | 'updatedAt'>) => void
-  onUpdateAnnotation?: (id: string, patch: Partial<Pick<PdfAnnotation, 'text' | 'color'>>) => void
+  onUpdateAnnotation?: (
+    id: string,
+    patch: Partial<Pick<PdfAnnotation, 'text' | 'color' | 'x' | 'y' | 'width' | 'height'>>,
+  ) => void
   onRemoveAnnotation?: (id: string) => void
   interactive?: boolean
 }) {
@@ -533,6 +539,16 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     startX: number
     startY: number
   } | null>(null)
+  const annotationMoveRef = useRef<{
+    pointerId: number
+    annotationId: string
+    startX: number
+    startY: number
+    originX: number
+    originY: number
+    width: number
+    height: number
+  } | null>(null)
   const [pageData, setPageData] = useState<RenderedPageData | null>(null)
   const [renderError, setRenderError] = useState<string | null>(null)
   const [captureRect, setCaptureRect] = useState<{
@@ -544,10 +560,13 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   const [referenceSelectionRect, setReferenceSelectionRect] = useState<ReferenceSelectionRect | null>(null)
   const [hoveredBlockId, setHoveredBlockId] = useState<string | null>(null)
   const [annotationRect, setAnnotationRect] = useState<ReferenceSelectionRect | null>(null)
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
   const [textDraft, setTextDraft] = useState<{
     annotationId?: string
     x: number
     y: number
+    width: number
+    height: number
     value: string
   } | null>(null)
 
@@ -572,6 +591,12 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     captureRectRef.current = null
     setCaptureRect(null)
   }, [isCaptureMode])
+
+  useEffect(() => {
+    setSelectedAnnotationId(null)
+    setTextDraft(null)
+    annotationMoveRef.current = null
+  }, [annotationTool, pageNumber])
 
   useEffect(() => {
     const handleKeyUp = (event: KeyboardEvent) => {
@@ -824,6 +849,9 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   }
 
   const beginTextSelection = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!isCaptureMode && event.button === 0 && !event.shiftKey) {
+      setSelectedAnnotationId(null)
+    }
     if (isCaptureMode || event.button !== 0 || !event.shiftKey) {
       return
     }
@@ -902,13 +930,6 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     const point = resolvePointerPosition(event)
     if (!point) return
 
-    if (annotationTool === 'text') {
-      setTextDraft({ x: point.x / pageData.width, y: point.y / pageData.height, value: '' })
-      event.stopPropagation()
-      event.preventDefault()
-      return
-    }
-
     annotationDragRef.current = {
       pointerId: event.pointerId,
       startX: point.x,
@@ -949,16 +970,26 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       height: Math.abs(point.y - drag.startY),
     }
     setAnnotationRect(null)
-    if (rect.width >= 5 && rect.height >= 5) {
-      onAddAnnotation?.({
-        pageNumber,
-        type: 'highlight',
-        color: annotationColor,
-        x: rect.left / pageData.width,
-        y: rect.top / pageData.height,
-        width: rect.width / pageData.width,
-        height: rect.height / pageData.height,
-      })
+    if (annotationTool === 'text') {
+      if (rect.width >= 24 && rect.height >= 18) {
+        setTextDraft({
+          x: rect.left / pageData.width,
+          y: rect.top / pageData.height,
+          width: rect.width / pageData.width,
+          height: rect.height / pageData.height,
+          value: '',
+        })
+      }
+    } else if (rect.width >= 5 && rect.height >= 5) {
+        onAddAnnotation?.({
+          pageNumber,
+          type: 'highlight',
+          color: annotationColor,
+          x: rect.left / pageData.width,
+          y: rect.top / pageData.height,
+          width: rect.width / pageData.width,
+          height: rect.height / pageData.height,
+        })
     }
     event.stopPropagation()
     event.preventDefault()
@@ -969,7 +1000,14 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     const value = textDraft.value.trim()
     if (value) {
       if (textDraft.annotationId) {
-        onUpdateAnnotation?.(textDraft.annotationId, { text: value, color: annotationColor })
+        onUpdateAnnotation?.(textDraft.annotationId, {
+          text: value,
+          color: annotationColor,
+          x: textDraft.x,
+          y: textDraft.y,
+          width: textDraft.width,
+          height: textDraft.height,
+        })
       } else {
         onAddAnnotation?.({
           pageNumber,
@@ -977,13 +1015,61 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
           color: annotationColor,
           x: textDraft.x,
           y: textDraft.y,
-          width: Math.min(0.34, Math.max(0.16, 1 - textDraft.x)),
-          height: 0.075,
+          width: textDraft.width,
+          height: textDraft.height,
           text: value,
         })
       }
     }
     setTextDraft(null)
+  }
+
+  const beginAnnotationMove = (
+    event: React.PointerEvent<HTMLDivElement>,
+    annotation: PdfAnnotation,
+  ) => {
+    if (annotation.type !== 'text' || event.button !== 0) return
+    event.stopPropagation()
+    if (selectedAnnotationId !== annotation.id) {
+      setSelectedAnnotationId(annotation.id)
+      return
+    }
+    const point = resolvePointerPosition(event)
+    if (!point) return
+    annotationMoveRef.current = {
+      pointerId: event.pointerId,
+      annotationId: annotation.id,
+      startX: point.x / pageData!.width,
+      startY: point.y / pageData!.height,
+      originX: annotation.x,
+      originY: annotation.y,
+      width: annotation.width,
+      height: annotation.height,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+  }
+
+  const moveAnnotation = (event: React.PointerEvent<HTMLDivElement>) => {
+    const move = annotationMoveRef.current
+    const point = resolvePointerPosition(event)
+    if (!move || !point || !pageData || move.pointerId !== event.pointerId) return
+    const nextX = Math.min(Math.max(move.originX + point.x / pageData.width - move.startX, 0), 1 - move.width)
+    const nextY = Math.min(Math.max(move.originY + point.y / pageData.height - move.startY, 0), 1 - move.height)
+    onUpdateAnnotation?.(move.annotationId, { x: nextX, y: nextY })
+    event.stopPropagation()
+    event.preventDefault()
+  }
+
+  const finishAnnotationMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const move = annotationMoveRef.current
+    if (!move || move.pointerId !== event.pointerId) return
+    annotationMoveRef.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    event.stopPropagation()
+    event.preventDefault()
   }
 
   return (
@@ -1156,21 +1242,28 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
           {annotations.map((annotation) => (
             <div
               key={annotation.id}
-              className={`pdf-stage__annotation pdf-stage__annotation--${annotation.type}`}
+              className={`pdf-stage__annotation pdf-stage__annotation--${annotation.type}${selectedAnnotationId === annotation.id ? ' is-selected' : ''}`}
               style={{
                 '--annotation-color': annotation.color,
                 left: `${annotation.x * pageData.width}px`,
                 top: `${annotation.y * pageData.height}px`,
                 width: `${annotation.width * pageData.width}px`,
-                minHeight: `${annotation.height * pageData.height}px`,
+                height: `${annotation.height * pageData.height}px`,
               } as React.CSSProperties}
+              onPointerDown={(event) => beginAnnotationMove(event, annotation)}
+              onPointerMove={moveAnnotation}
+              onPointerUp={finishAnnotationMove}
+              onPointerCancel={finishAnnotationMove}
               onDoubleClick={(event) => {
                 if (annotation.type !== 'text') return
                 event.stopPropagation()
+                setSelectedAnnotationId(annotation.id)
                 setTextDraft({
                   annotationId: annotation.id,
                   x: annotation.x,
                   y: annotation.y,
+                  width: annotation.width,
+                  height: annotation.height,
                   value: annotation.text || '',
                 })
               }}
@@ -1180,8 +1273,10 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                 type="button"
                 aria-label={annotation.type === 'text' ? '删除文本批注' : '删除高亮'}
                 title="删除批注"
+                onPointerDown={(event) => event.stopPropagation()}
                 onClick={(event) => {
                   event.stopPropagation()
+                  setSelectedAnnotationId(null)
                   onRemoveAnnotation?.(annotation.id)
                 }}
               >
@@ -1210,7 +1305,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
         >
           {annotationRect ? (
             <div
-              className="pdf-stage__annotation-draft-highlight"
+              className={`pdf-stage__annotation-draft pdf-stage__annotation-draft--${annotationTool}`}
               style={{
                 '--annotation-color': annotationColor,
                 left: `${annotationRect.left}px`,
@@ -1233,6 +1328,8 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
             '--annotation-color': annotationColor,
             left: `${textDraft.x * pageData.width * displayScale}px`,
             top: `${textDraft.y * pageData.height * displayScale}px`,
+            width: `${textDraft.width * pageData.width * displayScale}px`,
+            minHeight: `${textDraft.height * pageData.height * displayScale}px`,
           } as React.CSSProperties}
           onChange={(event) => setTextDraft((current) => current ? { ...current, value: event.target.value } : null)}
           onBlur={commitTextDraft}

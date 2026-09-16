@@ -5622,16 +5622,28 @@ body.is-resizing-panels {
 }
 
 .pdf-stage__annotation--text {
-  min-width: 92px;
-  padding: 7px 9px;
-  border: 1px solid color-mix(in srgb, var(--annotation-color) 68%, #526174);
-  border-radius: 7px;
+  padding: 2px 3px;
+  border: 1px solid transparent;
   color: #26364d;
-  background: color-mix(in srgb, var(--annotation-color) 17%, #fff);
-  box-shadow: 0 4px 12px rgba(34, 51, 73, .12);
+  background: transparent;
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+  cursor: text;
+  user-select: none;
+}
+
+.pdf-stage__annotation--text.is-selected {
+  border-color: color-mix(in srgb, var(--annotation-color) 72%, #526174);
+  cursor: move;
+}
+
+.pdf-stage__annotation--text.is-selected::before {
+  position: absolute;
+  inset: -3px;
+  border: 1px dashed color-mix(in srgb, var(--annotation-color) 58%, #526174);
+  content: '';
+  pointer-events: none;
 }
 
 .pdf-stage__annotation > button {
@@ -5653,34 +5665,40 @@ body.is-resizing-panels {
   transition: opacity 120ms ease;
 }
 
-.pdf-stage__annotation:hover > button,
+.pdf-stage__annotation--highlight:hover > button,
+.pdf-stage__annotation--text.is-selected > button,
 .pdf-stage__annotation > button:focus-visible { opacity: 1; }
 .pdf-stage__annotation > button svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 
-.pdf-stage__annotation-draft-highlight {
+.pdf-stage__annotation-draft {
   position: absolute;
   border: 1px dashed color-mix(in srgb, var(--annotation-color) 55%, #5b6572);
   border-radius: 2px;
+}
+
+.pdf-stage__annotation-draft--highlight {
   background: var(--annotation-color);
   opacity: .42;
+}
+
+.pdf-stage__annotation-draft--text {
+  background: color-mix(in srgb, var(--annotation-color) 7%, transparent);
 }
 
 .pdf-stage__annotation-text-editor {
   position: absolute;
   z-index: 7;
-  width: min(240px, 42%);
-  min-height: 72px;
-  padding: 9px 10px;
-  border: 2px solid color-mix(in srgb, var(--annotation-color) 62%, #4f6278);
-  border-radius: 8px;
+  padding: 3px 4px;
+  border: 1px solid color-mix(in srgb, var(--annotation-color) 72%, #4f6278);
+  border-radius: 2px;
   outline: 0;
   color: #26364d;
-  background: color-mix(in srgb, var(--annotation-color) 13%, #fff);
-  box-shadow: 0 8px 24px rgba(34, 51, 73, .16);
+  background: rgba(255, 255, 255, .92);
+  box-shadow: 0 2px 8px rgba(34, 51, 73, .1);
   font: inherit;
   font-size: 12px;
   line-height: 1.45;
-  resize: both;
+  resize: none;
 }
 
 .question-answer-viewer {

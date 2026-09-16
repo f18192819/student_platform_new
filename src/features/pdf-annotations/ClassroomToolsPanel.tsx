@@ -126,7 +126,7 @@ export function ClassroomToolsPanel({
           ))}
         </div>
         {!canAnnotate ? <p className="classroom-tools__notice">打开 PDF 后即可使用高亮和文本框。</p> : (
-          <p>{tool === 'highlight' ? '在页面上拖动以添加高亮。' : tool === 'text' ? '点击页面位置，输入批注内容。' : '选择一种工具后即可在页面上批注。'}</p>
+          <p>{tool === 'highlight' ? '在页面上拖动以添加高亮。' : tool === 'text' ? '拖出文字区域后输入；单击已有文字可移动或删除。' : '选择一种工具后即可在页面上批注。'}</p>
         )}
         <button
           type="button"

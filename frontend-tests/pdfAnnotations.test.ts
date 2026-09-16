@@ -48,11 +48,15 @@ test('PDF annotations use normalized page coordinates and survive zoom', () => {
   assert.match(canvasSource, /y: rect\.top \/ pageData\.height/)
   assert.match(canvasSource, /annotation\.x \* pageData\.width/)
   assert.match(canvasSource, /transform: `scale\(\$\{displayScale\}\)`/)
-  assert.match(canvasSource, /pdf-stage__annotation-draft-highlight/)
+  assert.match(canvasSource, /pdf-stage__annotation-draft--\$\{annotationTool\}/)
 })
 
-test('text annotations support inline entry, editing and deletion', () => {
+test('text annotations use a drawn text area with selection, movement and deletion', () => {
   assert.match(canvasSource, /placeholder="输入课堂批注…"/)
+  assert.match(canvasSource, /rect\.width >= 24 && rect\.height >= 18/)
+  assert.match(canvasSource, /selectedAnnotationId === annotation\.id \? ' is-selected'/)
+  assert.match(canvasSource, /annotationMoveRef/)
+  assert.match(canvasSource, /onUpdateAnnotation\?\.\(move\.annotationId, \{ x: nextX, y: nextY \}\)/)
   assert.match(canvasSource, /onUpdateAnnotation\?\./)
   assert.match(canvasSource, /onRemoveAnnotation\?\./)
   assert.match(canvasSource, /event\.key === 'Escape'/)

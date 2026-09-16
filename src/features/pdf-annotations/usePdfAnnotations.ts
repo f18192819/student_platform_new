@@ -42,7 +42,10 @@ export function usePdfAnnotations(documentKey: string) {
     }])
   }, [commit])
 
-  const updateAnnotation = useCallback((id: string, patch: Partial<Pick<PdfAnnotation, 'text' | 'color'>>) => {
+  const updateAnnotation = useCallback((
+    id: string,
+    patch: Partial<Pick<PdfAnnotation, 'text' | 'color' | 'x' | 'y' | 'width' | 'height'>>,
+  ) => {
     commit((current) => current.map((annotation) => annotation.id === id
       ? { ...annotation, ...patch, updatedAt: Date.now() }
       : annotation))
