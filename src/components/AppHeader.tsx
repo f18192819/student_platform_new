@@ -5,6 +5,10 @@ import {
   readRememberedCourseId,
   rememberCourseId,
 } from '../lib/courseContext'
+import {
+  isLessonRecordingActive,
+  LESSON_RECORDING_STATE_EVENT,
+} from '../features/lesson-recording/lessonRecordingState'
 
 export function AppHeader({
   rightContent,
@@ -18,7 +22,7 @@ export function AppHeader({
   const currentCourseId = routeCourseId ?? rememberedCourseId
   const knowledgeLibraryTarget = buildCourseScopedPath('/library', currentCourseId)
   const pdfReaderTarget = buildCourseScopedPath('/pdf', currentCourseId)
-  const [isLessonRecording, setIsLessonRecording] = useState(false)
+  const [isLessonRecording, setIsLessonRecording] = useState(isLessonRecordingActive)
   const [lessonProcessingStatus, setLessonProcessingStatus] = useState('')
 
   useEffect(() => {
@@ -37,10 +41,10 @@ export function AppHeader({
       setLessonProcessingStatus(customEvent.detail?.label?.trim() ?? '')
     }
 
-    window.addEventListener('student-platform:lesson-recording-state', handleState)
+    window.addEventListener(LESSON_RECORDING_STATE_EVENT, handleState)
     window.addEventListener('student-platform:lesson-processing-state', handleProcessingState)
     return () => {
-      window.removeEventListener('student-platform:lesson-recording-state', handleState)
+      window.removeEventListener(LESSON_RECORDING_STATE_EVENT, handleState)
       window.removeEventListener('student-platform:lesson-processing-state', handleProcessingState)
     }
   }, [])
@@ -110,6 +114,16 @@ export function AppHeader({
             <Link className="octopus-header-link" to="/settings/api">
               API 配置
             </Link>
+            {lessonProcessingStatus ? <span className="octopus-status-pill">{lessonProcessingStatus}</span> : null}
+            {isLessonRecording ? (
+              <button
+                type="button"
+                className="octopus-primary-button octopus-primary-button--link"
+                onClick={handleToggleLesson}
+              >
+                结束录音
+              </button>
+            ) : null}
             <Link className="octopus-primary-button octopus-primary-button--link" to={pdfReaderTarget}>
               PDF 阅读器
             </Link>

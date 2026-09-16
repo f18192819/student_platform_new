@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { fetchLectureRecordings, type LectureRecordingView } from './lessonRecordingApi'
+import { LESSON_RECORDING_UPDATED_EVENT } from './lessonRecordingState'
 
 export function useLessonRecordings(courseId: string | null, enabled = true) {
   const [records, setRecords] = useState<LectureRecordingView[]>([])
@@ -29,6 +30,13 @@ export function useLessonRecordings(courseId: string | null, enabled = true) {
     const controller = new AbortController()
     void refresh(controller.signal)
     return () => controller.abort()
+  }, [enabled, refresh])
+
+  useEffect(() => {
+    if (!enabled) return
+    const handleUpdated = () => void refresh()
+    window.addEventListener(LESSON_RECORDING_UPDATED_EVENT, handleUpdated)
+    return () => window.removeEventListener(LESSON_RECORDING_UPDATED_EVENT, handleUpdated)
   }, [enabled, refresh])
 
   useEffect(() => {

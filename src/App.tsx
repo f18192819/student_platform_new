@@ -7,6 +7,7 @@ import { DashboardPage } from './pages/DashboardPage'
 import { KnowledgeLibraryPage } from './pages/KnowledgeLibraryPage'
 import { PdfWorkspacePage } from './pages/PdfWorkspacePage'
 import { StudyPlanPage } from './pages/StudyPlanPage'
+import { LessonRecordingController } from './features/lesson-recording/LessonRecordingController'
 import { runAutoCoursewareSyncOnce } from './features/knowledge-library/autoCoursewareSync'
 import { resumePendingQuestionDocuments } from './lib/questionPipeline'
 import {
@@ -76,6 +77,7 @@ function App() {
 
   return (
     <div className={`app-shell${isReaderPage ? ' app-shell--reader-page' : ''}`}>
+      <LessonRecordingController />
       <AppHeader />
       {coursewareSyncStatus ? (
         <div
@@ -99,4 +101,3 @@ function App() {
 }
 
 export default App
-

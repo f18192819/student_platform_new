@@ -3,17 +3,30 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 const pageSource = readFileSync('src/pages/PdfWorkspacePage.tsx', 'utf8')
+const controllerSource = readFileSync('src/features/lesson-recording/LessonRecordingController.tsx', 'utf8')
+const appSource = readFileSync('src/App.tsx', 'utf8')
+const headerSource = readFileSync('src/components/AppHeader.tsx', 'utf8')
 const aiSource = readFileSync('src/lib/ai.ts', 'utf8')
 const mediaSource = readFileSync('backend/media_router.py', 'utf8')
 
 test('lesson recording can start before choosing a course or opening a document', () => {
-  assert.doesNotMatch(pageSource, /if \(!activeKnowledgeCourseId\)[\s\S]*请先从课程页面进入 PDF 阅读器/)
-  assert.doesNotMatch(pageSource, /请先打开一份讲义 PDF，再开始上课录音/)
-  assert.match(pageSource, /if \(!audioBlob\.size\) \{\s*return/)
-  assert.match(pageSource, /activeKnowledgeCourseIdRef\.current/)
-  assert.match(pageSource, /knowledgeFileIdRef\.current/)
-  assert.match(pageSource, /等待选择课程或上传讲义/)
-  assert.match(pageSource, /麦克风启动失败/)
+  assert.match(controllerSource, /contextFromLocation/)
+  assert.match(controllerSource, /context\.courseId\s*\? \{ courseId: context\.courseId, documentId: context\.documentId \}\s*: undefined/)
+  assert.match(controllerSource, /等待选择课程或上传讲义/)
+  assert.match(controllerSource, /麦克风启动失败/)
+})
+
+test('recording controller survives route changes and only explicit stop ends capture', () => {
+  assert.match(appSource, /<LessonRecordingController \/>/)
+  assert.doesNotMatch(pageSource, /new MediaRecorder|lessonStreamRef|track\.stop\(\)/)
+  assert.match(controllerSource, /routeContextRef\.current = contextFromLocation\(location\.search\)/)
+  assert.match(controllerSource, /if \(detail\?\.nextRecording\) void startRecording\(\)/)
+  assert.match(controllerSource, /else stopRecording\(\)/)
+  assert.doesNotMatch(
+    controllerSource.match(/return \(\) => \{[\s\S]*?\n    \}/g)?.at(-1) ?? '',
+    /recorder\.stop\(\)|track\.stop\(\)/,
+  )
+  assert.match(headerSource, /isLessonRecording \? \([\s\S]*?结束录音/)
 })
 
 test('ASR context is optional and the backend persists unassigned recordings', () => {

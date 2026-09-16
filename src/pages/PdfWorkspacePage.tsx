@@ -15,13 +15,9 @@ import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/Rela
 import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
 import { LessonRecordingPanel } from '../features/lesson-recording/LessonRecordingPanel'
 import {
-  appendLessonRecordingChunk,
-  createLessonRecordingDraft,
-  getLessonRecordingOwnerId,
-  markLessonRecordingPending,
-  readLessonRecordingDrafts,
-  removeLessonRecordingDraft,
-} from '../features/lesson-recording/recordingDraftStore'
+  isLessonRecordingActive,
+  LESSON_RECORDING_STATE_EVENT,
+} from '../features/lesson-recording/lessonRecordingState'
 import { useLessonRecordings } from '../features/lesson-recording/useLessonRecordings'
 import { QuestionAnswerViewer } from '../features/question-answer/QuestionAnswerViewer'
 import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageLecturePlayback'
@@ -167,7 +163,7 @@ export function PdfWorkspacePage() {
   const [homeworkFocus, setHomeworkFocus] = useState<HomeworkFocus | null>(null)
   const [, setIsExtractingHomework] = useState(false)
   const [_isProcessingLesson, setIsProcessingLesson] = useState(false)
-  const [isLessonRecording, setIsLessonRecording] = useState(false)
+  const [isLessonRecording, setIsLessonRecording] = useState(isLessonRecordingActive)
   const [pageFilter, setPageFilter] = useState<number | null>(null)
   const [pageLectureFilter, setPageLectureFilter] = useState<number | null>(null)
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
@@ -183,13 +179,6 @@ export function PdfWorkspacePage() {
   const streamBufferRef = useRef('')
   const streamTimerRef = useRef<number | null>(null)
   const saveChatTimerRef = useRef<number | null>(null)
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const lessonChunksRef = useRef<Blob[]>([])
-  const lessonStreamRef = useRef<MediaStream | null>(null)
-  const lessonDraftIdRef = useRef<string | null>(null)
-  const lessonChunkOrderRef = useRef(0)
-  const lessonChunkWritesRef = useRef<Promise<void>>(Promise.resolve())
-  const lessonRecoveryStartedRef = useRef(false)
   const pdfInputRef = useRef<HTMLInputElement | null>(null)
   const chatUploadInputRef = useRef<HTMLInputElement | null>(null)
   const homeworkUploadInputRef = useRef<HTMLInputElement | null>(null)
@@ -1374,24 +1363,6 @@ export function PdfWorkspacePage() {
     )
   }
 
-  const stopLessonRecording = useCallback(async () => {
-    const recorder = mediaRecorderRef.current
-    if (!recorder) {
-      return
-    }
-
-    await new Promise<void>((resolve) => {
-      recorder.addEventListener(
-        'stop',
-        () => {
-          resolve()
-        },
-        { once: true },
-      )
-      recorder.stop()
-    })
-  }, [])
-
   const persistLessonTranscript = useCallback(
     async (
       transcript:
@@ -1497,147 +1468,6 @@ export function PdfWorkspacePage() {
     },
     [persistLessonTranscript, refreshLessonRecordings],
   )
-
-  useEffect(() => {
-    if (lessonRecoveryStartedRef.current) return
-    lessonRecoveryStartedRef.current = true
-
-    const recoverInterruptedRecordings = async () => {
-      try {
-        const drafts = await readLessonRecordingDrafts(getLessonRecordingOwnerId())
-        const recoverable = drafts.filter((item) => item.blob.size > 0)
-        if (!recoverable.length) return
-        emitLessonProcessingState(`正在恢复 ${recoverable.length} 段未提交录音`)
-        for (const item of recoverable) {
-          await markLessonRecordingPending(item.draft.id)
-          const saved = await processLessonAudio(
-            item.blob,
-            '刷新前的课堂录音',
-            { courseId: item.draft.courseId, documentId: item.draft.documentId },
-          )
-          if (saved) await removeLessonRecordingDraft(item.draft.id)
-        }
-      } catch (error) {
-        console.warn('Interrupted classroom recording recovery failed:', error)
-        emitLessonProcessingState('录音恢复失败，可刷新重试')
-      }
-    }
-
-    void recoverInterruptedRecordings()
-  }, [processLessonAudio])
-
-  const startLessonRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const recorder = new MediaRecorder(stream)
-      let draftId: string | null = null
-      try {
-        const draft = await createLessonRecordingDraft({
-          ownerId: getLessonRecordingOwnerId(),
-          courseId: activeKnowledgeCourseId,
-          documentId: knowledgeFileId,
-          mimeType: recorder.mimeType || 'audio/webm',
-        })
-        draftId = draft.id
-      } catch (error) {
-        console.warn('Recording draft persistence is unavailable:', error)
-      }
-      lessonChunksRef.current = []
-      lessonDraftIdRef.current = draftId
-      lessonChunkOrderRef.current = 0
-      lessonChunkWritesRef.current = Promise.resolve()
-      lessonStreamRef.current = stream
-      mediaRecorderRef.current = recorder
-
-      recorder.addEventListener('dataavailable', (event) => {
-        if (event.data.size > 0) {
-          lessonChunksRef.current.push(event.data)
-          if (draftId) {
-            const order = lessonChunkOrderRef.current++
-            lessonChunkWritesRef.current = lessonChunkWritesRef.current
-              .then(() => appendLessonRecordingChunk(draftId, order, event.data))
-              .catch((error) => {
-                console.warn('Failed to persist a classroom recording chunk:', error)
-              })
-          }
-        }
-      })
-
-      recorder.addEventListener(
-        'stop',
-        async () => {
-          setIsLessonRecording(false)
-          window.dispatchEvent(
-            new CustomEvent('student-platform:lesson-recording-state', {
-              detail: { isRecording: false },
-            }),
-          )
-
-          lessonStreamRef.current?.getTracks().forEach((track) => track.stop())
-          lessonStreamRef.current = null
-          mediaRecorderRef.current = null
-
-          await lessonChunkWritesRef.current
-          let audioBlob = new Blob(lessonChunksRef.current, {
-            type: recorder.mimeType || 'audio/webm',
-          })
-          lessonChunksRef.current = []
-
-          if (draftId) {
-            try {
-              await markLessonRecordingPending(draftId)
-              const recovered = (await readLessonRecordingDrafts(getLessonRecordingOwnerId()))
-                .find((item) => item.draft.id === draftId)
-              if (recovered?.blob.size) audioBlob = recovered.blob
-            } catch (error) {
-              console.warn('Failed to finalize the persistent recording draft:', error)
-            }
-          }
-
-          if (!audioBlob.size) {
-            return
-          }
-
-          const saved = await processLessonAudio(audioBlob, '课堂录音')
-          if (saved && draftId) {
-            await removeLessonRecordingDraft(draftId).catch((error) => {
-              console.warn('Failed to remove a submitted recording draft:', error)
-            })
-          }
-          if (lessonDraftIdRef.current === draftId) lessonDraftIdRef.current = null
-        },
-        { once: true },
-      )
-
-      recorder.start(1000)
-      setIsLessonRecording(true)
-      emitLessonProcessingState(draftId ? '录音中 · 已开启防丢保护' : '录音中 · 本地保护不可用')
-      window.dispatchEvent(
-        new CustomEvent('student-platform:lesson-recording-state', {
-          detail: { isRecording: true },
-        }),
-      )
-      setChatMessages((current) => [
-        ...current,
-        createMessage(
-          'system',
-          knowledgeFileId
-            ? '已开始录音。结束后系统会自动转写并映射到当前讲义。'
-            : activeKnowledgeCourseId
-              ? '已开始录音。结束后先完成 ASR 转写；上传本课程讲义后会自动继续映射。'
-              : '已开始录音。结束后先完成 ASR 转写；进入课程或上传讲义后会自动绑定并继续映射。',
-        ),
-      ])
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '无法启动录音'
-      emitLessonProcessingState('麦克风启动失败')
-      window.setTimeout(() => emitLessonProcessingState(''), 3000)
-      setChatMessages((current) => [
-        ...current,
-        createMessage('system', `录音启动失败：${message}`),
-      ])
-    }
-  }, [activeKnowledgeCourseId, knowledgeFileId, processLessonAudio])
 
   const handleLessonAudioUploadChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -2596,23 +2426,6 @@ export function PdfWorkspacePage() {
   const currentDocumentText = documentText
 
   useEffect(() => {
-    window.dispatchEvent(
-      new CustomEvent('student-platform:lesson-recording-state', {
-        detail: { isRecording: isLessonRecording },
-      }),
-    )
-  }, [isLessonRecording])
-
-  useEffect(() => {
-    const handleToggle = (event: Event) => {
-      const customEvent = event as CustomEvent<{ nextRecording?: boolean }>
-      if (customEvent.detail?.nextRecording) {
-        void startLessonRecording()
-      } else {
-        void stopLessonRecording()
-      }
-    }
-
     const handleAudioUpload = () => {
       lessonAudioUploadInputRef.current?.click()
     }
@@ -2621,35 +2434,23 @@ export function PdfWorkspacePage() {
       lessonTranscriptUploadInputRef.current?.click()
     }
 
-    const persistLatestRecordingSlice = () => {
-      const recorder = mediaRecorderRef.current
-      if (recorder?.state === 'recording') {
-        try {
-          recorder.requestData()
-        } catch (error) {
-          console.warn('Unable to flush the latest recording slice:', error)
-        }
-      }
-    }
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') persistLatestRecordingSlice()
-    }
-
-    window.addEventListener('student-platform:lesson-recording-toggle', handleToggle)
     window.addEventListener('student-platform:lesson-audio-upload', handleAudioUpload)
     window.addEventListener('student-platform:lesson-transcript-upload', handleTranscriptUpload)
-    window.addEventListener('pagehide', persistLatestRecordingSlice)
-    document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
-      window.removeEventListener('student-platform:lesson-recording-toggle', handleToggle)
       window.removeEventListener('student-platform:lesson-audio-upload', handleAudioUpload)
       window.removeEventListener('student-platform:lesson-transcript-upload', handleTranscriptUpload)
-      window.removeEventListener('pagehide', persistLatestRecordingSlice)
-      document.removeEventListener('visibilitychange', handleVisibilityChange)
-      lessonStreamRef.current?.getTracks().forEach((track) => track.stop())
     }
-  }, [currentDocumentText, currentKnowledgeFileId, startLessonRecording, stopLessonRecording])
+  }, [currentDocumentText, currentKnowledgeFileId])
+
+  useEffect(() => {
+    const handleRecordingState = (event: Event) => {
+      const detail = (event as CustomEvent<{ isRecording?: boolean }>).detail
+      setIsLessonRecording(Boolean(detail?.isRecording))
+    }
+    setIsLessonRecording(isLessonRecordingActive())
+    window.addEventListener(LESSON_RECORDING_STATE_EVENT, handleRecordingState)
+    return () => window.removeEventListener(LESSON_RECORDING_STATE_EVENT, handleRecordingState)
+  }, [])
 
   return (
     <main className="pdf-workspace pdf-workspace--reader">
