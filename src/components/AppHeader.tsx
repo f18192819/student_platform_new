@@ -59,14 +59,6 @@ export function AppHeader({
     )
   }
 
-  const handleUploadLessonAudio = () => {
-    window.dispatchEvent(new CustomEvent('student-platform:lesson-audio-upload'))
-  }
-
-  const handleUploadLessonTranscript = () => {
-    window.dispatchEvent(new CustomEvent('student-platform:lesson-transcript-upload'))
-  }
-
   return (
     <header className={`octopus-app-header${isReaderPage ? ' octopus-app-header--reader' : ''}`}>
       <div className="octopus-app-header__brand">
@@ -77,32 +69,10 @@ export function AppHeader({
       </div>
       <div className="octopus-app-header__actions">
         {rightContent ?? (isReaderPage ? (
-          <>
-            <nav className="octopus-app-header__primary-nav" aria-label="主要导航">
-              <Link className="octopus-header-link" to="/">课程</Link>
-              <Link className="octopus-header-link" to={knowledgeLibraryTarget}>知识库</Link>
-            </nav>
-            {lessonProcessingStatus ? <span className="octopus-status-pill">{lessonProcessingStatus}</span> : null}
-            <button
-              type="button"
-              className="octopus-primary-button octopus-primary-button--link"
-              onClick={handleToggleLesson}
-            >
-              {isLessonRecording ? '结束录音' : '开始上课'}
-            </button>
-            <details className="octopus-reader-more">
-              <summary aria-label="更多阅读器操作">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4" /><circle cx="12" cy="12" r="1.4" /><circle cx="19" cy="12" r="1.4" /></svg>
-                <span>更多</span>
-              </summary>
-              <div className="octopus-reader-more__menu">
-                <button type="button" onClick={handleUploadLessonAudio}>上传录音</button>
-                <button type="button" onClick={handleUploadLessonTranscript}>上传原文</button>
-                <Link to="/settings/api">API 配置</Link>
-                <Link to={pdfReaderTarget} aria-current="page">PDF 阅读器</Link>
-              </div>
-            </details>
-          </>
+          <nav className="octopus-app-header__primary-nav" aria-label="主要导航">
+            <Link className="octopus-header-link" to="/">课程</Link>
+            <Link className="octopus-header-link" to={knowledgeLibraryTarget}>知识库</Link>
+          </nav>
         ) : (
           <>
             <Link className="octopus-header-link" to="/">

@@ -6,6 +6,7 @@ import '../styles/reader-floating-ui.css'
 
 export function ReaderWorkspaceLayout({
   children,
+  classroomPanel,
   relatedPanel,
   chatPanel,
   gradingPanel,
@@ -17,6 +18,7 @@ export function ReaderWorkspaceLayout({
   gradingPinRequest = 0,
 }: {
   children: ReactNode
+  classroomPanel: ReactNode
   relatedPanel: ReactNode
   chatPanel: ReactNode
   gradingPanel?: ReactNode
@@ -35,14 +37,18 @@ export function ReaderWorkspaceLayout({
     if (gradingPinRequest > 0 && gradingPanel) openPanel('grading')
   }, [gradingPanel, gradingPinRequest, openPanel])
 
-  const leftContent = left.panel === 'grading'
+  const leftContent = left.panel === 'classroom'
+    ? classroomPanel
+    : left.panel === 'grading'
     ? gradingPanel
     : left.panel === 'history'
       ? historyPanel
       : left.panel === 'related'
         ? relatedPanel
         : null
-  const leftTitle = left.panel === 'grading'
+  const leftTitle = left.panel === 'classroom'
+    ? '课堂工具'
+    : left.panel === 'grading'
     ? '批改详情'
     : left.panel === 'history'
       ? historyTitle
@@ -54,6 +60,7 @@ export function ReaderWorkspaceLayout({
     '--reader-right-width': right.panel ? 'clamp(360px, 27vw, 460px)' : '0px',
   } as CSSProperties
   const leftItems = [
+    { id: 'classroom' as const, label: '课堂工具' },
     { id: 'related' as const, label: '习题关联' },
     { id: 'grading' as const, label: '批改', badge: gradingBadge, disabled: !gradingPanel },
     { id: 'history' as const, label: historyLabel, badge: historyBadge, disabled: !historyPanel },

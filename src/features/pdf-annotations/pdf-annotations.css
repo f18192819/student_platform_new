@@ -1,0 +1,30 @@
+.classroom-tools { display: grid; align-content: start; min-height: 100%; color: var(--reader-text-primary); }
+.classroom-tools__section { display: grid; gap: 13px; padding: 18px 16px 20px; border-bottom: 1px solid var(--reader-border-subtle); }
+.classroom-tools__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.classroom-tools__heading > div { display: grid; gap: 3px; }
+.classroom-tools__heading strong { font-size: 13px; }
+.classroom-tools__heading span, .classroom-tools__section > p { color: var(--reader-text-tertiary); font-size: 11px; line-height: 1.55; }
+.classroom-tools__section > p { margin: -2px 0 0; }
+.classroom-tools__recording-dot { width: 8px; height: 8px; border-radius: 50%; background: #aeb8c7; }
+.classroom-tools__recording-dot.is-active { background: #e2473f; box-shadow: 0 2px 8px rgba(226, 71, 63, .32); animation: classroom-recording-pulse 1.8s ease-in-out infinite; }
+.classroom-tools__record { display: flex; min-height: 42px; align-items: center; justify-content: center; gap: 9px; border: 0; border-radius: 10px; color: #fff; background: #1167d8; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+.classroom-tools__record > span { width: 9px; height: 9px; border: 2px solid currentColor; border-radius: 50%; }
+.classroom-tools__record.is-recording { background: #b63d37; }
+.classroom-tools__record.is-recording > span { border-radius: 2px; background: currentColor; }
+.classroom-tools__file-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.classroom-tools__file-actions button, .classroom-tools__clear { min-height: 36px; border: 1px solid var(--reader-border-subtle); border-radius: 9px; color: var(--reader-text-secondary); background: var(--reader-surface-1); font: inherit; font-size: 11px; font-weight: 650; cursor: pointer; }
+.classroom-tools__file-actions button:hover, .classroom-tools__clear:hover:not(:disabled) { color: var(--reader-accent); border-color: rgba(17, 103, 216, .35); background: var(--reader-accent-soft); }
+.classroom-tools__modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.classroom-tools__modes button { display: grid; min-height: 62px; place-items: center; align-content: center; gap: 5px; border: 1px solid transparent; border-radius: 10px; color: var(--reader-text-secondary); background: rgba(37, 55, 80, .045); font: inherit; font-size: 10px; cursor: pointer; }
+.classroom-tools__modes button:hover:not(:disabled) { color: var(--reader-text-primary); background: rgba(37, 55, 80, .075); }
+.classroom-tools__modes button.is-active { color: var(--reader-accent); border-color: rgba(17, 103, 216, .22); background: var(--reader-accent-soft); }
+.classroom-tools__modes button:disabled { cursor: not-allowed; opacity: .35; }
+.classroom-tools__modes svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.classroom-tools__palette { display: flex; align-items: center; gap: 8px; }
+.classroom-tools__palette > span { margin-right: auto; color: var(--reader-text-tertiary); font-size: 11px; }
+.classroom-tools__palette button { width: 22px; height: 22px; padding: 0; border: 2px solid var(--reader-surface-1); border-radius: 50%; background: var(--annotation-color); box-shadow: 0 0 0 1px rgba(37, 55, 80, .16); cursor: pointer; }
+.classroom-tools__palette button.is-active { box-shadow: 0 0 0 2px var(--reader-surface-1), 0 0 0 4px var(--reader-accent); }
+.classroom-tools__clear:disabled { cursor: default; opacity: .42; }
+.classroom-tools__notice { color: #8a5b22 !important; }
+@keyframes classroom-recording-pulse { 50% { opacity: .45; transform: scale(.78); } }
+@media (prefers-reduced-motion: reduce) { .classroom-tools__recording-dot.is-active { animation: none; } }

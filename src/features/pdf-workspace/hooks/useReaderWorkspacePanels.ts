@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-export type WorkspacePanelId = 'related' | 'chat' | 'grading' | 'history'
+export type WorkspacePanelId = 'classroom' | 'related' | 'chat' | 'grading' | 'history'
 export type WorkspaceLayoutMode = 'wide' | 'single-side' | 'drawer'
 
 type PanelState<T extends WorkspacePanelId> = {
@@ -8,7 +8,7 @@ type PanelState<T extends WorkspacePanelId> = {
 }
 
 export type WorkspaceLayoutState = {
-  left: PanelState<'related' | 'grading' | 'history'>
+  left: PanelState<'classroom' | 'related' | 'grading' | 'history'>
   right: PanelState<'chat'>
 }
 
@@ -49,7 +49,7 @@ export function useReaderWorkspacePanels() {
       }
       if (mode !== 'wide' && slot === 'left') next.right = { ...EMPTY_LAYOUT.right }
       if (mode !== 'wide' && slot === 'right') next.left = { ...EMPTY_LAYOUT.left }
-      if (slot === 'left') next.left = { panel: panel as 'related' | 'grading' | 'history' }
+      if (slot === 'left') next.left = { panel: panel as 'classroom' | 'related' | 'grading' | 'history' }
       if (slot === 'right') next.right = { panel: 'chat' }
       return next
     })

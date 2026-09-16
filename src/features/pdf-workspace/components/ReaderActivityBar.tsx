@@ -13,6 +13,7 @@ function ActivityIcon({ id }: { id: WorkspacePanelId | 'settings' }) {
     fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
     strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const,
   }
+  if (id === 'classroom') return <svg viewBox="0 0 24 24" aria-hidden="true"><path {...common} d="m5 19 1.2-4.3L16.5 4.4a1.6 1.6 0 0 1 2.2 0l.9.9a1.6 1.6 0 0 1 0 2.2L9.3 17.8 5 19Z" /><path {...common} d="m14.8 6.2 3 3M6.2 14.7l3.1 3.1" /></svg>
   if (id === 'related') return <svg viewBox="0 0 24 24" aria-hidden="true"><path {...common} d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5v-15Z" /><path {...common} d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20M8 7h8M8 11h6" /></svg>
   if (id === 'chat') return <svg viewBox="0 0 24 24" aria-hidden="true"><path {...common} d="M20.5 11.5a8 8 0 0 1-8.4 8 9.5 9.5 0 0 1-3.8-.8L4 20l1.4-3.8A7.7 7.7 0 0 1 4 11.5a8 8 0 0 1 8.5-8 8 8 0 0 1 8 8Z" /><path {...common} d="M8.5 11.5h.01M12.5 11.5h.01M16.5 11.5h.01" /></svg>
   if (id === 'grading') return <svg viewBox="0 0 24 24" aria-hidden="true"><path {...common} d="M6 3.5h9l3 3V21H6V3.5Z" /><path {...common} d="M15 3.5v3h3M9 11l2 2 4-4M9 17h6" /></svg>

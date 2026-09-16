@@ -21,9 +21,11 @@ test('reader workspace uses IDE-style activity rails around collapsible side pan
   assert.doesNotMatch(layoutSource, /reader-workspace__bottom/)
 })
 
-test('grading and history live on the left while AI owns the right side', () => {
-  assert.match(hookSource, /left: PanelState<'related' \| 'grading' \| 'history'>/)
+test('classroom tools, grading and history live on the left while AI owns the right side', () => {
+  assert.match(hookSource, /left: PanelState<'classroom' \| 'related' \| 'grading' \| 'history'>/)
   assert.match(hookSource, /right: PanelState<'chat'>/)
+  assert.match(layoutSource, /left\.panel === 'classroom'/)
+  assert.match(layoutSource, /id: 'classroom' as const, label: '课堂工具'/)
   assert.match(layoutSource, /left\.panel === 'grading'/)
   assert.match(layoutSource, /left\.panel === 'history'/)
   assert.match(layoutSource, /title="AI 助手"/)

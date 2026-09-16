@@ -16,6 +16,7 @@ export function QuestionAnswerViewer({
   sourceDocumentId,
   questionId,
   sourceType,
+  classroomPanel,
   relatedPanel,
   chatPanel,
   workspaceHistoryPanel,
@@ -28,6 +29,7 @@ export function QuestionAnswerViewer({
   sourceDocumentId: string | null
   questionId: string | null
   sourceType: 'homework' | 'past-exam'
+  classroomPanel: ReactNode
   relatedPanel: ReactNode
   chatPanel: ReactNode
   workspaceHistoryPanel?: ReactNode
@@ -159,6 +161,7 @@ export function QuestionAnswerViewer({
 
   return (
     <ReaderWorkspaceLayout
+      classroomPanel={classroomPanel}
       relatedPanel={relatedPanel}
       chatPanel={chatPanel}
       gradingPanel={gradingPanel}

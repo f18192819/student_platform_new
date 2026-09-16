@@ -5596,6 +5596,93 @@ body.is-resizing-panels {
   border-radius: 20px;
 }
 
+.pdf-stage__annotation-layer,
+.pdf-stage__annotation-input {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  transform-origin: top left;
+}
+
+.pdf-stage__annotation-layer { pointer-events: none; }
+.pdf-stage__annotation-input { z-index: 5; touch-action: none; user-select: none; }
+.pdf-stage__annotation-input--highlight { cursor: crosshair; }
+.pdf-stage__annotation-input--text { cursor: text; }
+
+.pdf-stage__annotation {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
+
+.pdf-stage__annotation--highlight {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--annotation-color) 36%, transparent);
+  mix-blend-mode: multiply;
+}
+
+.pdf-stage__annotation--text {
+  min-width: 92px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--annotation-color) 68%, #526174);
+  border-radius: 7px;
+  color: #26364d;
+  background: color-mix(in srgb, var(--annotation-color) 17%, #fff);
+  box-shadow: 0 4px 12px rgba(34, 51, 73, .12);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.pdf-stage__annotation > button {
+  position: absolute;
+  top: -9px;
+  right: -9px;
+  display: grid;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid rgba(68, 80, 96, .2);
+  border-radius: 50%;
+  color: #4b596b;
+  background: #fff;
+  box-shadow: 0 3px 8px rgba(34, 51, 73, .16);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.pdf-stage__annotation:hover > button,
+.pdf-stage__annotation > button:focus-visible { opacity: 1; }
+.pdf-stage__annotation > button svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+
+.pdf-stage__annotation-draft-highlight {
+  position: absolute;
+  border: 1px dashed color-mix(in srgb, var(--annotation-color) 55%, #5b6572);
+  border-radius: 2px;
+  background: var(--annotation-color);
+  opacity: .42;
+}
+
+.pdf-stage__annotation-text-editor {
+  position: absolute;
+  z-index: 7;
+  width: min(240px, 42%);
+  min-height: 72px;
+  padding: 9px 10px;
+  border: 2px solid color-mix(in srgb, var(--annotation-color) 62%, #4f6278);
+  border-radius: 8px;
+  outline: 0;
+  color: #26364d;
+  background: color-mix(in srgb, var(--annotation-color) 13%, #fff);
+  box-shadow: 0 8px 24px rgba(34, 51, 73, .16);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  resize: both;
+}
+
 .question-answer-viewer {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);

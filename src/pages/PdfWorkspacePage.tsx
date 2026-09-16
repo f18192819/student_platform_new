@@ -14,6 +14,8 @@ import { PageLecturePlayer } from '../features/pdf-workspace/components/PageLect
 import { RelatedMaterialsPanel } from '../features/pdf-workspace/components/RelatedMaterialsPanel'
 import { LectureMasteryTest } from '../features/mastery-test/LectureMasteryTest'
 import { LessonRecordingPanel } from '../features/lesson-recording/LessonRecordingPanel'
+import { ClassroomToolsPanel } from '../features/pdf-annotations/ClassroomToolsPanel'
+import { usePdfAnnotations } from '../features/pdf-annotations/usePdfAnnotations'
 import {
   isLessonRecordingActive,
   LESSON_RECORDING_STATE_EVENT,
@@ -378,6 +380,16 @@ export function PdfWorkspacePage() {
     viewerSource.kind === 'homework' ? homeworkPreviewImageUrl : null
   const currentViewerStructuredBlocks =
     viewerSource.kind === 'homework' ? homeworkPreviewLayoutBlocks : lectureLayoutBlocks
+  const annotationDocumentId = viewerSource.kind === 'homework'
+    ? selectedHomework?.id ?? null
+    : knowledgeFileId
+  const annotationDocumentKey = activeKnowledgeCourseId && annotationDocumentId
+    ? `${activeKnowledgeCourseId}:${viewerSource.kind}:${annotationDocumentId}`
+    : ''
+  const pdfAnnotations = usePdfAnnotations(annotationDocumentKey)
+  const currentPageAnnotationCount = pdfAnnotations.annotations.filter(
+    (annotation) => annotation.pageNumber === currentPage,
+  ).length
   const isLectureViewer = viewerSource.kind === 'lecture'
   const {
     records: lessonRecordingRecords,
@@ -2505,6 +2517,20 @@ export function PdfWorkspacePage() {
             sourceDocumentId={viewerSource.kind === 'homework' ? selectedHomework?.id ?? null : null}
             questionId={viewerSource.kind === 'homework' ? selectedHomeworkQuestion?.id ?? null : null}
             sourceType={currentFolderType}
+            classroomPanel={(
+              <ClassroomToolsPanel
+                tool={pdfAnnotations.tool}
+                color={pdfAnnotations.color}
+                canAnnotate={Boolean(currentViewerController && annotationDocumentKey)}
+                pageAnnotationCount={currentPageAnnotationCount}
+                onToolChange={(tool) => {
+                  pdfAnnotations.setTool(tool)
+                  if (tool !== 'pointer') setIsCaptureMode(false)
+                }}
+                onColorChange={pdfAnnotations.setColor}
+                onClearPage={() => pdfAnnotations.clearPage(currentPage)}
+              />
+            )}
             relatedPanel={(
               <RelatedMaterialsPanel
                 mode={viewerSource.kind === 'lecture' ? 'lecture' : 'question'}
@@ -2607,6 +2633,12 @@ export function PdfWorkspacePage() {
               onTextSelection={handleTextSelection}
               referencedBlockIds={referencedBlockIds}
               onRemoveBlockReference={removeBlockReference}
+              annotationTool={pdfAnnotations.tool}
+              annotationColor={pdfAnnotations.color}
+              annotations={pdfAnnotations.annotations}
+              onAddAnnotation={pdfAnnotations.addAnnotation}
+              onUpdateAnnotation={pdfAnnotations.updateAnnotation}
+              onRemoveAnnotation={pdfAnnotations.removeAnnotation}
             />
           </QuestionAnswerViewer>
         </div>

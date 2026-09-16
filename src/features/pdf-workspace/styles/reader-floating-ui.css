@@ -435,11 +435,10 @@
 
 @media (max-width: 640px) {
   .octopus-app-header--reader { padding: 0 8px; }
-  .octopus-app-header--reader .octopus-app-header__context,
-  .octopus-app-header--reader .octopus-app-header__primary-nav { display: none; }
+  .octopus-app-header--reader .octopus-app-header__context { display: none; }
+  .octopus-app-header--reader .octopus-app-header__primary-nav { display: flex; gap: 0; }
+  .octopus-app-header--reader .octopus-header-link { padding: 7px 6px; font-size: 11px; }
   .octopus-app-header--reader .octopus-app-header__title { font-size: 14px; }
-  .octopus-app-header--reader .octopus-reader-more > summary span { display: none; }
-  .octopus-app-header--reader .octopus-primary-button { padding: 0 9px; }
   .reader-workspace .pdf-stage__toolbar { grid-template-columns: 1fr; padding: 6px 8px; }
   .reader-workspace .pdf-stage__document { display: none; }
   .reader-workspace .pdf-stage__controls { grid-column: 1; justify-self: center; }

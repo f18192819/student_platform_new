@@ -1,0 +1,44 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+
+const pageSource = readFileSync('src/pages/PdfWorkspacePage.tsx', 'utf8')
+const canvasSource = readFileSync('src/components/PdfPreviewCanvas.tsx', 'utf8')
+const panelSource = readFileSync('src/features/pdf-annotations/ClassroomToolsPanel.tsx', 'utf8')
+const hookSource = readFileSync('src/features/pdf-annotations/usePdfAnnotations.ts', 'utf8')
+const storeSource = readFileSync('src/features/pdf-annotations/pdfAnnotationStore.ts', 'utf8')
+const headerSource = readFileSync('src/components/AppHeader.tsx', 'utf8')
+
+test('classroom tools own recording, uploads and annotation modes', () => {
+  assert.match(panelSource, /student-platform:lesson-recording-toggle/)
+  assert.match(panelSource, /student-platform:lesson-audio-upload/)
+  assert.match(panelSource, /student-platform:lesson-transcript-upload/)
+  assert.match(panelSource, /\['highlight', '高亮'\]/)
+  assert.match(panelSource, /\['text', '文本框'\]/)
+  assert.match(pageSource, /classroomPanel=\{/)
+  assert.doesNotMatch(headerSource, /octopus-reader-more/)
+})
+
+test('annotations are isolated by course and document and persisted locally', () => {
+  assert.match(pageSource, /`\$\{activeKnowledgeCourseId\}:\$\{viewerSource\.kind\}:\$\{annotationDocumentId\}`/)
+  assert.match(storeSource, /student-platform:pdf-annotations:v1:/)
+  assert.match(storeSource, /encodeURIComponent\(documentKey\)/)
+  assert.match(hookSource, /savePdfAnnotations\(documentKey, next\)/)
+  assert.match(hookSource, /current\.filter\(\(annotation\) => annotation\.pageNumber !== pageNumber\)/)
+})
+
+test('PDF annotations use normalized page coordinates and survive zoom', () => {
+  assert.match(canvasSource, /x: rect\.left \/ pageData\.width/)
+  assert.match(canvasSource, /y: rect\.top \/ pageData\.height/)
+  assert.match(canvasSource, /annotation\.x \* pageData\.width/)
+  assert.match(canvasSource, /transform: `scale\(\$\{displayScale\}\)`/)
+  assert.match(canvasSource, /pdf-stage__annotation-draft-highlight/)
+})
+
+test('text annotations support inline entry, editing and deletion', () => {
+  assert.match(canvasSource, /placeholder="输入课堂批注…"/)
+  assert.match(canvasSource, /onUpdateAnnotation\?\./)
+  assert.match(canvasSource, /onRemoveAnnotation\?\./)
+  assert.match(canvasSource, /event\.key === 'Escape'/)
+  assert.match(canvasSource, /event\.ctrlKey \|\| event\.metaKey/)
+})
