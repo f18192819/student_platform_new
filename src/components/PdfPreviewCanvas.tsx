@@ -16,6 +16,30 @@ import type {
 
 const BASE_RENDER_SCALE = 1.35
 
+type PendingPageNavigation = {
+  pageNumber: number
+  behavior: ScrollBehavior
+  source: 'pager' | 'question' | 'external'
+}
+
+type ViewportAnchor = {
+  pageNumber: number
+  normalizedY: number
+}
+
+function getExpectedPageSurfaceSize(
+  pdfController: PdfController,
+  pageNumber: number,
+  displayScale: number,
+) {
+  const pageSize = pdfController.pageSizes?.[pageNumber - 1]
+  if (!pageSize) return null
+  return {
+    width: pageSize.width * BASE_RENDER_SCALE * displayScale,
+    height: pageSize.height * BASE_RENDER_SCALE * displayScale,
+  }
+}
+
 type TextStyleLike = {
   ascent?: number
   descent?: number
@@ -474,6 +498,8 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   fallbackImageUrl,
   pageNumber,
   displayScale,
+  expectedWidth,
+  expectedHeight,
   structuredBlocks = [],
   onRendered,
   isCaptureMode,
@@ -493,6 +519,8 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   fallbackImageUrl?: string | null
   pageNumber: number
   displayScale: number
+  expectedWidth?: number
+  expectedHeight?: number
   structuredBlocks?: StructuredDocumentBlock[]
   onRendered: (page: RenderedPageData) => void
   isCaptureMode: boolean
@@ -1127,7 +1155,12 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
               width: `${pageData.width * displayScale}px`,
               height: `${pageData.height * displayScale}px`,
             }
-          : undefined
+          : expectedWidth && expectedHeight
+            ? {
+                width: `${expectedWidth}px`,
+                height: `${expectedHeight}px`,
+              }
+            : undefined
       }
     >
       {fallbackImageUrl ? (
@@ -1751,14 +1784,22 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const pageRefs = useRef(new Map<number, HTMLElement>())
   const renderedPagesRef = useRef(new Map<number, RenderedPageData>())
   const isAutoScrollingRef = useRef(false)
+  const autoScrollReleaseTimerRef = useRef<number | null>(null)
+  const scrollRafRef = useRef<number | null>(null)
+  const resizeRafRef = useRef<number | null>(null)
+  const latestViewportWidthRef = useRef(0)
+  const committedViewportWidthRef = useRef(0)
+  const pendingNavigationRef = useRef<PendingPageNavigation | null>(null)
+  const pendingViewportAnchorRef = useRef<ViewportAnchor | null>(null)
+  const pendingQuestionAnchorRef = useRef<string | null>(null)
   const pageChangeFromUserScrollRef = useRef<number | null>(null)
   const questionChangeFromUserScrollRef = useRef<string | null>(null)
+  const reportedVisiblePageRef = useRef(currentPage)
   const previousSelectedQuestionIdRef = useRef<string | null>(null)
   const visibleQuestionIdRef = useRef<string | null>(null)
   const previousPdfControllerRef = useRef<PdfController | null>(null)
   const questionAnchorTimerRef = useRef<number | null>(null)
   const [viewportWidth, setViewportWidth] = useState(0)
-  const [isRendering, setIsRendering] = useState(false)
   const [renderError, setRenderError] = useState<string | null>(null)
   const requestVisiblePageChange = useEffectEvent((pageNumber: number) => {
     onVisiblePageChange(pageNumber)
@@ -1789,20 +1830,73 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     if (controllerChanged) {
       pageChangeFromUserScrollRef.current = null
       questionChangeFromUserScrollRef.current = null
+      pendingNavigationRef.current = null
+      pendingQuestionAnchorRef.current = null
+      pendingViewportAnchorRef.current = null
       previousSelectedQuestionIdRef.current = null
       visibleQuestionIdRef.current = null
+      reportedVisiblePageRef.current = currentPage
     }
     pageRefs.current.clear()
     renderedPagesRef.current.clear()
     setRenderError(null)
-    setIsRendering(false)
   }, [imageUrl, pdfController])
 
   useEffect(() => () => {
     if (questionAnchorTimerRef.current !== null) {
       window.clearTimeout(questionAnchorTimerRef.current)
     }
+    if (autoScrollReleaseTimerRef.current !== null) {
+      window.clearTimeout(autoScrollReleaseTimerRef.current)
+    }
+    if (scrollRafRef.current !== null) {
+      window.cancelAnimationFrame(scrollRafRef.current)
+    }
+    if (resizeRafRef.current !== null) {
+      window.cancelAnimationFrame(resizeRafRef.current)
+    }
   }, [])
+
+  const captureViewportAnchor = () => {
+    const container = viewportRef.current
+    if (!container || !pageRefs.current.size) return null
+    const containerBounds = container.getBoundingClientRect()
+    const viewportCenterY = containerBounds.top + container.clientHeight / 2
+    let nearest: { pageNumber: number; bounds: DOMRect; distance: number } | null = null
+
+    pageRefs.current.forEach((element, pageNumber) => {
+      const bounds = element.getBoundingClientRect()
+      const distance = Math.abs(bounds.top + bounds.height / 2 - viewportCenterY)
+      if (!nearest || distance < nearest.distance) {
+        nearest = { pageNumber, bounds, distance }
+      }
+    })
+    if (!nearest) return null
+    const anchor = nearest as { pageNumber: number; bounds: DOMRect; distance: number }
+    return {
+      pageNumber: anchor.pageNumber,
+      normalizedY: Math.min(1, Math.max(0, (viewportCenterY - anchor.bounds.top) / Math.max(anchor.bounds.height, 1))),
+    } satisfies ViewportAnchor
+  }
+
+  const restoreViewportAnchor = (anchor: ViewportAnchor) => {
+    const container = viewportRef.current
+    const page = pageRefs.current.get(anchor.pageNumber)
+    if (!container || !page) return
+    const containerBounds = container.getBoundingClientRect()
+    const pageBounds = page.getBoundingClientRect()
+    const targetTop =
+      container.scrollTop +
+      pageBounds.top -
+      containerBounds.top +
+      pageBounds.height * anchor.normalizedY -
+      container.clientHeight / 2
+    container.scrollTo({
+      top: Math.max(0, targetTop),
+      left: container.scrollLeft,
+      behavior: 'auto',
+    })
+  }
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current
@@ -1810,22 +1904,87 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       return
     }
 
-    const updateWidth = () => {
-      setViewportWidth(viewport.clientWidth)
+    const commitWidth = () => {
+      resizeRafRef.current = null
+      const nextWidth = latestViewportWidthRef.current
+      if (Math.abs(nextWidth - committedViewportWidthRef.current) < 1) return
+      if (committedViewportWidthRef.current > 0) {
+        pendingViewportAnchorRef.current = captureViewportAnchor()
+      }
+      committedViewportWidthRef.current = nextWidth
+      setViewportWidth(nextWidth)
     }
 
-    updateWidth()
+    latestViewportWidthRef.current = viewport.clientWidth
+    commitWidth()
     if (typeof ResizeObserver === 'undefined') {
       return
     }
 
-    const observer = new ResizeObserver(() => updateWidth())
+    const observer = new ResizeObserver(() => {
+      latestViewportWidthRef.current = viewport.clientWidth
+      if (resizeRafRef.current === null) {
+        resizeRafRef.current = window.requestAnimationFrame(commitWidth)
+      }
+    })
     observer.observe(viewport)
 
     return () => {
       observer.disconnect()
+      if (resizeRafRef.current !== null) {
+        window.cancelAnimationFrame(resizeRafRef.current)
+        resizeRafRef.current = null
+      }
     }
   }, [])
+
+  useLayoutEffect(() => {
+    const anchor = pendingViewportAnchorRef.current
+    if (!anchor) return
+    pendingViewportAnchorRef.current = null
+    restoreViewportAnchor(anchor)
+  }, [viewportWidth])
+
+  const markProgrammaticScroll = (duration: number) => {
+    isAutoScrollingRef.current = true
+    if (autoScrollReleaseTimerRef.current !== null) {
+      window.clearTimeout(autoScrollReleaseTimerRef.current)
+    }
+    autoScrollReleaseTimerRef.current = window.setTimeout(() => {
+      isAutoScrollingRef.current = false
+      autoScrollReleaseTimerRef.current = null
+    }, duration)
+  }
+
+  const consumePendingPageNavigation = () => {
+    const navigation = pendingNavigationRef.current
+    const container = viewportRef.current
+    const activePage = navigation ? pageRefs.current.get(navigation.pageNumber) : null
+    if (!navigation || !container || !activePage) return false
+
+    pendingNavigationRef.current = null
+    markProgrammaticScroll(navigation.behavior === 'smooth' ? 420 : 100)
+    container.scrollTo({
+      top: Math.max(0, activePage.offsetTop - 12),
+      left: container.scrollLeft,
+      behavior: navigation.behavior,
+    })
+    return true
+  }
+  const consumePendingPageNavigationEffect = useEffectEvent(consumePendingPageNavigation)
+
+  const requestProgrammaticPageNavigation = (
+    pageNumber: number,
+    source: PendingPageNavigation['source'],
+    behavior: ScrollBehavior = 'auto',
+  ) => {
+    pendingNavigationRef.current = { pageNumber, source, behavior }
+    if (pageNumber !== currentPage) {
+      requestVisiblePageChange(pageNumber)
+      return
+    }
+    window.requestAnimationFrame(() => consumePendingPageNavigation())
+  }
 
   useEffect(() => {
     if (!pdfController) {
@@ -1836,6 +1995,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     const questionPageNumber = selectedHomeworkQuestion?.pageNumber
     if (!questionId) {
       previousSelectedQuestionIdRef.current = null
+      pendingQuestionAnchorRef.current = null
       return
     }
     if (previousSelectedQuestionIdRef.current === questionId) {
@@ -1843,46 +2003,42 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     }
     previousSelectedQuestionIdRef.current = questionId
 
-    if (
-      questionChangeFromUserScrollRef.current === questionId ||
-      !questionPageNumber
-    ) {
+    if (questionChangeFromUserScrollRef.current === questionId) {
+      questionChangeFromUserScrollRef.current = null
+      pendingQuestionAnchorRef.current = null
+      return
+    }
+    if (!questionPageNumber) {
       return
     }
 
-    requestVisiblePageChange(questionPageNumber)
+    pendingQuestionAnchorRef.current = questionId
+    requestProgrammaticPageNavigation(questionPageNumber, 'question')
   }, [pdfController, selectedHomeworkQuestion?.id, selectedHomeworkQuestion?.pageNumber])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!pdfController) {
       return
     }
 
-    const container = viewportRef.current
-    if (!container || !pageRefs.current.has(currentPage)) {
+    if (pageChangeFromUserScrollRef.current === currentPage) {
+      pageChangeFromUserScrollRef.current = null
+      reportedVisiblePageRef.current = currentPage
       return
     }
 
-    pageChangeFromUserScrollRef.current = null
-
-    isAutoScrollingRef.current = true
-    const layoutTimer = window.setTimeout(() => {
-      const activePage = pageRefs.current.get(currentPage)
-      if (!activePage) return
-      container.scrollTo({
-        top: Math.max(0, activePage.offsetTop - 12),
+    if (pendingNavigationRef.current?.pageNumber !== currentPage) {
+      pendingNavigationRef.current = {
+        pageNumber: currentPage,
         behavior: 'auto',
-      })
-    }, 0)
-    const releaseTimer = window.setTimeout(() => {
-      isAutoScrollingRef.current = false
-    }, 180)
-
-    return () => {
-      window.clearTimeout(layoutTimer)
-      window.clearTimeout(releaseTimer)
+        source: 'external',
+      }
     }
-  }, [currentPage, isRendering, pdfController, viewportWidth])
+    const frame = window.requestAnimationFrame(() => {
+      consumePendingPageNavigationEffect()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [currentPage, pdfController])
 
   const scrollToQuestionAnchor = (
     question: HomeworkQuestion,
@@ -1927,6 +2083,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
         container.scrollTop + canvasBounds.top - containerBounds.top + anchorOffset - 28
       container.scrollTo({
         top: Math.max(0, targetTop),
+        left: container.scrollLeft,
         behavior: 'smooth',
       })
     } else {
@@ -1948,15 +2105,8 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
 
   useEffect(() => {
     if (
-      selectedHomeworkQuestion?.id &&
-      questionChangeFromUserScrollRef.current === selectedHomeworkQuestion.id
-    ) {
-      questionChangeFromUserScrollRef.current = null
-      return
-    }
-
-    if (
-      isRendering ||
+      !selectedHomeworkQuestion?.id ||
+      pendingQuestionAnchorRef.current !== selectedHomeworkQuestion.id ||
       !selectedHomeworkQuestion?.pageNumber ||
       selectedHomeworkQuestion.pageNumber !== currentPage
     ) {
@@ -1966,8 +2116,10 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     if (!pageData) {
       return
     }
-    scrollToQuestionAnchorEffect(selectedHomeworkQuestion, pageData)
-  }, [currentPage, isRendering, pdfController, selectedHomeworkQuestion, structuredBlocks])
+    if (scrollToQuestionAnchorEffect(selectedHomeworkQuestion, pageData)) {
+      pendingQuestionAnchorRef.current = null
+    }
+  }, [currentPage, pdfController, selectedHomeworkQuestion, structuredBlocks])
 
   useEffect(() => {
     if (!pdfController) {
@@ -1979,8 +2131,9 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       return
     }
 
-    const handleScroll = () => {
-      if (isAutoScrollingRef.current || isRendering) {
+    const calculateVisiblePage = () => {
+      scrollRafRef.current = null
+      if (isAutoScrollingRef.current) {
         return
       }
 
@@ -1988,32 +2141,29 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       const containerBounds = usesWindowScroll
         ? { top: 0, bottom: window.innerHeight }
         : container.getBoundingClientRect()
-      const visibleViewportHeight = Math.max(containerBounds.bottom - containerBounds.top, 1)
-      let nextPage = currentPage
-      let largestVisibleRatio = 0
-      let largestVisiblePage = currentPage
+      const viewportCenterY = (containerBounds.top + containerBounds.bottom) / 2
+      let centerPage: number | null = null
+      let nearestPage = reportedVisiblePageRef.current
+      let nearestDistance = Number.POSITIVE_INFINITY
 
       pageRefs.current.forEach((element, pageNumber) => {
         const bounds = element.getBoundingClientRect()
-        const visibleHeight = Math.max(
-          0,
-          Math.min(bounds.bottom, containerBounds.bottom) - Math.max(bounds.top, containerBounds.top),
-        )
-        const visibleRatio =
-          visibleHeight / Math.max(Math.min(bounds.height, visibleViewportHeight), 1)
-        if (visibleRatio > largestVisibleRatio) {
-          largestVisibleRatio = visibleRatio
-          largestVisiblePage = pageNumber
+        if (bounds.top <= viewportCenterY && bounds.bottom >= viewportCenterY) {
+          centerPage = pageNumber
+        }
+        const distance = Math.abs(bounds.top + bounds.height / 2 - viewportCenterY)
+        if (distance < nearestDistance) {
+          nearestDistance = distance
+          nearestPage = pageNumber
         }
       })
 
-      if (largestVisibleRatio >= 0.5) {
-        nextPage = largestVisiblePage
-      }
+      const nextPage = centerPage ?? nearestPage
 
-      if (nextPage !== currentPage) {
+      if (nextPage !== reportedVisiblePageRef.current) {
+        reportedVisiblePageRef.current = nextPage
         pageChangeFromUserScrollRef.current = nextPage
-        onVisiblePageChange(nextPage)
+        requestVisiblePageChange(nextPage)
       }
 
       const activePage = pageRefs.current.get(nextPage)
@@ -2037,16 +2187,22 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       }
     }
 
-    const scrollTarget: HTMLElement | Window =
-      container.scrollHeight > container.clientHeight + 1 ? container : window
-    scrollTarget.addEventListener('scroll', handleScroll, { passive: true })
+    const handleScroll = () => {
+      if (scrollRafRef.current !== null) return
+      scrollRafRef.current = window.requestAnimationFrame(calculateVisiblePage)
+    }
+
+    container.addEventListener('scroll', handleScroll, { passive: true })
+    window.addEventListener('scroll', handleScroll, { passive: true })
     return () => {
-      scrollTarget.removeEventListener('scroll', handleScroll)
+      container.removeEventListener('scroll', handleScroll)
+      window.removeEventListener('scroll', handleScroll)
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current)
+        scrollRafRef.current = null
+      }
     }
   }, [
-    currentPage,
-    isRendering,
-    onVisiblePageChange,
     onVisibleQuestionChange,
     pdfController,
     structuredBlocks,
@@ -2055,22 +2211,18 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
 
   const handlePageRendered = (page: RenderedPageData) => {
     renderedPagesRef.current.set(page.pageNumber, page)
-    if (page.pageNumber === currentPage) {
-      const container = viewportRef.current
-      const activePage = pageRefs.current.get(page.pageNumber)
-      if (container && activePage) {
-        container.scrollTop = Math.max(0, activePage.offsetTop - 12)
-      }
-    }
-    if (!isRendering && selectedHomeworkQuestion?.pageNumber === page.pageNumber) {
+    if (
+      selectedHomeworkQuestion?.id &&
+      pendingQuestionAnchorRef.current === selectedHomeworkQuestion.id &&
+      selectedHomeworkQuestion.pageNumber === page.pageNumber
+    ) {
       window.requestAnimationFrame(() => {
-        scrollToQuestionAnchor(selectedHomeworkQuestion, page)
+        if (scrollToQuestionAnchor(selectedHomeworkQuestion, page)) {
+          pendingQuestionAnchorRef.current = null
+        }
       })
     }
-    if (isRendering) {
-      setIsRendering(false)
-      setRenderError(null)
-    }
+    setRenderError(null)
   }
 
   const firstRenderedPage =
@@ -2091,11 +2243,25 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
           <strong>{fileName}</strong>
         </div> : null}
         <div className="pdf-stage__pager">
-          <button type="button" className="toolbar-pill" aria-label="上一页" title="上一页" disabled={!canGoPrev} onClick={onPrevPage}>
+          <button type="button" className="toolbar-pill" aria-label="上一页" title="上一页" disabled={!canGoPrev} onClick={() => {
+            pendingNavigationRef.current = {
+              pageNumber: Math.max(1, currentPage - 1),
+              behavior: 'auto',
+              source: 'pager',
+            }
+            onPrevPage()
+          }}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
           </button>
           <strong>{currentPage}{pageCount ? ` / ${pageCount}` : ''}</strong>
-          <button type="button" className="toolbar-pill" aria-label="下一页" title="下一页" disabled={!canGoNext} onClick={onNextPage}>
+          <button type="button" className="toolbar-pill" aria-label="下一页" title="下一页" disabled={!canGoNext} onClick={() => {
+            pendingNavigationRef.current = {
+              pageNumber: Math.min(pageCount ?? currentPage, currentPage + 1),
+              behavior: 'auto',
+              source: 'pager',
+            }
+            onNextPage()
+          }}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
           </button>
         </div>
@@ -2129,7 +2295,11 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
               <button
                 type="button"
                 className="toolbar-pill toolbar-pill--accent"
-                onClick={() => onVisiblePageChange(selectedHomeworkQuestion.pageNumber!)}
+                onClick={() => requestProgrammaticPageNavigation(
+                  selectedHomeworkQuestion.pageNumber!,
+                  'question',
+                  'smooth',
+                )}
               >
                 跳到第 {selectedHomeworkQuestion.pageNumber} 页
               </button>
@@ -2156,7 +2326,11 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
             {pageNumbers.map((pageNumber) => {
               const pageLinks = lecturePageQuestionLinks.get(pageNumber) ?? []
               const lectureSegments = lectureSegmentsByPage.get(pageNumber) ?? []
-              const pageSize = pdfController.pageSizes?.[pageNumber - 1]
+              const expectedSurfaceSize = getExpectedPageSurfaceSize(
+                pdfController,
+                pageNumber,
+                displayScale,
+              )
               const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1
               const hasLectureExplanation = lectureSegments.length > 0
               const hasPlayableLecture = lectureSegments.some(
@@ -2268,6 +2442,8 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                       pageNumber={pageNumber}
                       fallbackImageUrl={pageImageUrl?.(pageNumber) ?? null}
                       displayScale={displayScale}
+                      expectedWidth={expectedSurfaceSize?.width}
+                      expectedHeight={expectedSurfaceSize?.height}
                       structuredBlocks={structuredBlocks}
                       onRendered={handlePageRendered}
                       isCaptureMode={isCaptureMode}
@@ -2287,9 +2463,9 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                     <div
                       className="pdf-stage__page-surface pdf-stage__page-surface--placeholder"
                       aria-hidden="true"
-                      style={pageSize ? {
-                        width: `${pageSize.width * BASE_RENDER_SCALE * displayScale}px`,
-                        height: `${pageSize.height * BASE_RENDER_SCALE * displayScale}px`,
+                      style={expectedSurfaceSize ? {
+                        width: `${expectedSurfaceSize.width}px`,
+                        height: `${expectedSurfaceSize.height}px`,
                       } : undefined}
                     />
                   )}
