@@ -8,6 +8,8 @@ import {
   PDFJS_WASM_URL,
 } from './assets'
 import { extractPageMarkdown, type PageExtraction } from './layout'
+import { createFastPdfController, type FastPdfOpenOptions } from './fastController'
+import { pdfMark } from './performance'
 
 ensureUint8ArrayToHex()
 
@@ -45,37 +47,53 @@ function createPdfDocumentTask(buffer: ArrayBuffer) {
   })
 }
 
-export async function openPdfPreviewFromBuffer(buffer: ArrayBuffer) {
-  const task = createPdfDocumentTask(buffer)
-  const pdf = await task.promise
-  const pageSizes = await Promise.all(
-    Array.from({ length: pdf.numPages }, async (_, index) => {
-      const page = await pdf.getPage(index + 1)
-      const viewport = page.getViewport({ scale: 1 })
-      return { width: viewport.width, height: viewport.height }
-    }),
-  )
-  const controller: PdfController = {
-    pageCount: pdf.numPages,
-    markdown: '',
-    pageSizes,
-    getPage: (pageNumber: number) => pdf.getPage(pageNumber),
+async function finishFastOpen(task: ReturnType<typeof createPdfDocumentTask>, options: FastPdfOpenOptions) {
+  pdfMark('document-load-start')
+  try {
+    const pdf = await task.promise
+    pdfMark('document-ready')
+    const controller = await createFastPdfController(pdf, options)
+    pdfMark('controller-ready')
+    return {
+      controller,
+      pageCount: pdf.numPages,
+      previewUrl: null,
+      markdown: '',
+      outlineBlocks: [],
+      pageTexts: [],
+    }
+  } catch (error) {
+    await task.destroy()
+    throw error
   }
+}
 
-  return {
-    controller,
-    pageCount: pdf.numPages,
-    previewUrl: null,
-    markdown: '',
-    outlineBlocks: [],
-    pageTexts: [],
-  }
+export function openPdfPreviewFromBuffer(buffer: ArrayBuffer, options: FastPdfOpenOptions = {}) {
+  return finishFastOpen(createPdfDocumentTask(buffer), options)
+}
+
+export function openPdfPreviewFromUrl(url: string, options: FastPdfOpenOptions = {}) {
+  pdfMark('fetch-start')
+  return finishFastOpen(pdfjsLib.getDocument({
+    url,
+    disableStream: true,
+    disableAutoFetch: true,
+    rangeChunkSize: 65536,
+    cMapUrl: PDFJS_CMAP_URL,
+    cMapPacked: true,
+    standardFontDataUrl: PDFJS_STANDARD_FONT_DATA_URL,
+    wasmUrl: PDFJS_WASM_URL,
+  }), options)
 }
 
 export async function probePdfPageCountFromBuffer(buffer: ArrayBuffer) {
   const task = createPdfDocumentTask(buffer)
-  const pdf = await task.promise
-  return pdf.numPages
+  try {
+    const pdf = await task.promise
+    return pdf.numPages
+  } finally {
+    await task.destroy()
+  }
 }
 
 export async function extractPdfPreviewFromBuffer(buffer: ArrayBuffer, fileName: string) {

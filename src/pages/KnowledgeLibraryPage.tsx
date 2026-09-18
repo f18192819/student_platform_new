@@ -12,7 +12,7 @@ import {
   updateKnowledgeCourseSettings,
   upsertKnowledgeFile,
 } from '../lib/knowledgeBase'
-import { convertImageUploadToPdf, extractPdfPreview } from '../lib/pdf'
+import { convertImageUploadToPdf, openPdfPreviewFromBuffer } from '../lib/pdf'
 import {
   buildPendingHomeworkDocument,
   getMineruUploadError,
@@ -416,14 +416,17 @@ export function KnowledgeLibraryPage() {
       }
 
       const previewFile = uploadKind === 'image' ? await convertImageUploadToPdf(file) : file
-      const preview = await extractPdfPreview(previewFile)
+      const buffer = await previewFile.arrayBuffer()
+      const preview = await openPdfPreviewFromBuffer(buffer)
+      await preview.controller.dispose?.()
       const storedFile = await upsertKnowledgeFile({
         fileName: file.name,
         pageCount: preview.pageCount,
-        byteSize: preview.buffer.byteLength,
+        byteSize: buffer.byteLength,
+        pageSizes: preview.controller.pageSizes,
         markdown: '',
         layoutBlocks: [],
-        pdfBuffer: preview.buffer,
+        pdfBuffer: buffer,
         courseId: activeCourse.id,
         libraryFolder: activeFolderType === 'other' ? 'other' : 'courseware',
         ...(activeFolderType === 'other'

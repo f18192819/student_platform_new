@@ -73,6 +73,7 @@ import {
   linkQuestionToHomeworkAnnotation,
   loadKnowledgeHomeworkAsset,
   loadKnowledgePdfSource,
+  resolveKnowledgePdfSourceUrl,
   resolveKnowledgePdfPageImageUrl,
   saveKnowledgeClassroomSession,
   saveKnowledgeHomeworkDocuments,
@@ -109,6 +110,7 @@ import {
 import {
   extractPdfPreview,
   openPdfPreviewFromBuffer,
+  openPdfPreviewFromUrl,
 } from '../lib/pdf'
 import type {
   ApiConfig,
@@ -153,7 +155,8 @@ export function PdfWorkspacePage() {
   const [forcedHomeworkPreviewPage, setForcedHomeworkPreviewPage] = useState<number | null>(null)
   const [knowledgeFileId, setKnowledgeFileId] = useState<string | null>(initialFileId)
   const [knowledgeCourseId, setKnowledgeCourseId] = useState<string | null>(currentCourseId)
-  const [currentPage, setCurrentPage] = useState(1)
+  const [currentPage, setCurrentPage] = useState(initialPageNumber)
+  const [readerVisualReady, setReaderVisualReady] = useState(false)
   const [zoom, setZoom] = useState(1)
   const [apiConfig, setApiConfig] = useState<ApiConfig>(loadApiConfig())
   const pageLecturePlayback = usePageLecturePlayback()
@@ -396,7 +399,7 @@ export function PdfWorkspacePage() {
   const resolveLecturePageImage = useCallback(
     (pageNumber: number) =>
       isLectureViewer && knowledgeFileId
-        ? resolveKnowledgePdfPageImageUrl(knowledgeFileId, pageNumber)
+        ? resolveKnowledgePdfPageImageUrl(knowledgeFileId, pageNumber, getKnowledgeFile(knowledgeFileId)?.updatedAt)
         : null,
     [isLectureViewer, knowledgeFileId],
   )
@@ -544,6 +547,16 @@ export function PdfWorkspacePage() {
       }
 
       try {
+        const memoryPreview = homeworkPreviewCacheRef.current.get(targetDocument.id)
+        if (memoryPreview) {
+          cacheHomeworkPreview(targetDocument.id, memoryPreview)
+          setHomeworkPreviewName(targetDocument.fileName)
+          setHomeworkPreviewController(memoryPreview.controller)
+          setHomeworkPreviewImageUrl(memoryPreview.imageUrl)
+          setHomeworkPreviewPageCount(memoryPreview.pageCount)
+          setHomeworkPreviewLayoutBlocks(targetDocument.layoutBlocks ?? [])
+          return
+        }
         const payload = await loadKnowledgeHomeworkAsset(targetDocument.assetId)
         if (cancelled) {
           return
@@ -650,6 +663,9 @@ export function PdfWorkspacePage() {
     if (!initialFileId) {
       return
     }
+    // A freshly uploaded controller is already visible; changing its route
+    // must not fetch and initialize the same document a second time.
+    if (initialFileId === knowledgeFileId && lecturePdfController) return
 
     let cancelled = false
 
@@ -662,13 +678,7 @@ export function PdfWorkspacePage() {
         }
 
         setIsRestoringFile(true)
-
-        const pdfBuffer = storedFile.hasPdfSource
-          ? await loadKnowledgePdfSource(storedFile.id)
-          : null
-        const extracted = pdfBuffer
-          ? await openPdfPreviewFromBuffer(pdfBuffer)
-          : null
+        setReaderVisualReady(false)
 
         if (cancelled) {
           return
@@ -691,14 +701,14 @@ export function PdfWorkspacePage() {
         setKnowledgeCourseId(storedFile.courseId)
         setDocumentName(storedFile.fileName)
         setDocumentText(storedFile.markdown || '')
-        setPdfPageCount((storedFile.pageCount > 0 ? storedFile.pageCount : extracted?.pageCount) || null)
-        setPdfController(extracted?.controller ?? null)
+        setPdfPageCount(storedFile.pageCount || null)
+        setPdfController(null)
         setLectureDocumentName(storedFile.fileName)
         setLectureDocumentText(storedFile.markdown || '')
         setLecturePdfPageCount(
-          (storedFile.pageCount > 0 ? storedFile.pageCount : extracted?.pageCount) || null,
+          storedFile.pageCount || null,
         )
-        setLecturePdfController(extracted?.controller ?? null)
+        setLecturePdfController(null)
         setLectureLayoutBlocks(storedFile.layoutBlocks ?? [])
         setViewerSource(
           initialHomeworkDocument
@@ -746,6 +756,23 @@ export function PdfWorkspacePage() {
         setZoom(1)
         setDraftDoubt(null)
         touchKnowledgeFile(storedFile.id)
+        // Shell, name, annotations and structure are available before PDF I/O.
+        const extracted = storedFile.hasPdfSource
+          ? await openPdfPreviewFromUrl(resolveKnowledgePdfSourceUrl(storedFile.id), {
+              initialPage: initialPageNumber,
+              pageSizes: storedFile.pageSizes,
+            })
+          : null
+        if (cancelled) {
+          void extracted?.controller.dispose?.()
+          return
+        }
+        setPdfController(extracted?.controller ?? null)
+        setLecturePdfController(extracted?.controller ?? null)
+        if (extracted) {
+          setPdfPageCount(extracted.pageCount)
+          setLecturePdfPageCount(extracted.pageCount)
+        }
       } catch (error) {
         if (cancelled) {
           return
@@ -774,6 +801,8 @@ export function PdfWorkspacePage() {
     initialHomeworkId,
     initialHomeworkQuestionId,
     initialPageNumber,
+    knowledgeFileId,
+    lecturePdfController,
   ])
 
   useEffect(() => {
@@ -982,6 +1011,7 @@ export function PdfWorkspacePage() {
       return
     }
 
+    if (!readerVisualReady) return
     const storedFile = getKnowledgeFile(knowledgeFileId)
     if (!storedFile?.hasPdfSource) {
       return
@@ -1183,7 +1213,7 @@ export function PdfWorkspacePage() {
     return () => {
       cancelled = true
     }
-  }, [knowledgeFileId])
+  }, [knowledgeFileId, readerVisualReady])
 
   useEffect(() => {
     if (!knowledgeFileId || !activeKnowledgeCourseId) {
@@ -1264,17 +1294,40 @@ export function PdfWorkspacePage() {
       return
     }
 
+    let previewPublished = false
     try {
-      const result = await extractPdfPreview(file)
+      const buffer = await file.arrayBuffer()
+      const result = { ...await openPdfPreviewFromBuffer(buffer), buffer }
       const initialChatMessages = [
         createMessage(
           'assistant',
           `已载入 ${file.name}。PDF 预览已打开，正在后台用 MinerU 提取讲义结构。`,
         ),
       ]
+      // Publish the reader before persistence or MinerU. Failed persistence
+      // leaves the local document readable and reports an explicit save error.
+      setReaderVisualReady(false)
+      setKnowledgeFileId(null)
+      setDocumentName(file.name)
+      setDocumentText('')
+      setPdfPageCount(result.pageCount)
+      setPdfController(result.controller)
+      setLectureDocumentName(file.name)
+      setLectureDocumentText('')
+      setLecturePdfPageCount(result.pageCount)
+      setLecturePdfController(result.controller)
+      setLectureLayoutBlocks([])
+      setViewerSource({ kind: 'lecture' })
+      setAnnotations([])
+      setClassroomSessions([])
+      setCurrentPage(1)
+      setZoom(1)
+      setChatMessages(initialChatMessages)
+      previewPublished = true
       const storedFile = await upsertKnowledgeFile({
         fileName: file.name,
         pageCount: result.pageCount,
+        pageSizes: result.controller.pageSizes,
         byteSize: result.buffer.byteLength,
         markdown: '',
         layoutBlocks: [],
@@ -1341,7 +1394,12 @@ export function PdfWorkspacePage() {
       const message = error instanceof Error ? error.message : '解析失败'
       setChatMessages((current) => [
         ...current,
-        createMessage('system', `这次 PDF 解析失败了：${message}`),
+        createMessage(
+          'system',
+          previewPublished
+            ? `PDF 保存失败，本地预览仍可继续阅读：${message}`
+            : `PDF 打开失败：${message}`,
+        ),
       ])
     } finally {
       event.target.value = ''
@@ -2623,6 +2681,7 @@ export function PdfWorkspacePage() {
             <PdfPreviewCanvas
               fileName={currentViewerName}
               pdfController={currentViewerController}
+              onVisualReady={() => setReaderVisualReady(true)}
               pageImageUrl={resolveLecturePageImage}
               imageUrl={currentViewerImageUrl}
               currentPage={currentPage}

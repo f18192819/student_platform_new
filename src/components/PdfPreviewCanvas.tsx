@@ -2,6 +2,8 @@
 import * as pdfjsLib from 'pdfjs-dist'
 import { useLayoutEffect } from 'react'
 import { useEffectEvent } from 'react'
+import { pdfPageRenderPriority } from '../lib/pdf-core/renderPriority'
+import { pdfMark } from '../lib/pdf-core/performance'
 import type {
   ClassroomLectureSegment,
   HomeworkKnowledgeLink,
@@ -32,7 +34,7 @@ function getExpectedPageSurfaceSize(
   pageNumber: number,
   displayScale: number,
 ) {
-  const pageSize = pdfController.pageSizes?.[pageNumber - 1]
+  const pageSize = pdfController.pageSizes?.[pageNumber - 1] ?? pdfController.defaultPageSize
   if (!pageSize) return null
   return {
     width: pageSize.width * BASE_RENDER_SCALE * displayScale,
@@ -109,11 +111,12 @@ type RenderedPageData = {
 }
 
 function getFallbackRenderedPageWidth(pdfController: PdfController | null, pageNumber: number) {
-  const width = pdfController?.pageSizes?.[pageNumber - 1]?.width
+  const width = (pdfController?.pageSizes?.[pageNumber - 1] ?? pdfController?.defaultPageSize)?.width
   return typeof width === 'number' ? width * BASE_RENDER_SCALE : null
 }
 
 type PdfPreviewCanvasProps = {
+  onVisualReady?: (pageNumber: number) => void
   variant?: 'workspace' | 'readonly'
   fileName: string
   pdfController: PdfController | null
@@ -502,6 +505,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   expectedHeight,
   structuredBlocks = [],
   onRendered,
+  onVisualReady,
   isCaptureMode,
   onCaptureSelection,
   onTextSelection,
@@ -523,6 +527,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   expectedHeight?: number
   structuredBlocks?: StructuredDocumentBlock[]
   onRendered: (page: RenderedPageData) => void
+  onVisualReady: (pageNumber: number) => void
   isCaptureMode: boolean
   onCaptureSelection?: (capture: {
     pageNumber: number
@@ -546,7 +551,13 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
 }) {
   const surfaceRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const rasterRef = useRef<HTMLImageElement | null>(null)
+  const enhancementTimerRef = useRef<number | null>(null)
   const onRenderedRef = useRef(onRendered)
+  const onVisualReadyRef = useRef(onVisualReady)
+  onVisualReadyRef.current = onVisualReady
+  const [visualReady, setVisualReady] = useState(false)
+  const [rasterReady, setRasterReady] = useState(false)
   const captureSelectionRef = useRef(onCaptureSelection)
   const textSelectionRef = useRef(onTextSelection)
   const referenceDragRef = useRef<{
@@ -653,6 +664,9 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       }
 
       setRenderError(null)
+      setVisualReady(false)
+      setRasterReady(false)
+      pdfMark('render-start', pageNumber)
       const page = await pdfController.getPage(pageNumber)
       if (cancelled) {
         return
@@ -678,23 +692,26 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       setPageData(paintedPageData)
       onRenderedRef.current(paintedPageData)
 
-      if (!fallbackImageUrl) {
-        renderTask = page.render({
-          canvas,
-          viewport,
-        })
-        await renderTask.promise
-      }
+      renderTask = page.render({ canvas, viewport })
+      await renderTask.promise
 
       if (cancelled) {
         return
       }
 
+      pdfMark('render-complete', pageNumber)
+      // Cross a paint boundary before releasing raster and neighbor work.
+      await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
+      if (cancelled) return
+      setVisualReady(true)
+      pdfMark('visual-ready', pageNumber)
+      onVisualReadyRef.current(pageNumber)
+      // Text is optional interaction data, never the visual-ready signal.
       const textContent = interactive
-        ? await page.getTextContent({
+          ? await page.getTextContent({
             includeMarkedContent: true,
             disableNormalization: true,
-          })
+          }).catch(() => null)
         : null
 
       if (cancelled) {
@@ -728,7 +745,14 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       cancelled = true
       renderTask?.cancel()
     }
-  }, [fallbackImageUrl, interactive, pageNumber, pdfController])
+  }, [interactive, pageNumber, pdfController])
+
+  useEffect(() => {
+    setRasterReady(false)
+    return () => {
+      if (enhancementTimerRef.current !== null) window.clearTimeout(enhancementTimerRef.current)
+    }
+  }, [fallbackImageUrl])
 
   const textBlocks = useMemo(() => {
     if (!pageData) {
@@ -857,8 +881,9 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       return
     }
 
-    const scaleX = canvas.width / surface.clientWidth
-    const scaleY = canvas.height / surface.clientHeight
+    const captureSource = rasterReady && rasterRef.current?.complete ? rasterRef.current : canvas
+    const scaleX = (captureSource instanceof HTMLImageElement ? captureSource.naturalWidth : canvas.width) / surface.clientWidth
+    const scaleY = (captureSource instanceof HTMLImageElement ? captureSource.naturalHeight : canvas.height) / surface.clientHeight
     const sourceX = Math.max(0, Math.floor(rect.left * scaleX))
     const sourceY = Math.max(0, Math.floor(rect.top * scaleY))
     const sourceWidth = Math.max(1, Math.floor(rect.width * scaleX))
@@ -870,7 +895,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
 
     if (captureContext) {
       captureContext.drawImage(
-        canvas,
+        captureSource,
         sourceX,
         sourceY,
         sourceWidth,
@@ -1121,6 +1146,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     <div
       ref={surfaceRef}
       className="pdf-stage__page-surface"
+      data-visual-ready={visualReady ? 'true' : 'false'}
       onPointerDown={interactive ? beginTextSelection : undefined}
       onPointerMove={interactive ? (event) => {
         if (referenceDragRef.current) {
@@ -1163,17 +1189,29 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
             : undefined
       }
     >
-      {fallbackImageUrl ? (
+      {fallbackImageUrl && (visualReady || renderError) ? (
         <img
+          ref={rasterRef}
           className="pdf-stage__page-raster"
+          style={{ opacity: rasterReady ? 1 : 0 }}
           src={fallbackImageUrl}
           alt={`第 ${pageNumber} 页`}
           onLoad={(event) => {
+            pdfMark('raster-loaded', pageNumber)
             const canvas = canvasRef.current
             const context = canvas?.getContext('2d', { alpha: false })
-            if (canvas && context) {
-              context.drawImage(event.currentTarget, 0, 0, canvas.width, canvas.height)
-            }
+            const image = event.currentTarget
+            const delay = visualReady ? 110 : 0
+            enhancementTimerRef.current = window.setTimeout(() => {
+              if (canvas && context && rasterRef.current === image) {
+                context.drawImage(image, 0, 0, canvas.width, canvas.height)
+              }
+              setRasterReady(true)
+              if (!visualReady) {
+                setVisualReady(true)
+                onVisualReadyRef.current(pageNumber)
+              }
+            }, delay)
           }}
         />
       ) : null}
@@ -1187,7 +1225,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
                 height: `${pageData.height}px`,
                 transform: `scale(${displayScale})`,
                 transformOrigin: 'top left',
-                visibility: fallbackImageUrl ? 'hidden' : 'visible',
+                visibility: 'visible',
               }
             : undefined
         }
@@ -1738,6 +1776,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   variant = 'workspace',
   fileName,
   pdfController,
+  onVisualReady,
   pageImageUrl,
   imageUrl = null,
   currentPage,
@@ -1795,11 +1834,26 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const pageChangeFromUserScrollRef = useRef<number | null>(null)
   const questionChangeFromUserScrollRef = useRef<string | null>(null)
   const reportedVisiblePageRef = useRef(currentPage)
+  const currentPageRef = useRef(currentPage)
+  currentPageRef.current = currentPage
   const previousSelectedQuestionIdRef = useRef<string | null>(null)
   const visibleQuestionIdRef = useRef<string | null>(null)
   const previousPdfControllerRef = useRef<PdfController | null>(null)
   const questionAnchorTimerRef = useRef<number | null>(null)
   const [viewportWidth, setViewportWidth] = useState(0)
+  const [visualPages, setVisualPages] = useState<{ controller: PdfController | null; pages: Set<number> }>({ controller: null, pages: new Set() })
+  const isPageVisualReady = (number: number) => visualPages.controller === pdfController && visualPages.pages.has(number)
+    && Boolean(pageRefs.current.get(number)?.querySelector('[data-visual-ready="true"]'))
+  const handlePageVisualReady = (number: number) => {
+    setVisualPages(previous => ({
+      controller: pdfController,
+      pages: new Set([...(previous.controller === pdfController ? previous.pages : []), number]),
+    }))
+    if (number === currentPage || number === currentPage + 1) {
+      pdfMark('prefetch-release', number)
+    }
+    if (number === currentPage) onVisualReady?.(number)
+  }
   const [renderError, setRenderError] = useState<string | null>(null)
   const requestVisiblePageChange = useEffectEvent((pageNumber: number) => {
     onVisiblePageChange(pageNumber)
@@ -1835,7 +1889,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       pendingViewportAnchorRef.current = null
       previousSelectedQuestionIdRef.current = null
       visibleQuestionIdRef.current = null
-      reportedVisiblePageRef.current = currentPage
+      reportedVisiblePageRef.current = currentPageRef.current
     }
     pageRefs.current.clear()
     renderedPagesRef.current.clear()
@@ -2343,7 +2397,8 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                 pageNumber,
                 displayScale,
               )
-              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1
+              const priority = pdfPageRenderPriority(pageNumber, currentPage, pdfController.pageCount, isPageVisualReady)
+              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1 && priority !== null
               const hasLectureExplanation = lectureSegments.length > 0
               const hasPlayableLecture = lectureSegments.some(
                 (segment) =>
@@ -2358,6 +2413,11 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                   key={pageNumber}
                   className="pdf-stage__page-shell"
                   data-page-number={pageNumber}
+                  data-render-priority={priority ?? undefined}
+                  style={{
+                    contentVisibility: 'auto',
+                    containIntrinsicSize: `auto ${Math.ceil((expectedSurfaceSize?.height ?? 1000) + 48)}px`,
+                  }}
                   ref={(node) => {
                     if (node) {
                       pageRefs.current.set(pageNumber, node)
@@ -2458,6 +2518,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                       expectedHeight={expectedSurfaceSize?.height}
                       structuredBlocks={structuredBlocks}
                       onRendered={handlePageRendered}
+                      onVisualReady={handlePageVisualReady}
                       isCaptureMode={isCaptureMode}
                       onCaptureSelection={onCaptureSelection}
                       onTextSelection={onTextSelection}

@@ -595,6 +595,10 @@ function normalizeLibraryFile(file: Partial<KnowledgeFile>): KnowledgeFile {
     courseId: String(file.courseId || DEFAULT_COURSE_ID).trim() || DEFAULT_COURSE_ID,
     fileName: String(file.fileName || '未命名文件').trim() || '未命名文件',
     pageCount: typeof file.pageCount === 'number' ? file.pageCount : 0,
+    pageSizes: Array.isArray(file.pageSizes) ? file.pageSizes.map(size => (
+      size && Number.isFinite(size.width) && Number.isFinite(size.height) && size.width > 0 && size.height > 0
+        ? { width: size.width, height: size.height } : null
+    )) : undefined,
     byteSize: typeof file.byteSize === 'number' ? file.byteSize : 0,
     hasPdfSource: Boolean(file.hasPdfSource),
     markdown: String(file.markdown || ''),
@@ -704,7 +708,7 @@ async function persistKnowledgeLibrary(library: KnowledgeLibrary) {
 }
 
 function scheduleKnowledgeLibraryPersist(library: KnowledgeLibrary) {
-  knowledgeLibraryPersistPromise = knowledgeLibraryPersistPromise.then(() =>
+  knowledgeLibraryPersistPromise = knowledgeLibraryPersistPromise.catch(() => {}).then(() =>
     persistKnowledgeLibrary(library),
   )
   return knowledgeLibraryPersistPromise
@@ -1048,6 +1052,10 @@ export async function updateKnowledgeCourseSettings(
   return library.courses.find((course) => course.id === courseId) ?? payload.course ?? null
 }
 
+export function resolveKnowledgePdfSourceUrl(fileId: string) {
+  return resolveBackendApiUrl(`/api/knowledge/pdf/${encodeURIComponent(fileId)}`)
+}
+
 export async function loadKnowledgePdfSource(fileId: string) {
   const response = await fetch(resolveBackendApiUrl(`/api/knowledge/pdf/${encodeURIComponent(fileId)}`))
   if (response.status === 404) {
@@ -1178,9 +1186,9 @@ export async function deleteKnowledgeHomeworkDocument(
   return payload.deleted === true
 }
 
-export function resolveKnowledgePdfPageImageUrl(fileId: string, pageNumber: number) {
+export function resolveKnowledgePdfPageImageUrl(fileId: string, pageNumber: number, revision?: string) {
   return resolveBackendApiUrl(
-    `/api/knowledge/pdf/${encodeURIComponent(fileId)}/pages/${pageNumber}?v=3`,
+    `/api/knowledge/pdf/${encodeURIComponent(fileId)}/pages/${pageNumber}?v=3&revision=${encodeURIComponent(revision ?? '')}`,
   )
 }
 
@@ -1490,6 +1498,7 @@ export async function upsertKnowledgeFile(input: {
   fileId?: string
   fileName: string
   pageCount: number
+  pageSizes?: KnowledgeFile['pageSizes']
   byteSize: number
   markdown: string
   layoutBlocks?: StructuredDocumentBlock[]
@@ -1529,6 +1538,7 @@ export async function upsertKnowledgeFile(input: {
         courseId: targetCourseId,
         fileName: input.fileName,
         pageCount: input.pageCount,
+        pageSizes: input.pageSizes ?? existing.pageSizes,
         byteSize: input.byteSize,
         hasPdfSource: Boolean(input.pdfBuffer) || existing.hasPdfSource,
         markdown: input.markdown,
@@ -1554,6 +1564,7 @@ export async function upsertKnowledgeFile(input: {
         courseId: targetCourseId,
         fileName: input.fileName,
         pageCount: input.pageCount,
+        pageSizes: input.pageSizes,
         byteSize: input.byteSize,
         hasPdfSource: Boolean(input.pdfBuffer),
         markdown: input.markdown,
@@ -1584,6 +1595,7 @@ export async function upsertKnowledgeFile(input: {
   )
 
   saveKnowledgeLibrary(nextLibrary)
+  await knowledgeLibraryPersistPromise
   if (input.pdfBuffer) {
     await saveKnowledgePdfSource(nextFile.id, input.pdfBuffer)
   }

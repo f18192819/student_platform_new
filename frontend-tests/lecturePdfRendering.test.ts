@@ -10,11 +10,14 @@ test('stored lecture pages use the cached server image path', () => {
   assert.match(workspaceSource, /pageImageUrl=\{resolveLecturePageImage\}/)
   assert.match(
     canvasSource,
-    /context\.drawImage\(event\.currentTarget, 0, 0, canvas\.width, canvas\.height\)/,
+    /context\.drawImage\(image, 0, 0, canvas\.width, canvas\.height\)/,
   )
 })
 
 test('the reader only mounts canvases around the active page', () => {
   assert.match(canvasSource, /Math\.abs\(pageNumber - currentPage\) <= 1/)
   assert.match(canvasSource, /pdf-stage__page-surface--placeholder/)
+  assert.match(canvasSource, /pdfPageRenderPriority/)
+  assert.match(canvasSource, /renderTask = page\.render/)
+  assert.doesNotMatch(canvasSource, /if \(!fallbackImageUrl\)/)
 })

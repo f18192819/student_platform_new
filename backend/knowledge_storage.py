@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import json
 import io
+import json
+import os
 import shutil
+import tempfile
 import threading
+import weakref
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,93 @@ KNOWLEDGE_ANNOTATION_DIR = KNOWLEDGE_BASE_DIR / "annotation-assets"
 KNOWLEDGE_HOMEWORK_DIR = KNOWLEDGE_BASE_DIR / "homework-assets"
 
 _storage_lock = threading.RLock()
+_preview_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_preview_lock_guard = threading.Lock()
+_prewarm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pdf-prewarm')
+_prewarm_pending: set[tuple] = set()
+_preview_epochs: dict[str, int] = {}
+
+
+def pdf_source_path(file_id: str) -> Path:
+  path = _asset_path(KNOWLEDGE_PDF_DIR, file_id, '.pdf')
+  if not path.is_file():
+    raise HTTPException(status_code=404, detail='Knowledge PDF source not found.')
+  return path
+
+
+def _source_identity(path: Path) -> tuple:
+  stat = path.stat()
+  return (stat.st_mtime_ns, stat.st_size)
+
+
+def _is_valid_page_size(value: Any) -> bool:
+  return (
+    isinstance(value, dict)
+    and isinstance(value.get('width'), (int, float))
+    and isinstance(value.get('height'), (int, float))
+    and value['width'] > 0
+    and value['height'] > 0
+  )
+
+
+def _merge_page_sizes(previous: Any, incoming: Any) -> Any:
+  if not isinstance(previous, list) or not previous:
+    return incoming
+  if not isinstance(incoming, list):
+    return previous
+  merged = []
+  for index in range(max(len(previous), len(incoming))):
+    previous_size = previous[index] if index < len(previous) else None
+    incoming_size = incoming[index] if index < len(incoming) else None
+    if _is_valid_page_size(previous_size):
+      merged.append(previous_size)
+    elif _is_valid_page_size(incoming_size):
+      merged.append(incoming_size)
+    else:
+      merged.append(None)
+  return merged
+
+
+def schedule_pdf_prewarm(file_id: str) -> None:
+  # Capture paths so queued work cannot follow a changed storage root.
+  try:
+    path = pdf_source_path(file_id)
+    identity = _source_identity(path)
+    key = (str(path), identity)
+    with _preview_lock_guard:
+      if key in _prewarm_pending or len(_prewarm_pending) >= 8:
+        return
+      _prewarm_pending.add(key)
+    preview_root = KNOWLEDGE_PDF_PAGE_DIR
+    library_path = KNOWLEDGE_LIBRARY_PATH
+
+    def warm():
+      try:
+        import fitz
+        with fitz.open(path) as document:
+          sizes = [{'width': float(page.rect.width), 'height': float(page.rect.height)} for page in document]
+        with _storage_lock:
+          if _source_identity(path) != identity or library_path != KNOWLEDGE_LIBRARY_PATH:
+            return
+          library = read_knowledge_library()
+          for record in library.get('files') or []:
+            if record.get('id') == file_id:
+              record['pageSizes'] = sizes
+              write_knowledge_library(library)
+              break
+        for number in range(1, min(3, len(sizes)) + 1):
+          if KNOWLEDGE_PDF_DIR != path.parent or KNOWLEDGE_PDF_PAGE_DIR != preview_root or _source_identity(path) != identity:
+            return
+          read_pdf_page_image(file_id, number)
+      except Exception:
+        pass
+      finally:
+        with _preview_lock_guard:
+          _prewarm_pending.discard(key)
+
+    _prewarm_executor.submit(warm)
+  except Exception:
+    pass
 
 
 def ensure_knowledge_storage_dirs() -> None:
@@ -149,7 +240,22 @@ def read_knowledge_library(include_deleted: bool = False) -> dict[str, Any]:
 
 def write_knowledge_library(payload: dict[str, Any]) -> dict[str, Any]:
   ensure_knowledge_storage_dirs()
+  warm_ids = []
   with _storage_lock:
+    previous = {item.get('id'): item for item in read_knowledge_library().get('files') or [] if isinstance(item, dict)}
+    for record in payload.get('files') or []:
+      if not isinstance(record, dict):
+        continue
+      old = previous.get(record.get('id'), {})
+      if old.get('sourceKey') == record.get('sourceKey') and old.get('pageSizes'):
+        record['pageSizes'] = _merge_page_sizes(old['pageSizes'], record.get('pageSizes'))
+      record_id = str(record.get('id') or '').strip()
+      if record_id and record.get('layoutBlocks') != old.get('layoutBlocks') and record.get('hasPdfSource'):
+        path = _asset_path(KNOWLEDGE_PDF_DIR, record_id, '.pdf')
+        _preview_epochs[str(path)] = _preview_epochs.get(str(path), 0) + 1
+        shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
+        if record.get('pipelineStatus') == 'completed':
+          warm_ids.append(path.stem)
     normalized = {
       "files": _filter_deleted_library_files(
         payload.get("files") if isinstance(payload.get("files"), list) else [],
@@ -161,6 +267,8 @@ def write_knowledge_library(payload: dict[str, Any]) -> dict[str, Any]:
       json.dumps(normalized, ensure_ascii=False, indent=2),
       encoding="utf-8",
     )
+  for file_id in warm_ids:
+    schedule_pdf_prewarm(file_id)
   return normalized
 
 
@@ -377,9 +485,17 @@ def read_pdf_page_image(file_id: str, page_number: int) -> bytes:
 
   safe_file_id = pdf_path.stem
   preview_path = KNOWLEDGE_PDF_PAGE_DIR / safe_file_id / f"v3-{page_number}.png"
-  with _storage_lock:
-    if preview_path.is_file():
-      return preview_path.read_bytes()
+  with _preview_lock_guard:
+    key = (str(pdf_path), page_number)
+    lock = _preview_locks.get(key)
+    if lock is None:
+      lock = threading.Lock()
+      _preview_locks[key] = lock
+  with lock:
+    with _storage_lock:
+      identity = (_source_identity(pdf_path), _preview_epochs.get(str(pdf_path), 0))
+      if preview_path.is_file():
+        return preview_path.read_bytes()
     try:
       import fitz
       with fitz.open(pdf_path) as document:
@@ -388,15 +504,15 @@ def read_pdf_page_image(file_id: str, page_number: int) -> bytes:
         page = document[page_number - 1]
         page_width = float(page.rect.width)
         page_height = float(page.rect.height)
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-        payload = pixmap.tobytes("png")
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False, colorspace=fitz.csRGB)
+        from PIL import Image
+        page_image = Image.frombytes('RGB', (pixmap.width, pixmap.height), pixmap.samples)
     except HTTPException:
       raise
     except Exception as exc:
       raise HTTPException(status_code=422, detail="PDF page preview could not be rendered.") from exc
     try:
       from PIL import Image
-      page_image = Image.open(io.BytesIO(payload)).convert('RGB')
       file_record = next(
         (
           item for item in read_knowledge_library().get('files') or []
@@ -478,33 +594,50 @@ def read_pdf_page_image(file_id: str, page_number: int) -> bytes:
               Image.Resampling.LANCZOS,
             )
             page_image.paste(replacement, box[:2])
-      output = io.BytesIO()
-      page_image.save(output, format='PNG', optimize=True)
-      payload = output.getvalue()
     except Exception:
       # The complete PDF page remains usable even if an optional MinerU asset
       # is missing or malformed.
       pass
-    preview_path.parent.mkdir(parents=True, exist_ok=True)
-    preview_path.write_bytes(payload)
+    output = io.BytesIO()
+    page_image.save(output, format='PNG', optimize=False, compress_level=1)
+    payload = output.getvalue()
+    with _storage_lock:
+      if not pdf_path.exists() or (_source_identity(pdf_path), _preview_epochs.get(str(pdf_path), 0)) != identity:
+        raise HTTPException(status_code=409, detail='PDF source changed; retry preview.')
+      preview_path.parent.mkdir(parents=True, exist_ok=True)
+      temp_path = None
+      try:
+        with tempfile.NamedTemporaryFile(dir=preview_path.parent, suffix='.tmp', delete=False) as temporary:
+          temp_path = Path(temporary.name)
+          temporary.write(payload)
+        os.replace(temp_path, preview_path)
+      finally:
+        if temp_path is not None:
+          temp_path.unlink(missing_ok=True)
     return payload
 
 
 def write_pdf_bytes(file_id: str, payload: bytes) -> None:
   ensure_knowledge_storage_dirs()
   path = _asset_path(KNOWLEDGE_PDF_DIR, file_id, ".pdf")
-  path.write_bytes(payload)
-  shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
+  with _storage_lock:
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix='.tmp', delete=False) as temporary:
+      temporary.write(payload)
+      temporary_path = Path(temporary.name)
+    try:
+      os.replace(temporary_path, path)
+    finally:
+      temporary_path.unlink(missing_ok=True)
+    _preview_epochs[str(path)] = _preview_epochs.get(str(path), 0) + 1
+    shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
+  schedule_pdf_prewarm(path.stem)
 
 
 def delete_pdf_bytes(file_id: str) -> None:
   path = _asset_path(KNOWLEDGE_PDF_DIR, file_id, ".pdf")
-  try:
+  with _storage_lock:
     path.unlink(missing_ok=True)
-  except TypeError:
-    if path.exists():
-      path.unlink()
-  shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
+    shutil.rmtree(KNOWLEDGE_PDF_PAGE_DIR / path.stem, ignore_errors=True)
 
 
 def read_annotation_asset(asset_id: str) -> str:

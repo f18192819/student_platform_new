@@ -3415,13 +3415,20 @@
 .pdf-stage__page-raster {
   position: absolute;
   inset: 0;
-  z-index: 0;
+  z-index: 1;
   width: 100%;
   height: 100%;
   object-fit: fill;
+  pointer-events: none;
+  transition: opacity 100ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pdf-stage__page-raster { transition: none; }
 }
 
 .pdf-stage__text-layer {
+  z-index: 2;
   position: absolute;
   inset: 0;
   overflow: hidden;

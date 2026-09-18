@@ -2,6 +2,7 @@ export {
   extractPdfPreview,
   extractPdfPreviewFromBuffer,
   openPdfPreviewFromBuffer,
+  openPdfPreviewFromUrl,
   probePdfPageCount,
   probePdfPageCountFromBuffer,
 } from './pdf-core/preview'

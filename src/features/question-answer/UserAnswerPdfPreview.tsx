@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { PdfPreviewCanvas } from '../../components/PdfPreviewCanvas'
-import { extractPdfPreviewFromBuffer } from '../../lib/pdf'
+import { openPdfPreviewFromBuffer } from '../../lib/pdf'
 import {
   clampPdfPage,
   clampPdfZoom,
@@ -8,7 +8,7 @@ import {
   loadUserAnswerPdfPreview,
 } from './userAnswerPdfPreviewModel'
 
-type PdfPreviewResult = Awaited<ReturnType<typeof extractPdfPreviewFromBuffer>>
+type PdfPreviewResult = Awaited<ReturnType<typeof openPdfPreviewFromBuffer>>
 export type UserAnswerPdfPreviewCache = Map<string, Promise<PdfPreviewResult>>
 
 export function UserAnswerPdfPreview({ url, fileName, assetKey, cache }: {
@@ -42,7 +42,7 @@ export function UserAnswerPdfPreview({ url, fileName, assetKey, cache }: {
         url,
         fileName,
         abortController.signal,
-        extractPdfPreviewFromBuffer,
+        buffer => openPdfPreviewFromBuffer(buffer),
       )
     ))
 

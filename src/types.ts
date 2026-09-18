@@ -162,6 +162,7 @@ export type KnowledgeFile = {
   courseId: string
   fileName: string
   pageCount: number
+  pageSizes?: Array<PdfPageSize | null>
   byteSize: number
   hasPdfSource: boolean
   markdown: string
@@ -229,14 +230,16 @@ export type CourseStudyPlan = {
   updatedAt: string
 }
 
+export type PdfPageSize = { width: number; height: number }
+
 export type PdfController = {
   pageCount: number
   markdown: string
   pageTexts?: string[]
-  pageSizes?: Array<{
-    width: number
-    height: number
-  }>
+  pageSizes?: Array<PdfPageSize | null>
+  defaultPageSize?: PdfPageSize
+  getPageSize?: (pageNumber: number) => Promise<PdfPageSize>
+  dispose?: () => Promise<void>
   getPage: (pageNumber: number) => Promise<PDFPageProxy>
 }
 

@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 
 from .adaptive_testing import delete_learning_course, delete_learning_document
 from .application_runtime import ApplicationRuntime
@@ -19,7 +19,7 @@ from .knowledge_storage import (
   read_homework_asset,
   read_knowledge_library,
   read_pdf_page_image,
-  read_pdf_bytes,
+  pdf_source_path,
   update_knowledge_course_settings,
   write_annotation_asset,
   write_homework_binary_asset,
@@ -142,7 +142,7 @@ def create_knowledge_router(runtime: ApplicationRuntime) -> APIRouter:
 
   @router.get('/api/knowledge/pdf/{file_id}')
   async def get_pdf(file_id: str) -> Response:
-    return Response(content=read_pdf_bytes(file_id), media_type='application/pdf')
+    return FileResponse(pdf_source_path(file_id), media_type='application/pdf')
 
   @router.get('/api/knowledge/pdf/{file_id}/pages/{page_number}')
   async def get_pdf_page(file_id: str, page_number: int) -> Response:
@@ -155,8 +155,9 @@ def create_knowledge_router(runtime: ApplicationRuntime) -> APIRouter:
 
   @router.put('/api/knowledge/pdf/{file_id}')
   async def update_pdf(file_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
-    file.file.seek(0)
-    write_pdf_bytes(file_id, file.file.read())
+    await file.seek(0)
+    payload = await file.read()
+    await asyncio.to_thread(write_pdf_bytes, file_id, payload)
     return {'ok': True, 'fileId': file_id}
 
   @router.delete('/api/knowledge/pdf/{file_id}')

@@ -109,7 +109,7 @@ test('answer viewer uses readonly PDF.js preview without iframe or visible asset
   assert.match(viewer, /<UserAnswerPdfPreview/)
   assert.match(viewer, /<img src=\{selectedAssetUrl\} alt=\{selectedAsset\.filename\} \/>/)
   assert.doesNotMatch(viewer, /selectedAsset\.filename\}<\/span>/)
-  assert.match(preview, /extractPdfPreviewFromBuffer/)
+  assert.match(preview, /openPdfPreviewFromBuffer/)
   assert.match(preview, /variant="readonly"/)
   assert.match(preview, /abortController\.abort\(\)/)
   assert.match(viewer, /assetKey=\{`\$\{selected\.id\}:\$\{selectedAsset\.id\}`\}/)
