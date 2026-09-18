@@ -2554,6 +2554,24 @@ async def align_lecture_recording(
     raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@media_router.post('/api/audio/recordings/align-pending')
+async def queue_pending_lecture_recordings(
+  payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+  """Queue retryable ASR recordings when a processed lecture is opened."""
+  course_id = str(payload.get('course_id') or '').strip()
+  document_id = str(payload.get('document_id') or '').strip()
+  if not course_id or not document_id:
+    raise HTTPException(status_code=422, detail='course_id and document_id are required.')
+  pages = get_document_pipeline().pages(document_id)
+  if not pages or any(str(page.get('course_id') or '') != course_id for page in pages):
+    raise HTTPException(status_code=422, detail='Document does not belong to the requested course.')
+  if _application_runtime is None or _application_runtime.pipeline_coordinator is None:
+    raise HTTPException(status_code=503, detail='Document pipeline is not ready.')
+  _application_runtime.pipeline_coordinator.queue_pending_audio_alignment(course_id, document_id)
+  return {'queued': True, 'course_id': course_id, 'document_id': document_id}
+
+
 @media_router.get('/api/audio/recordings')
 async def list_lecture_recordings(
   course_id: str | None = None,

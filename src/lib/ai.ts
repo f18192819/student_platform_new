@@ -1026,6 +1026,10 @@ export async function loadCourseLectureRecordings(
       || status !== 'aligned'
       || !Array.isArray(item.page_transcripts)
     ) continue
+    if (!item.page_transcripts.length) {
+      failed = true
+      continue
+    }
     const transcript = (item.transcript_segments ?? [])
       .map((segment) => String(segment.text || '').trim())
       .filter(Boolean)
@@ -1037,6 +1041,21 @@ export async function loadCourseLectureRecordings(
     ))
   }
   return { sessions, waiting, failed }
+}
+
+export async function queuePendingCourseLectureRecordings(
+  courseId: string,
+  documentId: string,
+): Promise<void> {
+  const response = await fetch(resolveBackendApiUrl('/api/audio/recordings/align-pending'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ course_id: courseId, document_id: documentId }),
+  })
+  const payload = (await response.json().catch(() => ({}))) as { detail?: string }
+  if (!response.ok) {
+    throw new Error(String(payload.detail || `Audio alignment queue HTTP ${response.status}`))
+  }
 }
 
 export async function loadLatestDebugClassroomSession() {

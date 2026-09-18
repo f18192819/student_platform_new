@@ -1945,6 +1945,18 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     restoreViewportAnchor(anchor)
   }, [viewportWidth])
 
+  useLayoutEffect(() => {
+    const anchor = pendingViewportAnchorRef.current
+    if (!anchor) return
+    pendingViewportAnchorRef.current = null
+    restoreViewportAnchor(anchor)
+  }, [zoom])
+
+  const runZoomCommand = (command: () => void) => {
+    pendingViewportAnchorRef.current = captureViewportAnchor()
+    command()
+  }
+
   const markProgrammaticScroll = (duration: number) => {
     isAutoScrollingRef.current = true
     if (autoScrollReleaseTimerRef.current !== null) {
@@ -2234,7 +2246,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     firstPageWidth && effectiveViewportWidth
       ? Math.min(1, Math.max(0.45, (effectiveViewportWidth - 52) / firstPageWidth))
       : 1
-  const displayScale = Math.min(1, zoom * fitScale)
+  const displayScale = zoom * fitScale
   return (
     <div className={`pdf-stage${isReadonly ? ' pdf-stage--readonly' : ''}`}>
       <div className="pdf-stage__toolbar">
@@ -2272,14 +2284,14 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
             </button>
           ) : null}
           <div className="pdf-stage__control-group">
-            <button type="button" className="toolbar-pill" aria-label="缩小" title="缩小" onClick={onZoomOut}>
+            <button type="button" className="toolbar-pill" aria-label="缩小" title="缩小" onClick={() => runZoomCommand(onZoomOut)}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" /></svg>
             </button>
             <span className="pdf-stage__zoom-value" aria-label={`当前缩放 ${zoomLabel}`}>{zoomLabel}</span>
-            <button type="button" className="toolbar-pill" aria-label="放大" title="放大" onClick={onZoomIn}>
+            <button type="button" className="toolbar-pill" aria-label="放大" title="放大" onClick={() => runZoomCommand(onZoomIn)}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12M12 6v12" /></svg>
             </button>
-            <button type="button" className="toolbar-pill" onClick={onFitWidth} title="适应宽度">适应</button>
+            <button type="button" className="toolbar-pill" onClick={() => runZoomCommand(onFitWidth)} title="适应宽度">适应</button>
           </div>
         </div>
       </div>

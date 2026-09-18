@@ -39,7 +39,13 @@ test('ASR context is optional and the backend persists unassigned recordings', (
 })
 
 test('opening a lecture imports background-aligned recordings', () => {
+  assert.match(pageSource, /queuePendingCourseLectureRecordings\(activeKnowledgeCourseId, knowledgeFileId\)/)
   assert.match(pageSource, /loadCourseLectureRecordings/)
   assert.match(pageSource, /saveKnowledgeClassroomSession\(knowledgeFileId, session\)/)
-  assert.match(pageSource, /pollTimer = window\.setTimeout\(refreshMappedRecordings, 2500\)/)
+  assert.match(pageSource, /pollTimer = window\.setTimeout\(\(\) => refreshMappedRecordings\(\), 2500\)/)
+})
+
+test('empty aligned recordings are treated as failed instead of crashing session import', () => {
+  assert.match(aiSource, /if \(!item\.page_transcripts\.length\) \{[\s\S]*failed = true[\s\S]*continue/)
+  assert.match(aiSource, /\/api\/audio\/recordings\/align-pending/)
 })

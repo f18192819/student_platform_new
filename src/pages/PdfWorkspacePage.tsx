@@ -56,6 +56,7 @@ import {
   buildClassroomSessionWithApi,
   buildClassroomSessionFromSequentialAlignment,
   loadCourseLectureRecordings,
+  queuePendingCourseLectureRecordings,
   askWithConfiguredVisionApi,
   loadLatestDebugClassroomSession,
   summarizeChatMemoryWithConfiguredApi,
@@ -1191,7 +1192,7 @@ export function PdfWorkspacePage() {
     let cancelled = false
     let pollTimer: number | null = null
 
-    const refreshMappedRecordings = async () => {
+    const refreshMappedRecordings = async (forcePoll = false) => {
       try {
         const result = await loadCourseLectureRecordings(
           activeKnowledgeCourseId,
@@ -1221,9 +1222,9 @@ export function PdfWorkspacePage() {
             ),
           ])
         }
-        if (result.waiting) {
+        if (result.waiting || forcePoll) {
           emitLessonProcessingState('课堂录音等待映射')
-          pollTimer = window.setTimeout(refreshMappedRecordings, 2500)
+          pollTimer = window.setTimeout(() => refreshMappedRecordings(), 2500)
         } else if (result.sessions.length) {
           emitLessonProcessingState('课堂映射已完成')
           window.setTimeout(() => emitLessonProcessingState(''), 1800)
@@ -1235,7 +1236,22 @@ export function PdfWorkspacePage() {
       }
     }
 
-    void refreshMappedRecordings()
+    const queueAndRefreshMappedRecordings = async () => {
+      let queued = false
+      try {
+        await queuePendingCourseLectureRecordings(activeKnowledgeCourseId, knowledgeFileId)
+        queued = true
+      } catch (error) {
+        if (!cancelled) {
+          console.warn('Pending classroom recording queue failed:', error)
+        }
+      }
+      if (!cancelled) {
+        await refreshMappedRecordings(queued)
+      }
+    }
+
+    void queueAndRefreshMappedRecordings()
     return () => {
       cancelled = true
       if (pollTimer !== null) window.clearTimeout(pollTimer)
@@ -2003,7 +2019,7 @@ export function PdfWorkspacePage() {
   }
 
   const handleZoom = (nextZoom: number) => {
-    setZoom(Math.min(1, Math.max(0.75, nextZoom)))
+    setZoom(Math.min(2.5, Math.max(0.75, nextZoom)))
   }
 
   const handleVisiblePageChange = (pageNumber: number) => {

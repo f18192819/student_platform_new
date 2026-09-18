@@ -50,3 +50,10 @@ test('reader owns scroll preservation instead of browser scroll anchoring', () =
   assert.match(cssSource, /\.pdf-stage__viewport\s*\{[\s\S]*overflow-anchor:\s*none/)
   assert.match(cssSource, /\.pdf-stage__stack\s*\{[\s\S]*overflow-anchor:\s*none/)
 })
+
+test('zoom can exceed 100 percent while preserving the current reading anchor', () => {
+  assert.match(canvasSource, /const displayScale = zoom \* fitScale/)
+  assert.doesNotMatch(canvasSource, /const displayScale = Math\.min\(1, zoom \* fitScale\)/)
+  assert.match(canvasSource, /runZoomCommand\(onZoomIn\)/)
+  assert.match(canvasSource, /pendingViewportAnchorRef\.current = captureViewportAnchor\(\)/)
+})

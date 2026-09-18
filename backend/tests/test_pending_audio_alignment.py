@@ -5,6 +5,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import UploadFile
@@ -17,10 +18,25 @@ from backend.audio_alignment import (
   SequentialPageAligner,
   TranscriptSegment,
 )
-from backend.media_router import list_lecture_recordings, transcribe_audio
+from backend.media_router import (
+  list_lecture_recordings,
+  queue_pending_lecture_recordings,
+  transcribe_audio,
+)
 
 
 class PendingAudioAlignmentTest(unittest.TestCase):
+  @staticmethod
+  def _page(document_id: str = 'lecture-1') -> dict:
+    return {
+      'course_id': 'course-1',
+      'document_id': document_id,
+      'page_id': 'page-1',
+      'page_number': 1,
+      'title': 'Lecture',
+      'content': 'Lecture content',
+    }
+
   def test_course_recording_waits_without_document_then_aligns_to_uploaded_lecture(self):
     with tempfile.TemporaryDirectory() as temporary:
       root = Path(temporary)
@@ -100,6 +116,82 @@ class PendingAudioAlignmentTest(unittest.TestCase):
         self.assertIsNone(
           store.read('course-2', 'recording-course-2')['recording']['document_id'],
         )
+
+  def test_empty_alignment_is_failed_and_remains_retryable(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      with patch('backend.audio_alignment.AUDIO_ALIGNMENT_ROOT', Path(temporary)):
+        store = AudioAlignmentStore()
+        recording = LectureRecording(
+          id='recording-empty',
+          course_id='course-1',
+          document_id='lecture-1',
+          audio_path='audio/empty.webm',
+          duration=5,
+        )
+        segment = TranscriptSegment(
+          id='segment-empty',
+          recording_id=recording.id,
+          start_time=0,
+          end_time=5,
+          text='Lecture content',
+        )
+        empty_aligner = SimpleNamespace(align=lambda *_args: ([], []))
+        service = AudioAlignmentService(store=store, aligner=empty_aligner)
+        service.register(recording, [segment])
+
+        with self.assertRaisesRegex(ValueError, 'did not produce any page transcripts'):
+          service.align('course-1', recording.id, [self._page()], 'lecture-1')
+
+        stored = store.read('course-1', recording.id)
+        self.assertEqual('alignment_failed', stored['status'])
+        self.assertEqual([], stored['page_transcripts'])
+
+  def test_recording_bound_to_existing_other_lecture_is_not_rebound(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      with patch('backend.audio_alignment.AUDIO_ALIGNMENT_ROOT', Path(temporary)):
+        store = AudioAlignmentStore()
+        recording = LectureRecording(
+          id='recording-other',
+          course_id='course-1',
+          document_id='lecture-2',
+          audio_path='audio/other.webm',
+          duration=5,
+        )
+        service = AudioAlignmentService(store=store)
+        service.register(recording, [])
+
+        result = service.align_pending_for_document(
+          'course-1',
+          'lecture-1',
+          [self._page()],
+        )
+
+        self.assertEqual({'checked': 0, 'aligned': 0, 'failed': 0}, result)
+        self.assertEqual(
+          'lecture-2',
+          store.read('course-1', recording.id)['recording']['document_id'],
+        )
+
+  def test_open_lecture_endpoint_queues_pending_alignment(self):
+    queued: list[tuple[str, str]] = []
+    pipeline = SimpleNamespace(pages=lambda _document_id: [self._page()])
+    coordinator = SimpleNamespace(
+      queue_pending_audio_alignment=lambda course_id, document_id: queued.append(
+        (course_id, document_id),
+      ),
+    )
+    runtime = SimpleNamespace(
+      pipeline_coordinator=coordinator,
+      require_document_pipeline=lambda: pipeline,
+    )
+    with patch('backend.media_router._application_runtime', runtime):
+      result = asyncio.run(queue_pending_lecture_recordings({
+        'course_id': 'course-1',
+        'document_id': 'lecture-1',
+      }))
+
+    self.assertTrue(result['queued'])
+    self.assertEqual([('course-1', 'lecture-1')], queued)
 
   def test_unassigned_recording_is_claimed_by_first_uploaded_lecture(self):
     with tempfile.TemporaryDirectory() as temporary:

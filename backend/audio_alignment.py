@@ -411,17 +411,32 @@ class AudioAlignmentService:
     recording = recording.model_copy(update={'document_id': normalized_document_id})
     segments = [TranscriptSegment.model_validate(item) for item in stored.get('transcript_segments') or []]
     windows = build_transcript_windows(segments)
-    aligner = self.aligner or SequentialPageAligner.from_runtime_config()
-    alignments, relations = aligner.align(recording, windows, pages)
-    page_transcripts = build_page_transcripts(windows, alignments, pages)
-    self.store.save(recording, segments, {
-      'windows': [item.model_dump() for item in windows],
-      'alignments': [item.model_dump() for item in alignments],
-      'relations': [item.model_dump() for item in relations],
-      'page_transcripts': [item.model_dump() for item in page_transcripts],
-      'status': 'aligned',
-      'updated_at': time.time(),
-    })
+    try:
+      aligner = self.aligner or SequentialPageAligner.from_runtime_config()
+      alignments, relations = aligner.align(recording, windows, pages)
+      page_transcripts = build_page_transcripts(windows, alignments, pages)
+      if not page_transcripts:
+        raise ValueError('Audio alignment did not produce any page transcripts.')
+      self.store.save(recording, segments, {
+        'windows': [item.model_dump() for item in windows],
+        'alignments': [item.model_dump() for item in alignments],
+        'relations': [item.model_dump() for item in relations],
+        'page_transcripts': [item.model_dump() for item in page_transcripts],
+        'status': 'aligned',
+        'alignment_error': '',
+        'updated_at': time.time(),
+      })
+    except Exception as exc:
+      self.store.save(recording, segments, {
+        'windows': [item.model_dump() for item in windows],
+        'alignments': [],
+        'relations': [],
+        'page_transcripts': [],
+        'status': 'alignment_failed',
+        'alignment_error': str(exc),
+        'updated_at': time.time(),
+      })
+      raise
     return self.store.read(course_id, recording_id)
 
   def align_pending_for_document(
@@ -443,11 +458,13 @@ class AudioAlignmentService:
         if recording.id in seen_recording_ids:
           continue
         status = str(stored.get('status') or '')
-        is_unbound = not recording.document_id and status == 'transcribed'
+        has_empty_alignment = status == 'aligned' and not (stored.get('page_transcripts') or [])
+        is_retryable = status in {'transcribed', 'aligning', 'alignment_failed'} or has_empty_alignment
+        is_unbound = not recording.document_id and is_retryable
         is_bound_retry = (
           source_course_id == normalized_course_id
           and recording.document_id == normalized_document_id
-          and status in {'transcribed', 'aligning', 'alignment_failed'}
+          and is_retryable
         )
         if is_unbound or is_bound_retry:
           candidates.append((source_course_id, recording, stored))
