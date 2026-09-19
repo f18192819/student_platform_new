@@ -3,7 +3,7 @@ import * as pdfjsLib from 'pdfjs-dist'
 import { useLayoutEffect } from 'react'
 import { useEffectEvent } from 'react'
 import { pdfPageRenderPriority } from '../lib/pdf-core/renderPriority'
-import { pdfMark } from '../lib/pdf-core/performance'
+import { getPdfControllerId, pdfDiagnostic, pdfMark } from '../lib/pdf-core/performance'
 import { prefetchPdfPageSizes } from '../lib/pdf-core/pageSizePrefetch'
 import type {
   ClassroomLectureSegment,
@@ -674,6 +674,10 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       setVisualReady(false)
       setRasterReady(false)
       pdfMark('render-start', pageNumber)
+      pdfDiagnostic('page render start', {
+        controllerId: getPdfControllerId(pdfController),
+        pageNumber,
+      })
       const page = await pdfController.getPage(pageNumber)
       if (cancelled) {
         return
@@ -707,11 +711,19 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       }
 
       pdfMark('render-complete', pageNumber)
+      pdfDiagnostic('page render complete', {
+        controllerId: getPdfControllerId(pdfController),
+        pageNumber,
+      })
       // Cross a paint boundary before releasing raster and neighbor work.
       await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
       if (cancelled) return
       setVisualReady(true)
       pdfMark('visual-ready', pageNumber)
+      pdfDiagnostic('visual ready', {
+        controllerId: getPdfControllerId(pdfController),
+        pageNumber,
+      })
       onVisualReadyRef.current(pageNumber)
       // Text is optional interaction data, never the visual-ready signal.
       const textContent = interactive
@@ -746,6 +758,9 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       }
 
       setRenderError(error instanceof Error ? error.message : 'PDF render failed')
+      if (import.meta.env.DEV && !(error instanceof Error && error.name === 'RenderingCancelledException')) {
+        console.error('[PDF render failed]', { pageNumber, error })
+      }
     })
 
     return () => {
@@ -1852,8 +1867,8 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const [viewportWidth, setViewportWidth] = useState(0)
   const [geometryVersion, setGeometryVersion] = useState(0)
   const [visualPages, setVisualPages] = useState<{ controller: PdfController | null; pages: Set<number> }>({ controller: null, pages: new Set() })
-  const isPageVisualReady = (number: number) => visualPages.controller === pdfController && visualPages.pages.has(number)
-    && Boolean(pageRefs.current.get(number)?.querySelector('[data-visual-ready="true"]'))
+  const isPageVisualReady = (number: number) =>
+    visualPages.controller === pdfController && visualPages.pages.has(number)
   const handlePageVisualReady = (number: number) => {
     setVisualPages(previous => ({
       controller: pdfController,
@@ -1903,11 +1918,19 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       visibleQuestionIdRef.current = null
       reportedVisiblePageRef.current = currentPageRef.current
       prefetchedGeometryPagesRef.current.clear()
+      renderedPagesRef.current.clear()
+      setVisualPages({ controller: pdfController, pages: new Set() })
     }
-    pageRefs.current.clear()
-    renderedPagesRef.current.clear()
     setRenderError(null)
   }, [imageUrl, pdfController])
+
+  useEffect(() => {
+    if (!pdfController) return
+    pdfDiagnostic('controller activate', {
+      controllerId: getPdfControllerId(pdfController),
+      currentPage: currentPageRef.current,
+    })
+  }, [pdfController])
 
   useEffect(() => () => {
     if (questionAnchorTimerRef.current !== null) {
@@ -1972,7 +1995,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       !pdfController?.getPageSize ||
       visualPages.controller !== pdfController ||
       !visualPages.pages.has(currentPage) ||
-      !pageRefs.current.get(currentPage)?.querySelector('[data-visual-ready=true]') ||
+      !pageRefs.current.has(currentPage) ||
       prefetchedGeometryPages.has(currentPage)
     ) {
       return
@@ -2453,7 +2476,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                 displayScale,
               )
               const priority = pdfPageRenderPriority(pageNumber, currentPage, pdfController.pageCount, isPageVisualReady)
-              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1 && priority !== null
+              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1
               const hasLectureExplanation = lectureSegments.length > 0
               const hasPlayableLecture = lectureSegments.some(
                 (segment) =>
@@ -2469,10 +2492,6 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                   className="pdf-stage__page-shell"
                   data-page-number={pageNumber}
                   data-render-priority={priority ?? undefined}
-                  style={{
-                    contentVisibility: 'auto',
-                    containIntrinsicSize: `auto ${Math.ceil((expectedSurfaceSize?.height ?? 1000) + 48)}px`,
-                  }}
                   ref={(node) => {
                     if (node) {
                       pageRefs.current.set(pageNumber, node)

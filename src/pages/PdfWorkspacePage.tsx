@@ -110,7 +110,7 @@ import {
 import {
   extractPdfPreview,
   openPdfPreviewFromBuffer,
-  openPdfPreviewFromUrl,
+  openPdfPreviewFromUrlWithFallback,
 } from '../lib/pdf'
 import {
   clearPdfPreviewCache,
@@ -118,6 +118,7 @@ import {
   setBoundedPdfPreview,
 } from '../lib/pdf-core/disposableCache'
 import { useMineruHydrationGate } from '../lib/pdf-core/useMineruHydrationGate'
+import { getPdfControllerId, pdfDiagnostic } from '../lib/pdf-core/performance'
 import type {
   ApiConfig,
   ChatMessage,
@@ -199,7 +200,7 @@ export function PdfWorkspacePage() {
   const lessonTranscriptUploadInputRef = useRef<HTMLInputElement | null>(null)
   const lectureMineruInFlightRef = useRef<Set<string>>(new Set())
   const lectureMineruFailedRef = useRef<Set<string>>(new Set())
-  const lectureControllerOwnerRef = useRef<PdfController | null>(null)
+  const ownedPdfControllersRef = useRef(new Set<PdfController>())
 
   const homeworkPreviewCacheRef = useRef<
     Map<
@@ -223,7 +224,11 @@ export function PdfWorkspacePage() {
   ) => {
     // PDF.js page controllers retain render resources. Keep recently viewed
     // exercises available without allowing an unbounded cache in long sessions.
-    setBoundedPdfPreview(homeworkPreviewCacheRef.current, documentId, preview, 4)
+    setBoundedPdfPreview(homeworkPreviewCacheRef.current, documentId, preview, 4, {
+      // A cache entry can still be mounted while React switches documents.
+      // The workspace owns accepted controllers and disposes them on unmount.
+      disposeRemoved: false,
+    })
   }
 
   useEffect(() => () => {
@@ -233,9 +238,11 @@ export function PdfWorkspacePage() {
     if (saveChatTimerRef.current !== null) {
       window.clearTimeout(saveChatTimerRef.current)
     }
-    clearPdfPreviewCache(homeworkPreviewCacheRef.current)
-    void disposePdfController(lectureControllerOwnerRef.current)
-    lectureControllerOwnerRef.current = null
+    clearPdfPreviewCache(homeworkPreviewCacheRef.current, { disposeRemoved: false })
+    for (const controller of ownedPdfControllersRef.current) {
+      void disposePdfController(controller, 'workspace-unmount')
+    }
+    ownedPdfControllersRef.current.clear()
   }, [])
   const deferredChatMessages = useDeferredValue(chatMessages)
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([])
@@ -420,14 +427,6 @@ export function PdfWorkspacePage() {
     viewerSource.kind === 'homework' ? viewerSource.documentId : null
 
   useEffect(() => {
-    const previousController = lectureControllerOwnerRef.current
-    lectureControllerOwnerRef.current = lecturePdfController
-    if (previousController !== lecturePdfController) {
-      void disposePdfController(previousController)
-    }
-  }, [lecturePdfController])
-
-  useEffect(() => {
     if (isLectureViewer) {
       return
     }
@@ -606,11 +605,14 @@ export function PdfWorkspacePage() {
                 }
               : await openPdfPreviewFromBuffer(payload)
           if (cancelled) {
-            if (!cachedPreview) void disposePdfController(extracted.controller)
+            if (!cachedPreview) void disposePdfController(extracted.controller, 'homework-load-cancelled')
             return
           }
 
           if (!cachedPreview) {
+            if (extracted.controller) {
+              ownedPdfControllersRef.current.add(extracted.controller)
+            }
             cacheHomeworkPreview(targetDocument.id, {
               controller: extracted.controller,
               imageUrl: extracted.previewUrl,
@@ -774,15 +776,27 @@ export function PdfWorkspacePage() {
         touchKnowledgeFile(storedFile.id)
         // Shell, name, annotations and structure are available before PDF I/O.
         const extracted = storedFile.hasPdfSource
-          ? await openPdfPreviewFromUrl(resolveKnowledgePdfSourceUrl(storedFile.id), {
-              initialPage: initialPageNumber,
-              pageSizes: storedFile.pageSizes,
-            })
+          ? await openPdfPreviewFromUrlWithFallback(
+              resolveKnowledgePdfSourceUrl(storedFile.id),
+              () => loadKnowledgePdfSource(storedFile.id),
+              {
+                initialPage: initialPageNumber,
+                pageSizes: storedFile.pageSizes,
+              },
+            )
           : null
         if (cancelled) {
-          void extracted?.controller.dispose?.()
+          void disposePdfController(extracted?.controller, 'lecture-restore-cancelled')
           return
         }
+        if (extracted?.controller) {
+          ownedPdfControllersRef.current.add(extracted.controller)
+        }
+        pdfDiagnostic('controller activate', {
+          controllerId: getPdfControllerId(extracted?.controller),
+          documentId: storedFile.id,
+          initialPage: initialPageNumber,
+        })
         setPdfController(extracted?.controller ?? null)
         setLecturePdfController(extracted?.controller ?? null)
         if (extracted) {
@@ -1314,6 +1328,7 @@ export function PdfWorkspacePage() {
     try {
       const buffer = await file.arrayBuffer()
       const result = { ...await openPdfPreviewFromBuffer(buffer), buffer }
+      ownedPdfControllersRef.current.add(result.controller)
       const initialChatMessages = [
         createMessage(
           'assistant',

@@ -1,5 +1,6 @@
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import type { PdfController, PdfPageSize } from '../../types'
+import { getPdfControllerId, pdfDiagnostic } from './performance'
 
 export type FastPdfOpenOptions = {
   initialPage?: number
@@ -34,7 +35,7 @@ export async function createFastPdfController(pdf: PDFDocumentProxy, options: Fa
   const initialPage = Math.max(1, Math.min(pdf.numPages, Math.trunc(options.initialPage || 1)))
   // Only the page being opened can gate readiness. No text or all-page scan.
   if (!pageSizes[initialPage - 1]) await getPage(initialPage)
-  return {
+  const controller: PdfController = {
     pageCount: pdf.numPages,
     markdown: '',
     pageSizes,
@@ -43,4 +44,10 @@ export async function createFastPdfController(pdf: PDFDocumentProxy, options: Fa
     getPageSize,
     dispose: () => pdf.loadingTask.destroy(),
   }
+  pdfDiagnostic('controller create', {
+    controllerId: getPdfControllerId(controller),
+    initialPage,
+    pageCount: pdf.numPages,
+  })
+  return controller
 }

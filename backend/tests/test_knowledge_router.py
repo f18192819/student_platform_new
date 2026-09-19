@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
+from backend.app_factory import create_app_with_router
 from backend.knowledge_router import KnowledgeLibraryService, create_knowledge_router
 
 
@@ -67,6 +72,22 @@ class KnowledgeRouterTest(unittest.TestCase):
     self.assertIn('/api/knowledge/pdf/{file_id}', paths)
     self.assertIn('/api/knowledge/pdf/{file_id}/pages/{page_number}', paths)
     self.assertIn('/api/knowledge/homework-asset/{asset_id}', paths)
+
+  def test_pdf_endpoint_supports_byte_ranges(self):
+    with TemporaryDirectory() as directory:
+      pdf_path = Path(directory) / 'range.pdf'
+      pdf_path.write_bytes(b'%PDF-1.7\n' + b'x' * 100_000)
+      app = create_app_with_router(create_knowledge_router(FakeRuntime()))
+      with patch('backend.knowledge_router.pdf_source_path', return_value=pdf_path):
+        response = TestClient(app).get(
+          '/api/knowledge/pdf/range-test',
+          headers={'Range': 'bytes=0-65535'},
+        )
+
+    self.assertEqual(206, response.status_code)
+    self.assertEqual('bytes', response.headers.get('accept-ranges'))
+    self.assertEqual('bytes 0-65535/100009', response.headers.get('content-range'))
+    self.assertEqual('65536', response.headers.get('content-length'))
 
   @patch('backend.knowledge_router.mark_deleted_synced_courseware')
   @patch('backend.knowledge_router.delete_learning_document')

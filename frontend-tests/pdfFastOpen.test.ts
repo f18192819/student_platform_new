@@ -10,6 +10,7 @@ import {
 } from '../src/lib/pdf-core/disposableCache'
 import { createMineruHydrationGate, MINERU_FIRST_PAINT_GRACE_MS } from '../src/lib/pdf-core/mineruGate'
 import { getPdfPageSizePrefetchOrder, prefetchPdfPageSizes } from '../src/lib/pdf-core/pageSizePrefetch'
+import { withPdfPreviewFallback } from '../src/lib/pdf-core/preview'
 import { pdfPageRenderPriority } from '../src/lib/pdf-core/renderPriority'
 
 test('fast controller only resolves the requested page before becoming ready', async () => {
@@ -107,6 +108,44 @@ test('PDF controllers are disposed once across LRU eviction and teardown', async
   assert.equal(disposed, 1)
 })
 
+test('workspace-owned cache entries are not disposed during replacement or eviction', async () => {
+  let disposed = 0
+  const first = { pageCount: 1, markdown: '', getPage: async () => ({}) as never, dispose: async () => { disposed += 1 } }
+  const second = { pageCount: 1, markdown: '', getPage: async () => ({}) as never, dispose: async () => { disposed += 1 } }
+  const cache = new Map<string, { controller: typeof first }>()
+  setBoundedPdfPreview(cache, 'one', { controller: first }, 1, { disposeRemoved: false })
+  setBoundedPdfPreview(cache, 'two', { controller: second }, 1, { disposeRemoved: false })
+  clearPdfPreviewCache(cache, { disposeRemoved: false })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(disposed, 0)
+})
+
+test('URL preview falls back to a downloaded buffer after the primary open fails', async () => {
+  const expected = { pageCount: 3 }
+  const buffer = new ArrayBuffer(8)
+  const result = await withPdfPreviewFallback(
+    async () => { throw new Error('range failed') },
+    async () => buffer,
+    async (received) => {
+      assert.equal(received, buffer)
+      return expected
+    },
+  )
+  assert.equal(result, expected)
+})
+
+test('URL preview preserves the primary error when no fallback buffer is available', async () => {
+  const primaryError = new Error('range failed')
+  await assert.rejects(
+    withPdfPreviewFallback(
+      async () => { throw primaryError },
+      async () => null,
+      async () => ({ pageCount: 0 }),
+    ),
+    primaryError,
+  )
+})
+
 test('pending answer preview is disposed when it resolves after LRU eviction', async () => {
   let resolvePreview: ((value: { controller: { dispose: () => Promise<void> } }) => void) | null = null
   let disposed = 0
@@ -136,5 +175,14 @@ test('upload and restore critical paths do not use full text extraction', () => 
   const upload = source.slice(source.indexOf('const handlePdfChange'), source.indexOf('const handleInspectPageDoubts'))
   assert.doesNotMatch(upload, /extractPdfPreview\(/)
   assert.match(upload, /openPdfPreviewFromBuffer\(buffer\)/)
-  assert.match(source, /openPdfPreviewFromUrl/)
+  assert.match(source, /openPdfPreviewFromUrlWithFallback/)
+})
+
+test('reader rendering correctness does not depend on DOM-ready races or priority gates', () => {
+  const source = readFileSync('src/components/PdfPreviewCanvas.tsx', 'utf8')
+  const visualReady = source.slice(source.indexOf('const isPageVisualReady'), source.indexOf('const handlePageVisualReady'))
+  assert.doesNotMatch(source, /pageRefs\.current\.clear\(\)/)
+  assert.doesNotMatch(visualReady, /querySelector/)
+  assert.match(source, /const shouldRenderPage = Math\.abs\(pageNumber - currentPage\) <= 1/)
+  assert.doesNotMatch(source, /contentVisibility/)
 })

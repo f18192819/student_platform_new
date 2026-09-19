@@ -1,4 +1,5 @@
 import type { PdfController } from '../../types'
+import { getPdfControllerId, pdfDiagnostic } from './performance'
 
 type PdfPreviewWithController = {
   controller?: PdfController | null
@@ -6,23 +7,33 @@ type PdfPreviewWithController = {
 
 const disposedControllers = new WeakSet<PdfController>()
 
-export function disposePdfController(controller: PdfController | null | undefined) {
+export function disposePdfController(
+  controller: PdfController | null | undefined,
+  reason = 'unspecified',
+) {
   if (!controller?.dispose || disposedControllers.has(controller)) {
     return Promise.resolve()
   }
 
   disposedControllers.add(controller)
+  pdfDiagnostic('controller dispose', {
+    controllerId: getPdfControllerId(controller),
+    reason,
+  })
   return Promise.resolve(controller.dispose()).catch((error) => {
     console.warn('PDF controller disposal failed:', error)
   })
 }
 
-export function disposePdfPreviews<T extends PdfPreviewWithController>(previews: Iterable<T>) {
+export function disposePdfPreviews<T extends PdfPreviewWithController>(
+  previews: Iterable<T>,
+  reason = 'preview-collection-disposed',
+) {
   const controllers = new Set<PdfController>()
   for (const preview of previews) {
     if (preview.controller) controllers.add(preview.controller)
   }
-  return Promise.all([...controllers].map(disposePdfController)).then(() => undefined)
+  return Promise.all([...controllers].map((controller) => disposePdfController(controller, reason))).then(() => undefined)
 }
 
 export function setBoundedPdfPreview<TKey, TPreview extends PdfPreviewWithController>(
@@ -30,12 +41,14 @@ export function setBoundedPdfPreview<TKey, TPreview extends PdfPreviewWithContro
   key: TKey,
   preview: TPreview,
   limit: number,
+  options: { disposeRemoved?: boolean } = {},
 ) {
+  const disposeRemoved = options.disposeRemoved ?? true
   const replaced = cache.get(key)
   cache.delete(key)
   cache.set(key, preview)
-  if (replaced && replaced !== preview && replaced.controller !== preview.controller) {
-    void disposePdfController(replaced.controller)
+  if (disposeRemoved && replaced && replaced !== preview && replaced.controller !== preview.controller) {
+    void disposePdfController(replaced.controller, 'preview-cache-replaced')
   }
 
   while (cache.size > limit) {
@@ -43,16 +56,21 @@ export function setBoundedPdfPreview<TKey, TPreview extends PdfPreviewWithContro
     if (oldestKey === undefined) break
     const evicted = cache.get(oldestKey)
     cache.delete(oldestKey)
-    void disposePdfController(evicted?.controller)
+    if (disposeRemoved) {
+      void disposePdfController(evicted?.controller, 'preview-cache-evicted')
+    }
   }
 }
 
 export function clearPdfPreviewCache<TPreview extends PdfPreviewWithController>(
   cache: Map<unknown, TPreview>,
+  options: { disposeRemoved?: boolean } = {},
 ) {
   const previews = [...cache.values()]
   cache.clear()
-  void disposePdfPreviews(previews)
+  if (options.disposeRemoved ?? true) {
+    void disposePdfPreviews(previews, 'preview-cache-cleared')
+  }
 }
 
 export class DisposablePdfPreviewPromiseCache<TPreview extends PdfPreviewWithController> {
@@ -113,7 +131,7 @@ export class DisposablePdfPreviewPromiseCache<TPreview extends PdfPreviewWithCon
     if (this.#disposedTasks.has(task)) return
     this.#disposedTasks.add(task)
     void task.then(
-      (preview) => disposePdfController(preview.controller),
+      (preview) => disposePdfController(preview.controller, 'preview-promise-evicted'),
       () => undefined,
     )
   }

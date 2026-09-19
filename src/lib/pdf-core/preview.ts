@@ -9,7 +9,7 @@ import {
 } from './assets'
 import { extractPageMarkdown, type PageExtraction } from './layout'
 import { createFastPdfController, type FastPdfOpenOptions } from './fastController'
-import { pdfMark } from './performance'
+import { pdfDiagnostic, pdfMark } from './performance'
 
 ensureUint8ArrayToHex()
 
@@ -51,6 +51,10 @@ async function finishFastOpen(task: ReturnType<typeof createPdfDocumentTask>, op
   pdfMark('document-load-start')
   try {
     const pdf = await task.promise
+    pdfDiagnostic('document open', {
+      pageCount: pdf.numPages,
+      initialPage: options.initialPage ?? 1,
+    })
     pdfMark('document-ready')
     const controller = await createFastPdfController(pdf, options)
     pdfMark('controller-ready')
@@ -84,6 +88,35 @@ export function openPdfPreviewFromUrl(url: string, options: FastPdfOpenOptions =
     standardFontDataUrl: PDFJS_STANDARD_FONT_DATA_URL,
     wasmUrl: PDFJS_WASM_URL,
   }), options)
+}
+
+export async function withPdfPreviewFallback<T>(
+  openPrimary: () => Promise<T>,
+  loadBuffer: () => Promise<ArrayBuffer | null>,
+  openBuffer: (buffer: ArrayBuffer) => Promise<T>,
+) {
+  try {
+    return await openPrimary()
+  } catch (primaryError) {
+    const buffer = await loadBuffer()
+    if (!buffer) throw primaryError
+    return openBuffer(buffer)
+  }
+}
+
+export async function openPdfPreviewFromUrlWithFallback(
+  url: string,
+  loadBuffer: () => Promise<ArrayBuffer | null>,
+  options: FastPdfOpenOptions = {},
+) {
+  return withPdfPreviewFallback(
+    () => openPdfPreviewFromUrl(url, options),
+    async () => {
+      pdfDiagnostic('range fallback', { url })
+      return loadBuffer()
+    },
+    (buffer) => openPdfPreviewFromBuffer(buffer, options),
+  )
 }
 
 export async function probePdfPageCountFromBuffer(buffer: ArrayBuffer) {
