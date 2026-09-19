@@ -1,5 +1,9 @@
 type PdfFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 type PdfExtractor<TResult> = (buffer: ArrayBuffer, fileName: string) => Promise<TResult>
+type PdfPreviewCache<TResult> = {
+  get: (key: string) => Promise<TResult> | undefined
+  set: (key: string, task: Promise<TResult>) => unknown
+}
 
 export function clampPdfPage(page: number, pageCount: number) {
   return Math.min(Math.max(Math.round(page), 1), Math.max(pageCount, 1))
@@ -10,7 +14,7 @@ export function clampPdfZoom(zoom: number) {
 }
 
 export function getOrCreateCachedPdfPreview<TResult>(
-  cache: Map<string, Promise<TResult>>,
+  cache: PdfPreviewCache<TResult>,
   key: string,
   load: () => Promise<TResult>,
 ) {

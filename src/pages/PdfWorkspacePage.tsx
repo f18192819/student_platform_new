@@ -112,6 +112,12 @@ import {
   openPdfPreviewFromBuffer,
   openPdfPreviewFromUrl,
 } from '../lib/pdf'
+import {
+  clearPdfPreviewCache,
+  disposePdfController,
+  setBoundedPdfPreview,
+} from '../lib/pdf-core/disposableCache'
+import { useMineruHydrationGate } from '../lib/pdf-core/useMineruHydrationGate'
 import type {
   ApiConfig,
   ChatMessage,
@@ -193,6 +199,7 @@ export function PdfWorkspacePage() {
   const lessonTranscriptUploadInputRef = useRef<HTMLInputElement | null>(null)
   const lectureMineruInFlightRef = useRef<Set<string>>(new Set())
   const lectureMineruFailedRef = useRef<Set<string>>(new Set())
+  const lectureControllerOwnerRef = useRef<PdfController | null>(null)
 
   const homeworkPreviewCacheRef = useRef<
     Map<
@@ -214,16 +221,9 @@ export function PdfWorkspacePage() {
       pageTexts: string[]
     },
   ) => {
-    const cache = homeworkPreviewCacheRef.current
-    cache.delete(documentId)
-    cache.set(documentId, preview)
     // PDF.js page controllers retain render resources. Keep recently viewed
     // exercises available without allowing an unbounded cache in long sessions.
-    while (cache.size > 4) {
-      const oldestDocumentId = cache.keys().next().value
-      if (!oldestDocumentId) break
-      cache.delete(oldestDocumentId)
-    }
+    setBoundedPdfPreview(homeworkPreviewCacheRef.current, documentId, preview, 4)
   }
 
   useEffect(() => () => {
@@ -233,7 +233,9 @@ export function PdfWorkspacePage() {
     if (saveChatTimerRef.current !== null) {
       window.clearTimeout(saveChatTimerRef.current)
     }
-    homeworkPreviewCacheRef.current.clear()
+    clearPdfPreviewCache(homeworkPreviewCacheRef.current)
+    void disposePdfController(lectureControllerOwnerRef.current)
+    lectureControllerOwnerRef.current = null
   }, [])
   const deferredChatMessages = useDeferredValue(chatMessages)
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([])
@@ -385,6 +387,11 @@ export function PdfWorkspacePage() {
     viewerSource.kind === 'homework' ? homeworkPreviewImageUrl : null
   const currentViewerStructuredBlocks =
     viewerSource.kind === 'homework' ? homeworkPreviewLayoutBlocks : lectureLayoutBlocks
+  const mineruHydrationAllowed = useMineruHydrationGate(
+    knowledgeFileId,
+    lecturePdfController,
+    readerVisualReady,
+  )
   const annotationDocumentId = viewerSource.kind === 'homework'
     ? selectedHomework?.id ?? null
     : knowledgeFileId
@@ -411,6 +418,14 @@ export function PdfWorkspacePage() {
   } = useLessonRecordings(activeKnowledgeCourseId, isLectureViewer)
   const activeHomeworkDocumentId =
     viewerSource.kind === 'homework' ? viewerSource.documentId : null
+
+  useEffect(() => {
+    const previousController = lectureControllerOwnerRef.current
+    lectureControllerOwnerRef.current = lecturePdfController
+    if (previousController !== lecturePdfController) {
+      void disposePdfController(previousController)
+    }
+  }, [lecturePdfController])
 
   useEffect(() => {
     if (isLectureViewer) {
@@ -591,6 +606,7 @@ export function PdfWorkspacePage() {
                 }
               : await openPdfPreviewFromBuffer(payload)
           if (cancelled) {
+            if (!cachedPreview) void disposePdfController(extracted.controller)
             return
           }
 
@@ -1011,7 +1027,7 @@ export function PdfWorkspacePage() {
       return
     }
 
-    if (!readerVisualReady) return
+    if (!mineruHydrationAllowed) return
     const storedFile = getKnowledgeFile(knowledgeFileId)
     if (!storedFile?.hasPdfSource) {
       return
@@ -1213,7 +1229,7 @@ export function PdfWorkspacePage() {
     return () => {
       cancelled = true
     }
-  }, [knowledgeFileId, readerVisualReady])
+  }, [knowledgeFileId, mineruHydrationAllowed])
 
   useEffect(() => {
     if (!knowledgeFileId || !activeKnowledgeCourseId) {

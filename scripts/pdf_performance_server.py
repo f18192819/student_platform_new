@@ -1,6 +1,9 @@
 import argparse
 import asyncio
+import json
+import os
 import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -9,12 +12,27 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response, FileResponse
 
+DEFAULT_BASELINE_REF = 'c7225717a82b0bf4025ee3e87a3c00c7506ba3d5'
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--baseline', action='store_true')
+parser.add_argument('--baseline-ref', default=os.environ.get('PDF_BENCH_BASELINE_REF', DEFAULT_BASELINE_REF))
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root))
+baseline_ref = subprocess.check_output(['git', 'rev-parse', args.baseline_ref], cwd=root).decode('utf-8').strip()
+candidate_ref = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root).decode('utf-8').strip()
+print(json.dumps({
+    'pdfBenchmark': 'server',
+    'mode': 'baseline' if args.baseline else 'candidate',
+    'baselineRef': baseline_ref,
+    'candidateRef': candidate_ref,
+}), flush=True)
 if args.baseline:
-    code = subprocess.check_output(['git', 'show', 'HEAD:backend/knowledge_storage.py'], cwd=root).decode('utf-8')
+    code = subprocess.check_output(
+        ['git', 'show', f'{baseline_ref}:backend/knowledge_storage.py'],
+        cwd=root,
+    ).decode('utf-8')
     storage = types.ModuleType('backend.benchmark_storage')
     storage.__file__ = str(root / 'backend/knowledge_storage.py')
     exec(compile(code, storage.__file__, 'exec'), storage.__dict__)
@@ -23,7 +41,9 @@ else:
 fixture_root = root / '.pytest-tmp/pdf-performance'
 fixture_root.mkdir(parents=True, exist_ok=True)
 storage.KNOWLEDGE_PDF_DIR = fixture_root
-storage.KNOWLEDGE_PDF_PAGE_DIR = fixture_root / ('baseline-pages' if args.baseline else 'updated-pages')
+storage.KNOWLEDGE_PDF_PAGE_DIR = fixture_root / (
+    f'baseline-{baseline_ref[:12]}-pages' if args.baseline else f'candidate-{candidate_ref[:12]}-pages'
+)
 storage.KNOWLEDGE_LIBRARY_PATH = fixture_root / 'library.json'
 files = []
 for count in [10, 50, 120]:

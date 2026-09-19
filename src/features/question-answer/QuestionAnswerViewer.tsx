@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ReaderWorkspaceLayout } from '../pdf-workspace/components/ReaderWorkspaceLayout'
+import { openPdfPreviewFromBuffer } from '../../lib/pdf'
+import { DisposablePdfPreviewPromiseCache } from '../../lib/pdf-core/disposableCache'
 import { userAnswerAssetUrl, type QuestionAnswerIdentity } from '../../lib/userAnswers'
 import { useQuestionAnswer } from './useQuestionAnswer'
 import { AttemptHistoryTray } from './AttemptHistoryTray'
 import { GradingInspector, gradingSummaryOf } from './GradingInspector'
 import { ReaderSegmentedControl } from './ReaderSegmentedControl'
-import { UserAnswerPdfPreview, type UserAnswerPdfPreviewCache } from './UserAnswerPdfPreview'
+import { UserAnswerPdfPreview } from './UserAnswerPdfPreview'
 import './question-answer.css'
 
 const ACCEPTED_ANSWERS = 'application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp'
+type PdfPreviewResult = Awaited<ReturnType<typeof openPdfPreviewFromBuffer>>
 
 export function QuestionAnswerViewer({
   children,
@@ -52,7 +55,7 @@ export function QuestionAnswerViewer({
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
   const [previewImage, setPreviewImage] = useState<string | null>(null)
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
-  const pdfPreviewCacheRef = useRef<UserAnswerPdfPreviewCache>(new Map())
+  const pdfPreviewCacheRef = useRef(new DisposablePdfPreviewPromiseCache<PdfPreviewResult>(6))
   const identityKey = `${courseId}:${sourceDocumentId}:${questionId}`
 
   useEffect(() => {
@@ -62,6 +65,8 @@ export function QuestionAnswerViewer({
     setPreviewImage(null)
     pdfPreviewCacheRef.current.clear()
   }, [identityKey])
+
+  useEffect(() => () => pdfPreviewCacheRef.current.clear(), [])
 
   const selectedSummary = attempts.find((attempt) => attempt.id === selectedAttemptId) ?? attempts[0] ?? null
   const selected = selectedSummary ? details[selectedSummary.id] ?? null : null

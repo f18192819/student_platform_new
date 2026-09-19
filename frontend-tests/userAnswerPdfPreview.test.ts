@@ -115,3 +115,14 @@ test('answer viewer uses readonly PDF.js preview without iframe or visible asset
   assert.match(viewer, /assetKey=\{`\$\{selected\.id\}:\$\{selectedAsset\.id\}`\}/)
   assert.match(viewer, /cache=\{pdfPreviewCacheRef\.current\}/)
 })
+
+test('answer PDF preview uses a bounded disposable cache', () => {
+  const preview = readFileSync(
+    'src/features/question-answer/UserAnswerPdfPreview.tsx', 'utf8',
+  )
+  const viewer = readFileSync(
+    'src/features/question-answer/QuestionAnswerViewer.tsx', 'utf8',
+  )
+  assert.match(preview, /new DisposablePdfPreviewPromiseCache<PdfPreviewResult>\(6\)/)
+  assert.match(viewer, /pdfPreviewCacheRef\.current\.clear\(\)/)
+})

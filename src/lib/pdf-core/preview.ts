@@ -158,6 +158,7 @@ export async function extractPdfPreviewFromBuffer(buffer: ArrayBuffer, fileName:
       height: result.pageHeight,
     })),
     getPage: (pageNumber: number) => pdf.getPage(pageNumber),
+    dispose: () => pdf.loadingTask.destroy(),
   }
 
   return {

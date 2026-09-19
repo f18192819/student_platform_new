@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { PdfPreviewCanvas } from '../../components/PdfPreviewCanvas'
 import { openPdfPreviewFromBuffer } from '../../lib/pdf'
+import { DisposablePdfPreviewPromiseCache } from '../../lib/pdf-core/disposableCache'
 import {
   clampPdfPage,
   clampPdfZoom,
@@ -9,7 +10,7 @@ import {
 } from './userAnswerPdfPreviewModel'
 
 type PdfPreviewResult = Awaited<ReturnType<typeof openPdfPreviewFromBuffer>>
-export type UserAnswerPdfPreviewCache = Map<string, Promise<PdfPreviewResult>>
+type UserAnswerPdfPreviewCache = DisposablePdfPreviewPromiseCache<PdfPreviewResult>
 
 export function UserAnswerPdfPreview({ url, fileName, assetKey, cache }: {
   url: string
@@ -17,7 +18,7 @@ export function UserAnswerPdfPreview({ url, fileName, assetKey, cache }: {
   assetKey: string
   cache?: UserAnswerPdfPreviewCache
 }) {
-  const localCacheRef = useRef<UserAnswerPdfPreviewCache>(new Map())
+  const localCacheRef = useRef<UserAnswerPdfPreviewCache>(new DisposablePdfPreviewPromiseCache<PdfPreviewResult>(6))
   const previewCache = cache ?? localCacheRef.current
   const [preview, setPreview] = useState<PdfPreviewResult | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
@@ -67,6 +68,10 @@ export function UserAnswerPdfPreview({ url, fileName, assetKey, cache }: {
       }
     }
   }, [assetKey, fileName, previewCache, url])
+
+  useEffect(() => () => {
+    if (!cache) localCacheRef.current.clear()
+  }, [cache])
 
   if (isLoading) {
     return <div className="user-answer-pdf-preview__status">正在加载 PDF…</div>

@@ -57,3 +57,9 @@ test('zoom can exceed 100 percent while preserving the current reading anchor', 
   assert.match(canvasSource, /runZoomCommand\(onZoomIn\)/)
   assert.match(canvasSource, /pendingViewportAnchorRef\.current = captureViewportAnchor\(\)/)
 })
+
+test('mixed-size geometry prefetch waits for visual ready and preserves the viewport anchor', () => {
+  assert.match(canvasSource, /visualPages\.pages\.has\(currentPage\)[\s\S]*prefetchPdfPageSizes/)
+  assert.match(canvasSource, /pendingViewportAnchorRef\.current = captureViewportAnchor\w*\(\)[\s\S]*setGeometryVersion/)
+  assert.match(canvasSource, /\[geometryVersion, zoom\]/)
+})

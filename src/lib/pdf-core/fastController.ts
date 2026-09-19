@@ -17,6 +17,20 @@ export async function createFastPdfController(pdf: PDFDocumentProxy, options: Fa
     pageSizes[number - 1] = { width: viewport.width, height: viewport.height }
     return page
   }
+  const pageSizePromises = new Map<number, Promise<PdfPageSize>>()
+  const getPageSize = (number: number) => {
+    const known = pageSizes[number - 1]
+    if (known) return Promise.resolve(known)
+    const pending = pageSizePromises.get(number)
+    if (pending) return pending
+    const task = getPage(number).then(() => pageSizes[number - 1]!)
+    pageSizePromises.set(number, task)
+    void task.then(
+      () => pageSizePromises.delete(number),
+      () => pageSizePromises.delete(number),
+    )
+    return task
+  }
   const initialPage = Math.max(1, Math.min(pdf.numPages, Math.trunc(options.initialPage || 1)))
   // Only the page being opened can gate readiness. No text or all-page scan.
   if (!pageSizes[initialPage - 1]) await getPage(initialPage)
@@ -26,10 +40,7 @@ export async function createFastPdfController(pdf: PDFDocumentProxy, options: Fa
     pageSizes,
     defaultPageSize: pageSizes[initialPage - 1]!,
     getPage,
-    getPageSize: async number => {
-      if (!pageSizes[number - 1]) await getPage(number)
-      return pageSizes[number - 1]!
-    },
+    getPageSize,
     dispose: () => pdf.loadingTask.destroy(),
   }
 }

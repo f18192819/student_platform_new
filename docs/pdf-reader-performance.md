@@ -88,7 +88,7 @@ PDF 保存以及 MinerU/layout 更新后，后台单 worker、有限队列地预
 
 ## 14. Frontend tests
 
-`npm.cmd run test:frontend`：67/67 通过。新增覆盖 fast controller 只请求初始页、当前/下一/上一调度顺序、上传不再走全量 extraction、存在 raster 时 PDF.js 仍先渲染等行为。
+`npm.cmd run test:frontend`：74/74 通过。新增覆盖 fast controller 只请求初始页、当前/下一/上一调度顺序、上传不再走全量 extraction、存在 raster 时 PDF.js 仍先渲染，以及本轮 soft gate、controller dispose、page-size prefetch 与 mixed-size anchor 等行为。
 
 ## 15. Backend tests
 
@@ -97,3 +97,12 @@ PDF 保存以及 MinerU/layout 更新后，后台单 worker、有限队列地预
 ## 视觉与响应式 QA
 
 使用 120 页文档检查 1440×1000 与 390×844 viewport：document/body 横向溢出均为 0；首屏完成后只挂载第 1、2 页 canvas，对应 priority 0、1。截图保存在 `.pytest-tmp/pdf-reader-desktop.png` 和 `.pytest-tmp/pdf-reader-mobile.png`。
+
+## Stability follow-up
+
+本轮不更新上述历史性能结论，只收尾生命周期、MinerU 恢复能力、混合页面尺寸稳定性与 benchmark 可复现性。
+
+- MinerU hydration 仍优先等待当前页 first visual，但 1,800 ms grace 到期后会放行，Reader 渲染失败不会永久阻断处理。
+- Lecture、Homework 与学生答案 PDF controller 均按 object identity 幂等释放；LRU 淘汰和组件 teardown 会销毁 PDF.js document 资源。
+- 当前页 visual-ready 后才以低优先级预取邻近两页的 geometry，顺序为 `+1, -1, +2, -2`，不会进入 first-paint critical path。
+- `scripts/pdf_performance_server.py --baseline` 默认固定读取 `c7225717a82b0bf4025ee3e87a3c00c7506ba3d5`，也可用 `--baseline-ref` 或 `PDF_BENCH_BASELINE_REF` 覆盖。启动输出同时记录解析后的 baseline ref 与当前 candidate HEAD。

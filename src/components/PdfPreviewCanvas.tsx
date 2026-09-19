@@ -4,6 +4,7 @@ import { useLayoutEffect } from 'react'
 import { useEffectEvent } from 'react'
 import { pdfPageRenderPriority } from '../lib/pdf-core/renderPriority'
 import { pdfMark } from '../lib/pdf-core/performance'
+import { prefetchPdfPageSizes } from '../lib/pdf-core/pageSizePrefetch'
 import type {
   ClassroomLectureSegment,
   HomeworkKnowledgeLink,
@@ -17,6 +18,12 @@ import type {
 } from '../features/pdf-annotations/pdfAnnotationStore'
 
 const BASE_RENDER_SCALE = 1.35
+const PAGE_SIZE_PREFETCH_RADIUS = 2
+
+type IdleWindow = typeof window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number
+  cancelIdleCallback?: (handle: number) => void
+}
 
 type PendingPageNavigation = {
   pageNumber: number
@@ -1840,7 +1847,10 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const visibleQuestionIdRef = useRef<string | null>(null)
   const previousPdfControllerRef = useRef<PdfController | null>(null)
   const questionAnchorTimerRef = useRef<number | null>(null)
+  const pageSizePrefetchTimerRef = useRef<number | null>(null)
+  const prefetchedGeometryPagesRef = useRef(new Set<number>())
   const [viewportWidth, setViewportWidth] = useState(0)
+  const [geometryVersion, setGeometryVersion] = useState(0)
   const [visualPages, setVisualPages] = useState<{ controller: PdfController | null; pages: Set<number> }>({ controller: null, pages: new Set() })
   const isPageVisualReady = (number: number) => visualPages.controller === pdfController && visualPages.pages.has(number)
     && Boolean(pageRefs.current.get(number)?.querySelector('[data-visual-ready="true"]'))
@@ -1852,7 +1862,9 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     if (number === currentPage || number === currentPage + 1) {
       pdfMark('prefetch-release', number)
     }
-    if (number === currentPage) onVisualReady?.(number)
+    if (number === currentPage) {
+      onVisualReady?.(number)
+    }
   }
   const [renderError, setRenderError] = useState<string | null>(null)
   const requestVisiblePageChange = useEffectEvent((pageNumber: number) => {
@@ -1890,6 +1902,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       previousSelectedQuestionIdRef.current = null
       visibleQuestionIdRef.current = null
       reportedVisiblePageRef.current = currentPageRef.current
+      prefetchedGeometryPagesRef.current.clear()
     }
     pageRefs.current.clear()
     renderedPagesRef.current.clear()
@@ -1951,6 +1964,48 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       behavior: 'auto',
     })
   }
+  const captureViewportAnchorEvent = useEffectEvent(captureViewportAnchor)
+
+  useEffect(() => {
+    const prefetchedGeometryPages = prefetchedGeometryPagesRef.current
+    if (
+      !pdfController?.getPageSize ||
+      visualPages.controller !== pdfController ||
+      !visualPages.pages.has(currentPage) ||
+      !pageRefs.current.get(currentPage)?.querySelector('[data-visual-ready=true]') ||
+      prefetchedGeometryPages.has(currentPage)
+    ) {
+      return
+    }
+
+    prefetchedGeometryPages.add(currentPage)
+    let started = false
+    const runPrefetch = () => {
+      started = true
+      pageSizePrefetchTimerRef.current = null
+      void prefetchPdfPageSizes(pdfController, currentPage, PAGE_SIZE_PREFETCH_RADIUS).then((pages) => {
+        if (!pages.length || previousPdfControllerRef.current !== pdfController) return
+        pendingViewportAnchorRef.current = captureViewportAnchorEvent()
+        setGeometryVersion((version) => version + 1)
+      })
+    }
+    const idleWindow = window as IdleWindow
+    const timer = idleWindow.requestIdleCallback
+      ? idleWindow.requestIdleCallback(runPrefetch, { timeout: 600 })
+      : window.setTimeout(runPrefetch, 0)
+    pageSizePrefetchTimerRef.current = timer
+
+    return () => {
+      if (started) return
+      if (idleWindow.cancelIdleCallback) {
+        idleWindow.cancelIdleCallback(timer)
+      } else {
+        window.clearTimeout(timer)
+      }
+      pageSizePrefetchTimerRef.current = null
+      prefetchedGeometryPages.delete(currentPage)
+    }
+  }, [currentPage, pdfController, visualPages])
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current
@@ -2004,7 +2059,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     if (!anchor) return
     pendingViewportAnchorRef.current = null
     restoreViewportAnchor(anchor)
-  }, [zoom])
+  }, [geometryVersion, zoom])
 
   const runZoomCommand = (command: () => void) => {
     pendingViewportAnchorRef.current = captureViewportAnchor()
