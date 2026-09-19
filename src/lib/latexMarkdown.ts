@@ -1,4 +1,5 @@
 const PROTECTED_MARKDOWN = /```[\s\S]*?```|`[^`\n]*`|\$\$[\s\S]*?\$\$|\$(?!\$)(?:\\.|[^$\n])+\$/g
+const CHAT_CODE_MARKDOWN = /```[\s\S]*?```|`[^`\n]*`/g
 const DISPLAY_ENVIRONMENT = /\\begin\s*\{(array|aligned|alignedat|cases|gathered|matrix|pmatrix|bmatrix|vmatrix|Vmatrix)\}[\s\S]*?\\end\s*\{\1\}/g
 const RAW_INLINE_LATEX = /(^|[\u3400-\u9fff\uE000-\uF8FF，。；：！？、“”‘’])([^\u3400-\u9fff\uE000-\uF8FF，。；：！？、“”‘’\n]*\\[A-Za-z]+[^\u3400-\u9fff\uE000-\uF8FF，。；：！？、“”‘’\n]*)/gm
 const PLACEHOLDER = '\uE000LATEX_MARKDOWN_'
@@ -125,4 +126,12 @@ export function prepareMineruMarkdownMath(value: string) {
 /** Normalize legacy assessment pseudo-math before passing it to remark-math. */
 export function prepareAssessmentMarkdownMath(value: string) {
   return wrapPlainAssessmentEquations(prepareMineruMarkdownMath(value))
+}
+
+/** Normalize model TeX delimiters without rewriting fenced or inline code. */
+export function prepareChatMarkdownMath(value: string) {
+  const protectedParts: string[] = []
+  const normalized = String(value || '').replace(/\r\n?/g, '\n')
+  const withoutCode = protect(normalized, CHAT_CODE_MARKDOWN, protectedParts)
+  return restore(normalizeTexDelimiters(withoutCode), protectedParts).trim()
 }

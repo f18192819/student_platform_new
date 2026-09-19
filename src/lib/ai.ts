@@ -291,6 +291,58 @@ async function readStreamedMarkdownAnswer(
   return content.trim()
 }
 
+export async function readDeepSeekWebStream(
+  response: Response,
+  handlers?: AskStreamHandlers,
+  onActivity: () => void = () => {},
+) {
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  if (!response.body) throw new Error('Response body is empty.')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  let content = ''
+
+  const consumeLine = (line: string) => {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) return
+    const source = trimmed.slice(5).trim()
+    if (!source || source === '[DONE]') return
+    let payload: { type?: string; content?: string; message?: string }
+    try {
+      payload = JSON.parse(source) as { type?: string; content?: string; message?: string }
+    } catch {
+      return
+    }
+    const next = String(payload.content || '')
+    if (payload.type === 'delta') {
+      content += next
+      emitDeltaText(next, handlers)
+    } else if (payload.type === 'snapshot') {
+      content = next
+      handlers?.onSnapshot?.(content)
+    } else if (payload.type === 'done' && next && next !== content) {
+      content = next
+      handlers?.onSnapshot?.(content)
+    } else if (payload.type === 'error') {
+      throw new Error(payload.message || next || 'DeepSeek Web stream failed.')
+    }
+    onActivity()
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) consumeLine(line)
+  }
+  if (buffer.trim()) consumeLine(buffer)
+  return content.trim()
+}
+
 export async function askWithConfiguredVisionApi(
   question: string,
   documentContext: string | PromptSourceSection[],
@@ -305,6 +357,9 @@ export async function askWithConfiguredVisionApi(
   }
 
   const controller = new AbortController()
+  const abortFromCaller = () => controller.abort(handlers?.signal?.reason ?? 'user-stop')
+  if (handlers?.signal?.aborted) abortFromCaller()
+  else handlers?.signal?.addEventListener('abort', abortFromCaller, { once: true })
   let timeout = 0
   let content = ''
   const imageAttachments = attachments ?? []
@@ -313,8 +368,8 @@ export async function askWithConfiguredVisionApi(
   const responseBudget = resolveModelContextBudget(config, responseModel, 'chat')
 
   const resetTimeout = () => {
-    window.clearTimeout(timeout)
-    timeout = window.setTimeout(() => controller.abort('stream-idle-timeout'), STREAM_IDLE_TIMEOUT_MS)
+    globalThis.clearTimeout(timeout)
+    timeout = globalThis.setTimeout(() => controller.abort('stream-idle-timeout'), STREAM_IDLE_TIMEOUT_MS)
   }
 
   const baseInstruction = [
@@ -328,7 +383,7 @@ export async function askWithConfiguredVisionApi(
       ? 'If any image is blurred, cropped or blocked, explicitly say which part is unclear.'
       : '',
     `User question: ${question}`,
-    'Return Markdown only. Keep the answer concise, structured and grounded in the provided material.',
+    'Return Markdown only. Use $...$ for inline math and $$...$$ for display math. Keep the answer concise, structured and grounded in the provided material.',
   ]
     .filter(Boolean)
     .join('\n\n')
@@ -392,34 +447,61 @@ export async function askWithConfiguredVisionApi(
       ),
       userInstruction,
     ].filter(Boolean).join('\n\n')
-    const response = await fetch(resolveBackendApiUrl('/api/deepseek-web/chat'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
-    })
-    const payload = (await response.json().catch(() => ({}))) as {
-      text?: string
-      detail?: string | { message?: string }
-    }
-    if (!response.ok || !payload.text?.trim()) {
-      const detail = payload.detail
-      const message = typeof detail === 'string' ? detail : detail?.message
-      throw new Error(message || `DeepSeek Web Bridge request failed (HTTP ${response.status}).`)
-    }
-    emitDeltaText(payload.text, handlers)
-    return {
-      answer: payload.text.trim(),
-      evidence: [],
-      keyword: null,
-      mode: 'api',
-      note: 'Answered through the local DeepSeek Web Bridge.',
-      contextUsage: {
-        model: 'deepseek-web',
-        contextWindow: contextPlan.model.contextWindow,
-        estimatedInputTokens: contextPlan.estimatedInputTokens,
-        rawInputTokens: contextPlan.rawInputTokens + rawFixedTokenDelta,
-        wasTruncated: contextPlan.wasTruncated || fixedInputWasTruncated,
-      },
+    try {
+      resetTimeout()
+      let response = await fetch(resolveBackendApiUrl('/api/deepseek-web/chat/stream'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({ prompt }),
+      })
+      if (response.status === 404 || response.status === 405) {
+        response = await fetch(resolveBackendApiUrl('/api/deepseek-web/chat'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ prompt }),
+        })
+        const payload = (await response.json().catch(() => ({}))) as {
+          text?: string
+          detail?: string | { message?: string }
+        }
+        if (!response.ok || !payload.text?.trim()) {
+          const detail = payload.detail
+          const message = typeof detail === 'string' ? detail : detail?.message
+          throw new Error(message || `DeepSeek Web Bridge request failed (HTTP ${response.status}).`)
+        }
+        content = payload.text.trim()
+        emitDeltaText(content, handlers)
+      } else {
+        content = await readDeepSeekWebStream(response, handlers, resetTimeout)
+      }
+      if (!content) throw new Error('No answer content returned.')
+      return {
+        answer: content,
+        evidence: [],
+        keyword: null,
+        mode: 'api',
+        note: 'Answered through the local DeepSeek Web Bridge.',
+        contextUsage: {
+          model: 'deepseek-web',
+          contextWindow: contextPlan.model.contextWindow,
+          estimatedInputTokens: contextPlan.estimatedInputTokens,
+          rawInputTokens: contextPlan.rawInputTokens + rawFixedTokenDelta,
+          wasTruncated: contextPlan.wasTruncated || fixedInputWasTruncated,
+        },
+      }
+    } catch (error) {
+      if (content.trim()) {
+        return {
+          answer: content.trim(), evidence: [], keyword: null, mode: 'api',
+          note: 'Partial DeepSeek Web answer kept.',
+        }
+      }
+      throw error
+    } finally {
+      globalThis.clearTimeout(timeout)
+      handlers?.signal?.removeEventListener('abort', abortFromCaller)
     }
   }
 
@@ -511,7 +593,8 @@ export async function askWithConfiguredVisionApi(
     const message = error instanceof Error ? error.message : 'request failed'
     throw new Error(`API request failed: ${message}`)
   } finally {
-    window.clearTimeout(timeout)
+    globalThis.clearTimeout(timeout)
+    handlers?.signal?.removeEventListener('abort', abortFromCaller)
   }
 }
 

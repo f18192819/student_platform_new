@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Any, Literal, Sequence
+from typing import Any, AsyncIterator, Literal, Sequence
 
 from .browser import PersistentBrowser, SerializedBrowserTasks
 
@@ -87,6 +87,52 @@ class DeepSeekWebClient:
       return await self._wait_and_extract(page, response_format=response_format)
 
     return await self.tasks.run(operation)
+
+  async def chat_stream(self, prompt: str) -> AsyncIterator[dict[str, str]]:
+    async def operation() -> AsyncIterator[dict[str, str]]:
+      page = await self._ready_page()
+      await self._new_chat(page)
+      await self._send_prompt(page, prompt)
+      async for event in self._stream_answer(page):
+        yield event
+
+    async for event in self.tasks.stream(operation):
+      yield event
+
+  @staticmethod
+  def build_stream_event(previous: str, current: str) -> dict[str, str] | None:
+    if not current or current == previous:
+      return None
+    if current.startswith(previous):
+      return {'type': 'delta', 'content': current[len(previous):]}
+    return {'type': 'snapshot', 'content': current}
+
+  async def _stream_answer(self, page) -> AsyncIterator[dict[str, str]]:
+    deadline = asyncio.get_running_loop().time() + self.generation_timeout
+    previous = ''
+    stable_rounds = 0
+    generation_started = False
+    while asyncio.get_running_loop().time() < deadline:
+      stop_visible = await self._stop_button_visible(page)
+      generation_started = generation_started or stop_visible
+      current = await self._latest_answer(page)
+      event = self.build_stream_event(previous, current)
+      if event is not None:
+        previous = current
+        stable_rounds = 0
+        yield event
+      elif current:
+        stable_rounds += 1
+      if previous and not stop_visible and (
+        (generation_started and stable_rounds >= 3) or stable_rounds >= 5
+      ):
+        yield {'type': 'done', 'content': previous}
+        return
+      await page.wait_for_timeout(200)
+    if previous and stable_rounds >= 3:
+      yield {'type': 'done', 'content': previous}
+      return
+    raise BridgeOperationError('generation_timeout', 'DeepSeek 网页生成超时。')
 
   async def ocr(
     self,

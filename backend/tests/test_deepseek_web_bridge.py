@@ -134,6 +134,10 @@ class DeepSeekWebRouterTest(unittest.TestCase):
       self.response_format = response_format
       return f'answer:{prompt}'
 
+    def chat_stream(self, _url, prompt):
+      yield {'type': 'delta', 'content': f'answer:{prompt}'}
+      yield {'type': 'done', 'content': f'answer:{prompt}'}
+
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
   })
@@ -141,6 +145,17 @@ class DeepSeekWebRouterTest(unittest.TestCase):
     client = TestClient(create_app_with_router(create_deepseek_web_router(self.FakeClient())))
     self.assertTrue(client.get('/api/deepseek-web/status').json()['logged_in'])
     self.assertEqual('answer:why', client.post('/api/deepseek-web/chat', json={'prompt': 'why'}).json()['text'])
+
+  @patch('backend.deepseek_web_router.load_api_config', return_value={
+    'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
+  })
+  def test_stream_proxy_contract(self, _load):
+    client = TestClient(create_app_with_router(create_deepseek_web_router(self.FakeClient())))
+    response = client.post('/api/deepseek-web/chat/stream', json={'prompt': 'why'})
+
+    self.assertEqual(200, response.status_code)
+    self.assertIn('"type": "delta"', response.text)
+    self.assertIn('answer:why', response.text)
 
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
@@ -307,6 +322,16 @@ class SerializedBrowserTasksTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual('{"questions": [], "unassigned_blocks": []}', result)
 
+  def test_stream_event_uses_delta_for_append_and_snapshot_for_dom_rewrite(self):
+    self.assertEqual(
+      {'type': 'delta', 'content': 'def'},
+      DeepSeekWebClient.build_stream_event('abc', 'abcdef'),
+    )
+    self.assertEqual(
+      {'type': 'snapshot', 'content': 'rewritten'},
+      DeepSeekWebClient.build_stream_event('abcdef', 'rewritten'),
+    )
+
 
 class BridgeHttpApiTest(unittest.TestCase):
   class FakeBrowserClient:
@@ -327,6 +352,11 @@ class BridgeHttpApiTest(unittest.TestCase):
     async def chat(self, prompt, response_format='text'):
       self.response_format = response_format
       return f'web:{prompt}'
+
+    async def chat_stream(self, prompt):
+      yield {'type': 'delta', 'content': 'web:'}
+      yield {'type': 'delta', 'content': prompt}
+      yield {'type': 'done', 'content': f'web:{prompt}'}
 
     async def ocr(self, paths, prompt='', response_format='text'):
       self.ocr_names = [path.name for path in paths]
@@ -352,6 +382,15 @@ class BridgeHttpApiTest(unittest.TestCase):
     self.assertEqual(2, response.json()['page_count'])
     self.assertEqual(['001.png', '002.jpg'], fake.ocr_names)
     self.assertEqual('text', fake.ocr_response_format)
+
+  def test_chat_stream_endpoint_emits_sse_events(self):
+    with TestClient(create_bridge_app(self.FakeBrowserClient())) as client:
+      response = client.post('/v1/chat/stream', json={'prompt': 'hello'})
+
+    self.assertEqual(200, response.status_code)
+    self.assertEqual('text/event-stream; charset=utf-8', response.headers['content-type'])
+    self.assertIn('"type": "delta"', response.text)
+    self.assertIn('web:hello', response.text)
 
   def test_capability_error_remains_stable(self):
     class Unsupported(self.FakeBrowserClient):

@@ -1,9 +1,7 @@
 import type { AskStreamHandlers } from '../../types'
 
 export function emitDeltaText(delta: string, handlers?: AskStreamHandlers) {
-  for (const char of delta) {
-    handlers?.onToken?.(char)
-  }
+  if (delta) handlers?.onToken?.(delta)
 }
 
 function extractJsonArray(text: string) {

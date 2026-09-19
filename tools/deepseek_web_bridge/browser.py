@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 
 T = TypeVar('T')
@@ -17,6 +17,11 @@ class SerializedBrowserTasks:
   async def run(self, operation: Callable[[], Awaitable[T]]) -> T:
     async with self._lock:
       return await operation()
+
+  async def stream(self, operation: Callable[[], AsyncIterator[T]]) -> AsyncIterator[T]:
+    async with self._lock:
+      async for item in operation():
+        yield item
 
 
 class PersistentBrowser:

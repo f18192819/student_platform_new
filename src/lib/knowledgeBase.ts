@@ -13,11 +13,12 @@
   KnowledgeLibraryFolderType,
   KnowledgeFile,
   KnowledgeLibrary,
+  ReaderChatSession,
   StructuredDocumentBlock,
   StoredDoubtAnnotation,
 } from '../types'
 import { resolveBackendApiUrl } from './apiConfig'
-import { normalizeDoubtChatSession } from './chatMemory'
+import { migrateReaderChatSessions, normalizeDoubtChatSession } from './chatMemory'
 import {
   createKnowledgeCourseRecord,
   findKnowledgeCourseByInput,
@@ -492,6 +493,12 @@ function normalizeHomeworkDocument(document: Partial<HomeworkDocument>): Homewor
       } satisfies HomeworkKnowledgeLink
     })
     .filter((link) => link.questionId && link.conceptTitle && link.lectureAnchorText)
+  const readerChatState = migrateReaderChatSessions({
+    documentId,
+    sessions: document.readerChatSessions,
+    activeSessionId: document.activeChatSessionId,
+    annotations,
+  })
 
   return {
     id: documentId,
@@ -524,6 +531,8 @@ function normalizeHomeworkDocument(document: Partial<HomeworkDocument>): Homewor
     questions,
     knowledgeLinks,
     annotations,
+    readerChatSessions: readerChatState.sessions,
+    activeChatSessionId: readerChatState.activeSessionId,
     errorMessage: document.errorMessage ? String(document.errorMessage) : null,
     createdAt: document.createdAt ?? now,
     updatedAt: document.updatedAt ?? document.createdAt ?? now,
@@ -588,9 +597,18 @@ function normalizeLibraryFile(file: Partial<KnowledgeFile>): KnowledgeFile {
         normalizeClassroomSession(session as Partial<ClassroomSession>),
       )
     : []
+  const fileId = file.id ?? crypto.randomUUID()
+  const legacyChatMessages = Array.isArray(file.chatMessages) ? file.chatMessages : []
+  const readerChatState = migrateReaderChatSessions({
+    documentId: fileId,
+    sessions: file.readerChatSessions,
+    activeSessionId: file.activeChatSessionId,
+    annotations,
+    legacyMessages: legacyChatMessages,
+  })
 
   return {
-    id: file.id ?? crypto.randomUUID(),
+    id: fileId,
     sourceKey: file.sourceKey ?? buildSourceKey(file.fileName ?? 'untitled.pdf', file.byteSize ?? 0),
     courseId: String(file.courseId || DEFAULT_COURSE_ID).trim() || DEFAULT_COURSE_ID,
     fileName: String(file.fileName || '未命名文件').trim() || '未命名文件',
@@ -611,7 +629,9 @@ function normalizeLibraryFile(file: Partial<KnowledgeFile>): KnowledgeFile {
     updatedAt: file.updatedAt ?? new Date().toISOString(),
     lastOpenedAt: file.lastOpenedAt ?? new Date().toISOString(),
     annotations,
-    chatMessages: Array.isArray(file.chatMessages) ? file.chatMessages : [],
+    chatMessages: legacyChatMessages,
+    readerChatSessions: readerChatState.sessions,
+    activeChatSessionId: readerChatState.activeSessionId,
     homeworkDocuments: dedupeHomeworkDocuments(homeworkDocuments),
     classroomSessions,
     libraryFolder: file.libraryFolder === 'other' ? 'other' : 'courseware',
@@ -1208,6 +1228,53 @@ export function saveKnowledgeChatMessages(fileId: string, chatMessages: ChatMess
     chatMessages,
     updatedAt: now,
     lastOpenedAt: now,
+  }))
+}
+
+export function saveKnowledgeReaderChatState(
+  fileId: string,
+  readerChatSessions: ReaderChatSession[],
+  activeChatSessionId: string,
+) {
+  const now = new Date().toISOString()
+  updateLibraryFile(fileId, (file) => ({
+    ...file,
+    readerChatSessions,
+    activeChatSessionId,
+    updatedAt: now,
+    lastOpenedAt: now,
+  }))
+}
+
+export function saveKnowledgeHomeworkReaderChatState(
+  courseId: string,
+  folderType: KnowledgeHomeworkFolderType,
+  homeworkDocumentId: string,
+  readerChatSessions: ReaderChatSession[],
+  activeChatSessionId: string,
+) {
+  const now = new Date().toISOString()
+  updateLibraryCourse(courseId, (course) => ({
+    ...course,
+    homeworkFolders: course.homeworkFolders.map((folder) =>
+      folder.folderType === folderType
+        ? {
+            ...folder,
+            homeworkDocuments: folder.homeworkDocuments.map((document) =>
+              document.id === homeworkDocumentId
+                ? {
+                    ...document,
+                    readerChatSessions,
+                    activeChatSessionId,
+                    updatedAt: now,
+                  }
+                : document,
+            ),
+            updatedAt: now,
+          }
+        : folder,
+    ),
+    updatedAt: now,
   }))
 }
 

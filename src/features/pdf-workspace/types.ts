@@ -1,4 +1,4 @@
-import type { ChatMessage, HomeworkKnowledgeLink, HomeworkQuestion } from '../../types'
+import type { ChatMessage, ChatReference, HomeworkKnowledgeLink, HomeworkQuestion } from '../../types'
 
 export type DraftDoubt = {
   id: string
@@ -11,11 +11,8 @@ export type ComposerAttachment = {
   name: string
   dataUrl?: string
   contentText?: string
-  blockReference?: {
-    blockId: string
-    pageNumber: number
+  blockReference?: ChatReference & {
     viewer: 'lecture' | 'homework'
-    documentId?: string | null
   }
 }
 

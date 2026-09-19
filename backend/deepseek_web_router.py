@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
+from fastapi.responses import StreamingResponse
 
 from .deepseek_web_bridge import DeepSeekWebBridgeClient, DeepSeekWebBridgeError
 from .deepseek_web_process import (
@@ -67,6 +69,22 @@ def create_deepseek_web_router(
       response_format=response_format,
     )
     return {'text': text, 'provider': 'deepseek-web'}
+
+  @router.post('/chat/stream')
+  async def chat_stream(payload: dict[str, Any] = Body(...)):
+    prompt = str(payload.get('prompt') or '').strip()
+    if not prompt:
+      raise HTTPException(status_code=422, detail='prompt is required.')
+
+    def events():
+      try:
+        for event in bridge.chat_stream(bridge_url(payload), prompt):
+          yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
+      except DeepSeekWebBridgeError as exc:
+        event = {'type': 'error', 'content': '', 'message': str(exc), 'code': exc.code}
+        yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
+
+    return StreamingResponse(events(), media_type='text/event-stream')
 
   return router
 

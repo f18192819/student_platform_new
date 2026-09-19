@@ -2,7 +2,10 @@ import type {
   ApiConfig,
   ChatCompactionPoint,
   ChatMessage,
+  ChatReference,
   DoubtChatSession,
+  ReaderChatSession,
+  StoredDoubtAnnotation,
 } from '../types'
 import { resolveModelContextBudget } from './modelCapabilities'
 import { estimateChatMessageTokens } from './tokenEstimator'
@@ -33,6 +36,39 @@ function normalizeMessage(value: unknown): ChatMessage | null {
     content,
     ...(typeof partial.createdAt === 'string' ? { createdAt: partial.createdAt } : {}),
     ...(partial.isSummary === true ? { isSummary: true } : {}),
+    ...(Array.isArray(partial.references)
+      ? {
+          references: partial.references
+            .map(normalizeChatReference)
+            .filter((reference): reference is ChatReference => reference !== null),
+        }
+      : {}),
+  }
+}
+
+function normalizeChatReference(value: unknown): ChatReference | null {
+  if (!value || typeof value !== 'object') return null
+  const partial = value as Partial<ChatReference>
+  const sourceType = partial.sourceType
+  const documentId = String(partial.documentId || '').trim()
+  if (
+    !documentId ||
+    (sourceType !== 'lecture' && sourceType !== 'homework' && sourceType !== 'past-exam')
+  ) {
+    return null
+  }
+  return {
+    id: String(partial.id || `reference-${documentId}-${partial.pageNumber ?? 'unknown'}`),
+    sourceType,
+    documentId,
+    documentName: String(partial.documentName || '未命名文档'),
+    pageNumber: Number.isFinite(Number(partial.pageNumber)) ? Number(partial.pageNumber) : null,
+    ...(typeof partial.blockId === 'string' || partial.blockId === null
+      ? { blockId: partial.blockId }
+      : {}),
+    ...(typeof partial.label === 'string' ? { label: partial.label } : {}),
+    ...(partial.kind ? { kind: partial.kind } : {}),
+    excerpt: String(partial.excerpt || '').trim(),
   }
 }
 
@@ -46,13 +82,14 @@ function normalizeCompactionPoint(value: unknown): ChatCompactionPoint | null {
   return { summaryMessageId, boundaryMessageId, createdAt }
 }
 
-export function normalizeDoubtChatSession(
+export function normalizeReaderChatSession(
   value: unknown,
   sessionId: string,
   legacyMessages: ChatMessage[] = [],
-): DoubtChatSession {
+  fallbackTitle = '新对话',
+): ReaderChatSession {
   const partial = value && typeof value === 'object'
-    ? value as Partial<DoubtChatSession>
+    ? value as Partial<ReaderChatSession>
     : null
   const messages = Array.isArray(partial?.messages)
     ? partial.messages.map(normalizeMessage).filter((message): message is ChatMessage => message !== null)
@@ -63,13 +100,97 @@ export function normalizeDoubtChatSession(
         .filter((point): point is ChatCompactionPoint => point !== null)
     : []
 
+  const now = new Date().toISOString()
   return {
     id: String(partial?.id || sessionId).trim() || sessionId,
+    title: String(partial?.title || fallbackTitle).trim() || fallbackTitle,
     messages,
     compactionPoints,
+    createdAt: typeof partial?.createdAt === 'string'
+      ? partial.createdAt
+      : typeof partial?.updatedAt === 'string'
+        ? partial.updatedAt
+        : now,
     updatedAt: typeof partial?.updatedAt === 'string'
       ? partial.updatedAt
-      : new Date().toISOString(),
+      : now,
+  }
+}
+
+export const normalizeDoubtChatSession = normalizeReaderChatSession
+
+export function createReaderChatSession(documentId: string, title = '新对话'): ReaderChatSession {
+  const now = new Date().toISOString()
+  return {
+    id: `${documentId}-reader-chat-${crypto.randomUUID()}`,
+    title,
+    messages: [],
+    compactionPoints: [],
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+export function deriveReaderChatTitle(question: string) {
+  const normalized = question.replace(/\s+/g, ' ').trim()
+  if (!normalized) return '新对话'
+  return normalized.length > 28 ? `${normalized.slice(0, 28)}…` : normalized
+}
+
+export function migrateReaderChatSessions({
+  documentId,
+  sessions,
+  activeSessionId,
+  annotations = [],
+  legacyMessages = [],
+}: {
+  documentId: string
+  sessions?: ReaderChatSession[] | null
+  activeSessionId?: string | null
+  annotations?: StoredDoubtAnnotation[]
+  legacyMessages?: ChatMessage[]
+}) {
+  const migrated: ReaderChatSession[] = []
+  const seenIds = new Set<string>()
+  const push = (session: ReaderChatSession) => {
+    if (!session.id || seenIds.has(session.id)) return
+    seenIds.add(session.id)
+    migrated.push(session)
+  }
+
+  for (const session of sessions ?? []) {
+    push(normalizeReaderChatSession(session, session.id || `${documentId}-reader-chat-default`))
+  }
+
+  for (const annotation of annotations) {
+    if (!annotation.chatSession) continue
+    const sessionId = `legacy-annotation-${annotation.id}`
+    push({
+      ...normalizeReaderChatSession(annotation.chatSession, sessionId, [], annotation.question),
+      id: sessionId,
+    })
+  }
+
+  const realLegacyMessages = legacyMessages.filter(isConversationMessage)
+  const hasUserMessage = realLegacyMessages.some((message) => message.role === 'user')
+  if (hasUserMessage) {
+    push(normalizeReaderChatSession(
+      null,
+      `legacy-chat-${documentId}`,
+      realLegacyMessages,
+      '历史对话',
+    ))
+  }
+
+  if (!migrated.length) {
+    push(normalizeReaderChatSession(null, `${documentId}-reader-chat-default`))
+  }
+
+  return {
+    sessions: migrated,
+    activeSessionId: migrated.some((session) => session.id === activeSessionId)
+      ? activeSessionId!
+      : migrated[0].id,
   }
 }
 
@@ -88,6 +209,8 @@ export function appendDoubtChatMessages(
   }
 }
 
+export const appendReaderChatMessages = appendDoubtChatMessages
+
 export function updateDoubtChatMessage(
   session: DoubtChatSession,
   messageId: string,
@@ -101,6 +224,8 @@ export function updateDoubtChatMessage(
     updatedAt: new Date().toISOString(),
   }
 }
+
+export const updateReaderChatMessage = updateDoubtChatMessage
 
 export function findLatestApplicableCompactionPoint(
   session: DoubtChatSession,
@@ -134,12 +259,29 @@ export function buildDoubtChatContext(
       : completed.filter((message) => !message.isSummary)
   }
 
-  if (maxMessages >= context.length) return context.map((message) => ({ ...message }))
+  if (maxMessages >= context.length) return context.map(withReferenceContext)
   const summary = context[0]?.isSummary ? context[0] : null
   const tailLimit = Math.max(1, maxMessages - (summary ? 1 : 0))
   const tail = context.filter((message) => !message.isSummary).slice(-tailLimit)
-  return summary ? [{ ...summary }, ...tail.map((message) => ({ ...message }))] : tail
+  return summary ? [withReferenceContext(summary), ...tail.map(withReferenceContext)] : tail.map(withReferenceContext)
 }
+
+function withReferenceContext(message: ChatMessage): ChatMessage {
+  if (!message.references?.length) return { ...message }
+  const referenceContext = message.references
+    .map((reference) => {
+      const page = reference.pageNumber === null ? '页码未知' : `第 ${reference.pageNumber} 页`
+      const location = [reference.documentName, page, reference.label].filter(Boolean).join(' · ')
+      return `- ${location}${reference.excerpt ? `\n  ${reference.excerpt}` : ''}`
+    })
+    .join('\n')
+  return {
+    ...message,
+    content: `${message.content}\n\n[本条消息的显式引用]\n${referenceContext}`,
+  }
+}
+
+export const buildReaderChatContext = buildDoubtChatContext
 
 export function getDoubtChatCompactionDecision(
   session: DoubtChatSession,
@@ -165,6 +307,8 @@ export function shouldCompactDoubtChatSession(
 ) {
   return getDoubtChatCompactionDecision(session, config, modelId).shouldCompact
 }
+
+export const shouldCompactReaderChatSession = shouldCompactDoubtChatSession
 
 export function commitDoubtChatSummary(
   session: DoubtChatSession,
@@ -201,3 +345,5 @@ export function commitDoubtChatSummary(
     updatedAt: new Date().toISOString(),
   }
 }
+
+export const commitReaderChatSummary = commitDoubtChatSummary

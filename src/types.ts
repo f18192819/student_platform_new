@@ -24,6 +24,8 @@ export type AskAnswer = {
 
 export type AskStreamHandlers = {
   onToken?: (chunk: string) => void
+  onSnapshot?: (content: string) => void
+  signal?: AbortSignal
 }
 
 export type AskImageAttachment = {
@@ -37,6 +39,19 @@ export type ChatMessage = {
   content: string
   createdAt?: string
   isSummary?: boolean
+  references?: ChatReference[]
+}
+
+export type ChatReference = {
+  id: string
+  sourceType: 'lecture' | 'homework' | 'past-exam'
+  documentId: string
+  documentName: string
+  pageNumber: number | null
+  blockId?: string | null
+  label?: string
+  kind?: StructuredDocumentBlock['kind']
+  excerpt: string
 }
 
 export type ChatCompactionPoint = {
@@ -45,12 +60,16 @@ export type ChatCompactionPoint = {
   createdAt: number
 }
 
-export type DoubtChatSession = {
+export type ReaderChatSession = {
   id: string
+  title: string
   messages: ChatMessage[]
   compactionPoints: ChatCompactionPoint[]
+  createdAt: string
   updatedAt: string
 }
+
+export type DoubtChatSession = ReaderChatSession
 
 export type DoubtAnnotation = {
   id: string
@@ -138,6 +157,8 @@ export type HomeworkDocument = {
   questions: HomeworkQuestion[]
   knowledgeLinks: HomeworkKnowledgeLink[]
   annotations: StoredDoubtAnnotation[]
+  readerChatSessions?: ReaderChatSession[]
+  activeChatSessionId?: string | null
   errorMessage: string | null
   createdAt: string
   updatedAt: string
@@ -173,6 +194,8 @@ export type KnowledgeFile = {
   lastOpenedAt: string
   annotations: StoredDoubtAnnotation[]
   chatMessages: ChatMessage[]
+  readerChatSessions?: ReaderChatSession[]
+  activeChatSessionId?: string | null
   homeworkDocuments: HomeworkDocument[]
   classroomSessions: ClassroomSession[]
   libraryFolder?: KnowledgeLibraryFolderType

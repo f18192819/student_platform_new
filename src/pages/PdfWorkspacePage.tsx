@@ -1,11 +1,11 @@
 ﻿import {
   startTransition,
   useCallback,
-  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type SetStateAction,
 } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { PdfPreviewCanvas } from '../components/PdfPreviewCanvas'
@@ -26,18 +26,14 @@ import { usePageLecturePlayback } from '../features/pdf-workspace/hooks/usePageL
 import { useRelatedMaterials } from '../features/pdf-workspace/hooks/useRelatedMaterials'
 import type {
   ComposerAttachment,
-  DraftDoubt,
   HomeworkFocus,
   RelatedMaterialCard,
   ViewerSource,
 } from '../features/pdf-workspace/types'
 import {
-  appendRelatedQuestionId,
-  buildAnnotationConversation,
   buildHomeworkContextMarkdown,
   buildLectureConversation,
   buildStructuredPageContext,
-  createDraftDoubt,
   createMessage,
   DEFAULT_DOCUMENT_NAME,
   emitLessonProcessingState,
@@ -68,32 +64,28 @@ import {
   ensureKnowledgeLibraryLoaded,
   getKnowledgeFile,
   getKnowledgeHomeworkDocumentsByCourseFolder,
-  getKnowledgeHomeworkFolderName,
-  linkQuestionToAnnotation,
-  linkQuestionToHomeworkAnnotation,
   loadKnowledgeHomeworkAsset,
   loadKnowledgePdfSource,
   resolveKnowledgePdfSourceUrl,
   resolveKnowledgePdfPageImageUrl,
   saveKnowledgeClassroomSession,
   saveKnowledgeHomeworkDocuments,
-  saveKnowledgeAnnotation,
-  saveKnowledgeHomeworkAnnotation,
-  saveKnowledgeHomeworkAnnotationChatSession,
-  saveKnowledgeChatMessages,
-  saveKnowledgeAnnotationChatSession,
+  saveKnowledgeHomeworkReaderChatState,
+  saveKnowledgeReaderChatState,
   getKnowledgeCourse,
   touchKnowledgeFile,
   upsertKnowledgeFile,
 } from '../lib/knowledgeBase'
 import {
-  appendDoubtChatMessages,
-  buildDoubtChatContext,
-  commitDoubtChatSummary,
-  normalizeDoubtChatSession,
-  shouldCompactDoubtChatSession,
-  updateDoubtChatMessage,
+  appendReaderChatMessages,
+  buildReaderChatContext,
+  commitReaderChatSummary,
+  createReaderChatSession,
+  deriveReaderChatTitle,
+  migrateReaderChatSessions,
+  shouldCompactReaderChatSession,
 } from '../lib/chatMemory'
+import { createChatStreamBatcher, type ChatStreamBatcher } from '../lib/chatStreaming'
 import { retrieveChatContext } from '../lib/chatRetrieval'
 import type { PromptSourceSection } from '../lib/contextBudget'
 import {
@@ -122,14 +114,13 @@ import { getPdfControllerId, pdfDiagnostic } from '../lib/pdf-core/performance'
 import type {
   ApiConfig,
   ChatMessage,
+  ChatReference,
   ClassroomSession,
-  DoubtAnnotation,
-  DoubtChatSession,
   HomeworkDocument,
   KnowledgeHomeworkFolderType,
   PdfController,
+  ReaderChatSession,
   StructuredDocumentBlock,
-  StoredDoubtAnnotation,
 } from '../types'
 
 export function PdfWorkspacePage() {
@@ -170,29 +161,39 @@ export function PdfWorkspacePage() {
   const stopPageLecturePlayback = pageLecturePlayback.stop
   const [isAsking, setIsAsking] = useState(false)
   const [_isRestoringFile, setIsRestoringFile] = useState(false)
-  const [isSavingDoubt, setIsSavingDoubt] = useState(false)
-  const [draftDoubt, setDraftDoubt] = useState<DraftDoubt | null>(null)
-  const [annotations, setAnnotations] = useState<StoredDoubtAnnotation[]>([])
   const [homeworkDocuments, setHomeworkDocuments] = useState<HomeworkDocument[]>([])
   const [homeworkFocus, setHomeworkFocus] = useState<HomeworkFocus | null>(null)
   const [, setIsExtractingHomework] = useState(false)
   const [_isProcessingLesson, setIsProcessingLesson] = useState(false)
   const [isLessonRecording, setIsLessonRecording] = useState(isLessonRecordingActive)
-  const [pageFilter, setPageFilter] = useState<number | null>(null)
   const [pageLectureFilter, setPageLectureFilter] = useState<number | null>(null)
-  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
   const [isCaptureMode, setIsCaptureMode] = useState(false)
   const [classroomSessions, setClassroomSessions] = useState<ClassroomSession[]>([])
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => [
-    createMessage(
-      'assistant',
-      '上传 PDF 后，你可以按页查看疑点，或者直接开启新的疑点对话。',
-    ),
-  ])
+  const [readerChatSessions, setReaderChatSessions] = useState<ReaderChatSession[]>(() => {
+    const now = new Date().toISOString()
+    return [{
+      id: 'reader-chat-default',
+      title: '新对话',
+      messages: [],
+      compactionPoints: [],
+      createdAt: now,
+      updatedAt: now,
+    }]
+  })
+  const [activeChatSessionId, setActiveChatSessionId] = useState('reader-chat-default')
   const messagesContainerRef = useRef<HTMLDivElement | null>(null)
-  const streamBufferRef = useRef('')
-  const streamTimerRef = useRef<number | null>(null)
-  const saveChatTimerRef = useRef<number | null>(null)
+  const readerChatSessionsRef = useRef(readerChatSessions)
+  const activeChatSessionIdRef = useRef(activeChatSessionId)
+  const loadedChatDocumentKeyRef = useRef<string | null>(null)
+  const activeRequestRef = useRef<{
+    controller: AbortController
+    sessionId: string
+    assistantMessageId: string
+    documentKey: string
+    batcher: ChatStreamBatcher
+    persist: () => void
+  } | null>(null)
+  const saveChatTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pdfInputRef = useRef<HTMLInputElement | null>(null)
   const chatUploadInputRef = useRef<HTMLInputElement | null>(null)
   const homeworkUploadInputRef = useRef<HTMLInputElement | null>(null)
@@ -201,6 +202,15 @@ export function PdfWorkspacePage() {
   const lectureMineruInFlightRef = useRef<Set<string>>(new Set())
   const lectureMineruFailedRef = useRef<Set<string>>(new Set())
   const ownedPdfControllersRef = useRef(new Set<PdfController>())
+
+  const interruptActiveRequest = useCallback((reason: string, updateUi = true) => {
+    const request = activeRequestRef.current
+    if (!request) return
+    request.batcher.flush()
+    request.persist()
+    request.controller.abort(reason)
+    if (updateUi) setIsAsking(false)
+  }, [])
 
   const homeworkPreviewCacheRef = useRef<
     Map<
@@ -232,20 +242,46 @@ export function PdfWorkspacePage() {
   }
 
   useEffect(() => () => {
-    if (streamTimerRef.current !== null) {
-      window.clearTimeout(streamTimerRef.current)
-    }
+    interruptActiveRequest('workspace-unmount', false)
+    activeRequestRef.current?.batcher.dispose()
     if (saveChatTimerRef.current !== null) {
-      window.clearTimeout(saveChatTimerRef.current)
+      clearTimeout(saveChatTimerRef.current)
     }
     clearPdfPreviewCache(homeworkPreviewCacheRef.current, { disposeRemoved: false })
     for (const controller of ownedPdfControllersRef.current) {
       void disposePdfController(controller, 'workspace-unmount')
     }
     ownedPdfControllersRef.current.clear()
-  }, [])
-  const deferredChatMessages = useDeferredValue(chatMessages)
+  }, [interruptActiveRequest])
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([])
+  const activeChatSession = useMemo(
+    () => readerChatSessions.find((session) => session.id === activeChatSessionId) ?? readerChatSessions[0],
+    [activeChatSessionId, readerChatSessions],
+  )
+  const chatMessages = activeChatSession?.messages ?? []
+  const updateReaderChatSession = useCallback((
+    sessionId: string,
+    updater: (session: ReaderChatSession) => ReaderChatSession,
+  ) => {
+    const next = readerChatSessionsRef.current.map((session) =>
+      session.id === sessionId ? updater(session) : session,
+    )
+    readerChatSessionsRef.current = next
+    setReaderChatSessions(next)
+    return next
+  }, [])
+  const setChatMessages = useCallback((updater: SetStateAction<ChatMessage[]>) => {
+    const sessionId = activeChatSessionIdRef.current
+    updateReaderChatSession(sessionId, (session) => {
+      const nextMessages = typeof updater === 'function' ? updater(session.messages) : updater
+      return { ...session, messages: nextMessages, updatedAt: new Date().toISOString() }
+    })
+  }, [updateReaderChatSession])
+
+  useEffect(() => {
+    readerChatSessionsRef.current = readerChatSessions
+    activeChatSessionIdRef.current = activeChatSessionId
+  }, [activeChatSessionId, readerChatSessions])
 
   const availableModels = useMemo(
     () => Array.from(new Set(apiConfig.models.map((model) => model.trim()).filter(Boolean))),
@@ -259,6 +295,12 @@ export function PdfWorkspacePage() {
     homeworkDocuments.find((document) => document.id === homeworkFocus?.documentId) ??
     homeworkDocuments[0] ??
     null
+  const activeReaderDocumentId = viewerSource.kind === 'homework'
+    ? selectedHomework?.id ?? null
+    : knowledgeFileId
+  const activeReaderDocumentKey = activeReaderDocumentId
+    ? `${viewerSource.kind}:${activeReaderDocumentId}`
+    : null
   const activeKnowledgeCourseId = currentCourseId ?? knowledgeCourseId
   const activeKnowledgeCourseIdRef = useRef(activeKnowledgeCourseId)
   const knowledgeFileIdRef = useRef(knowledgeFileId)
@@ -278,19 +320,6 @@ export function PdfWorkspacePage() {
       return next
     }, { replace: true })
   }, [currentCourseId, knowledgeCourseId, knowledgeFileId, setSearchParams])
-  const activeAnnotations = useMemo(
-    () => (viewerSource.kind === 'homework' ? selectedHomework?.annotations ?? [] : annotations),
-    [annotations, selectedHomework, viewerSource.kind],
-  )
-  const visibleAnnotations = useMemo(
-    () =>
-      pageFilter === null
-        ? activeAnnotations
-        : activeAnnotations.filter((annotation) => annotation.pageNumber === pageFilter),
-    [activeAnnotations, pageFilter],
-  )
-  const selectedAnnotation =
-    activeAnnotations.find((annotation) => annotation.id === selectedAnnotationId) ?? null
   const selectedHomeworkQuestion =
     selectedHomework?.questions.find((question) => question.id === homeworkFocus?.questionId) ?? null
   const allHomeworkKnowledgeLinks = useMemo(
@@ -324,10 +353,6 @@ export function PdfWorkspacePage() {
     pageNumber: currentPage,
   })
 
-  const selectedAnnotationConversation = useMemo<ChatMessage[]>(
-    () => buildAnnotationConversation(selectedAnnotation, chatMessages),
-    [chatMessages, selectedAnnotation],
-  )
   const visibleConversationMessages = useMemo<ChatMessage[]>(() => {
     if (pageLectureFilter !== null) {
       const lectureMessages = buildLectureConversation(pageLectureFilter, lectureSegmentsByPage)
@@ -343,45 +368,11 @@ export function PdfWorkspacePage() {
       ]
     }
 
-    if (draftDoubt) {
-      return [
-        createMessage(
-          'assistant',
-          `已在第 ${draftDoubt.pageNumber ?? currentPage} 页开启新的疑点对话。直接在下方输入问题并发送，我会自动创建这条疑点记录。`,
-        ),
-      ]
-    }
-
-    if (selectedAnnotation) {
-      return selectedAnnotationConversation
-    }
-
-    if (pageFilter !== null) {
-      return [
-        createMessage(
-          'system',
-          `当前正在查看第 ${pageFilter} 页的疑点。请先从左侧选择一条疑点，或在下方新建提问。`,
-        ),
-      ]
-    }
-
-    return [
-      createMessage(
-        'assistant',
-        viewerSource.kind === 'homework'
-          ? '点击“查看疑点”后，这里会列出当前页面的疑点会话。选择一条会话即可继续讨论。'
-          : '点击“查看疑点”后，这里会列出当前页面的疑点会话。选择一条会话即可继续讨论。',
-      ),
-    ]
+    return chatMessages.filter((message) => !message.isSummary)
   }, [
-    currentPage,
-    draftDoubt,
+    chatMessages,
     lectureSegmentsByPage,
-    pageFilter,
     pageLectureFilter,
-    selectedAnnotation,
-    selectedAnnotationConversation,
-    viewerSource.kind,
   ])
 
   const currentViewerName =
@@ -455,30 +446,52 @@ export function PdfWorkspacePage() {
     return next
   }, [composerAttachments, viewerSource])
 
-  const clearStreamTimer = () => {
-    if (streamTimerRef.current !== null) {
-      window.clearTimeout(streamTimerRef.current)
-      streamTimerRef.current = null
-    }
-  }
-
-  const flushStreamBuffer = (messageId: string) => {
-    if (!streamBufferRef.current.length) {
-      streamTimerRef.current = null
-      return
-    }
-
-    const chunk = streamBufferRef.current.slice(0, 1)
-    streamBufferRef.current = streamBufferRef.current.slice(1)
-
-    startTransition(() => {
-      setChatMessages((current) =>
-        updateMessageContent(current, messageId, (content) => `${content}${chunk}`),
+  const persistReaderChatStateNow = useCallback((
+    sessions = readerChatSessionsRef.current,
+    sessionId = activeChatSessionIdRef.current,
+  ) => {
+    if (viewerSource.kind === 'homework' && selectedHomework && activeKnowledgeCourseId) {
+      saveKnowledgeHomeworkReaderChatState(
+        activeKnowledgeCourseId,
+        currentFolderType,
+        selectedHomework.id,
+        sessions,
+        sessionId,
       )
-    })
+      setHomeworkDocuments((current) => current.map((document) => document.id === selectedHomework.id
+        ? { ...document, readerChatSessions: sessions, activeChatSessionId: sessionId }
+        : document))
+    } else if (knowledgeFileId) {
+      saveKnowledgeReaderChatState(knowledgeFileId, sessions, sessionId)
+    }
+  }, [activeKnowledgeCourseId, currentFolderType, knowledgeFileId, selectedHomework, viewerSource.kind])
 
-    streamTimerRef.current = window.setTimeout(() => flushStreamBuffer(messageId), 14)
-  }
+  const handleSessionChange = useCallback((sessionId: string) => {
+    if (isAsking || !readerChatSessionsRef.current.some((session) => session.id === sessionId)) return
+    activeChatSessionIdRef.current = sessionId
+    setActiveChatSessionId(sessionId)
+    setPageLectureFilter(null)
+    persistReaderChatStateNow(readerChatSessionsRef.current, sessionId)
+  }, [isAsking, persistReaderChatStateNow])
+
+  const handleNewChat = useCallback(() => {
+    if (isAsking) return
+    const documentId = viewerSource.kind === 'homework' ? selectedHomework?.id : knowledgeFileId
+    if (!documentId) return
+    const session = createReaderChatSession(documentId)
+    const next = [session, ...readerChatSessionsRef.current]
+    readerChatSessionsRef.current = next
+    activeChatSessionIdRef.current = session.id
+    setReaderChatSessions(next)
+    setActiveChatSessionId(session.id)
+    setQuestionInput('')
+    setPageLectureFilter(null)
+    persistReaderChatStateNow(next, session.id)
+  }, [isAsking, knowledgeFileId, persistReaderChatStateNow, selectedHomework?.id, viewerSource.kind])
+
+  const handleStopGeneration = useCallback(() => {
+    interruptActiveRequest('user-stop')
+  }, [interruptActiveRequest])
 
   useEffect(() => {
     let cancelled = false
@@ -519,17 +532,6 @@ export function PdfWorkspacePage() {
 
     setIsCaptureMode(false)
   }, [pdfController])
-
-  useEffect(() => {
-    if (!selectedAnnotationId) {
-      return
-    }
-
-    const stillExists = activeAnnotations.some((annotation) => annotation.id === selectedAnnotationId)
-    if (!stillExists) {
-      setSelectedAnnotationId(null)
-    }
-  }, [activeAnnotations, selectedAnnotationId])
 
   useEffect(() => {
     let cancelled = false
@@ -675,8 +677,6 @@ export function PdfWorkspacePage() {
     }
   }, [chatMessages, isAsking])
 
-  useEffect(() => () => clearStreamTimer(), [])
-
   useEffect(() => {
     if (!initialFileId) {
       return
@@ -737,7 +737,6 @@ export function PdfWorkspacePage() {
         setHomeworkPreviewController(null)
         setHomeworkPreviewPageCount(null)
         setHomeworkPreviewImageUrl(null)
-        setAnnotations(storedFile.annotations)
         setHomeworkDocuments(storedHomeworkDocuments)
         setClassroomSessions(storedFile.classroomSessions)
         setHomeworkFocus(
@@ -754,25 +753,8 @@ export function PdfWorkspacePage() {
             : null,
         )
         setForcedHomeworkPreviewPage(initialHomeworkQuestion?.pageNumber ?? null)
-        setPageFilter(null)
-        setSelectedAnnotationId(
-          initialHomeworkDocument
-            ? initialHomeworkDocument.annotations[0]?.id ?? null
-            : storedFile.annotations[0]?.id ?? null,
-        )
-        setChatMessages(
-          storedFile.chatMessages.length
-            ? storedFile.chatMessages
-            : [
-                createMessage(
-                  'assistant',
-                  `已恢复 ${storedFile.fileName} 的历史问答与疑点记录，你可以继续编辑新的疑点。`,
-                ),
-              ],
-        )
         setCurrentPage(initialHomeworkQuestion?.pageNumber ?? initialPageNumber)
         setZoom(1)
-        setDraftDoubt(null)
         touchKnowledgeFile(storedFile.id)
         // Shell, name, annotations and structure are available before PDF I/O.
         const extracted = storedFile.hasPdfSource
@@ -892,7 +874,6 @@ export function PdfWorkspacePage() {
         setHomeworkPreviewPageCount(null)
         setHomeworkPreviewImageUrl(null)
         setHomeworkPreviewLayoutBlocks([])
-        setAnnotations([])
         setHomeworkDocuments(storedHomeworkDocuments)
         setClassroomSessions([])
         setHomeworkFocus(
@@ -904,17 +885,8 @@ export function PdfWorkspacePage() {
             : null,
         )
         setForcedHomeworkPreviewPage(initialHomeworkQuestion?.pageNumber ?? null)
-        setPageFilter(null)
-        setSelectedAnnotationId(initialHomeworkDocument?.annotations[0]?.id ?? null)
-        setChatMessages([
-          createMessage(
-            'assistant',
-            `${getKnowledgeHomeworkFolderName(currentFolderType)} 已打开，你可以直接上传题目。`,
-          ),
-        ])
         setCurrentPage(initialHomeworkQuestion?.pageNumber ?? initialPageNumber)
         setZoom(1)
-        setDraftDoubt(null)
       } catch (error) {
         if (cancelled) {
           return
@@ -943,31 +915,67 @@ export function PdfWorkspacePage() {
   ])
 
   useEffect(() => {
-    if (!knowledgeFileId) {
+    const request = activeRequestRef.current
+    if (!request || request.documentKey === activeReaderDocumentKey) return
+    interruptActiveRequest('document-switch')
+  }, [activeReaderDocumentKey, interruptActiveRequest])
+
+  useEffect(() => {
+    const documentId = activeReaderDocumentId
+    if (!documentId || !activeReaderDocumentKey) {
+      loadedChatDocumentKeyRef.current = null
       return
     }
+    if (loadedChatDocumentKeyRef.current === activeReaderDocumentKey) return
+
+    const storedFile = viewerSource.kind === 'lecture' && knowledgeFileId
+      ? getKnowledgeFile(knowledgeFileId)
+      : null
+    const source = viewerSource.kind === 'homework' ? selectedHomework : storedFile
+    if (!source) return
+    const migrated = migrateReaderChatSessions({
+      documentId,
+      sessions: source.readerChatSessions,
+      activeSessionId: source.activeChatSessionId,
+      annotations: source.annotations,
+      legacyMessages: viewerSource.kind === 'lecture' ? storedFile?.chatMessages ?? [] : [],
+    })
+    loadedChatDocumentKeyRef.current = activeReaderDocumentKey
+    readerChatSessionsRef.current = migrated.sessions
+    activeChatSessionIdRef.current = migrated.activeSessionId
+    setReaderChatSessions(migrated.sessions)
+    setActiveChatSessionId(migrated.activeSessionId)
+  }, [activeReaderDocumentId, activeReaderDocumentKey, knowledgeFileId, selectedHomework, viewerSource.kind])
+
+  useEffect(() => {
+    if (
+      !activeReaderDocumentKey ||
+      loadedChatDocumentKeyRef.current !== activeReaderDocumentKey ||
+      readerChatSessionsRef.current !== readerChatSessions ||
+      activeChatSessionIdRef.current !== activeChatSessionId
+    ) return
 
     if (saveChatTimerRef.current !== null) {
-      window.clearTimeout(saveChatTimerRef.current)
+      clearTimeout(saveChatTimerRef.current)
     }
 
-    saveChatTimerRef.current = window.setTimeout(() => {
+    saveChatTimerRef.current = setTimeout(() => {
       try {
-        saveKnowledgeChatMessages(knowledgeFileId, deferredChatMessages)
+        persistReaderChatStateNow(readerChatSessions, activeChatSessionId)
       } catch (error) {
-        console.error('saveKnowledgeChatMessages failed:', error)
+        console.error('saveReaderChatState failed:', error)
       } finally {
         saveChatTimerRef.current = null
       }
-    }, 280)
+    }, 400)
 
     return () => {
       if (saveChatTimerRef.current !== null) {
-        window.clearTimeout(saveChatTimerRef.current)
+        clearTimeout(saveChatTimerRef.current)
         saveChatTimerRef.current = null
       }
     }
-  }, [deferredChatMessages, knowledgeFileId])
+  }, [activeChatSessionId, activeReaderDocumentKey, persistReaderChatStateNow, readerChatSessions])
 
   useEffect(() => {
     if (!knowledgeFileId || classroomSessions.length || !documentText.trim()) {
@@ -1153,7 +1161,6 @@ export function PdfWorkspacePage() {
             setDocumentText(canonicalMarkdown)
             setLectureDocumentText(canonicalMarkdown)
             setLectureLayoutBlocks(refreshedFile.layoutBlocks)
-            setAnnotations(refreshedFile.annotations)
             setHomeworkDocuments(refreshedFile.homeworkDocuments)
             setClassroomSessions(refreshedFile.classroomSessions)
             setChatMessages((current) => current.some((message) =>
@@ -1326,6 +1333,7 @@ export function PdfWorkspacePage() {
 
     let previewPublished = false
     try {
+      interruptActiveRequest('document-upload')
       const buffer = await file.arrayBuffer()
       const result = { ...await openPdfPreviewFromBuffer(buffer), buffer }
       ownedPdfControllersRef.current.add(result.controller)
@@ -1335,6 +1343,15 @@ export function PdfWorkspacePage() {
           `已载入 ${file.name}。PDF 预览已打开，正在后台用 MinerU 提取讲义结构。`,
         ),
       ]
+      const pendingSession = {
+        ...createReaderChatSession(`pending-upload-${crypto.randomUUID()}`),
+        messages: initialChatMessages,
+      }
+      loadedChatDocumentKeyRef.current = null
+      readerChatSessionsRef.current = [pendingSession]
+      activeChatSessionIdRef.current = pendingSession.id
+      setReaderChatSessions([pendingSession])
+      setActiveChatSessionId(pendingSession.id)
       // Publish the reader before persistence or MinerU. Failed persistence
       // leaves the local document readable and reports an explicit save error.
       setReaderVisualReady(false)
@@ -1349,11 +1366,9 @@ export function PdfWorkspacePage() {
       setLecturePdfController(result.controller)
       setLectureLayoutBlocks([])
       setViewerSource({ kind: 'lecture' })
-      setAnnotations([])
       setClassroomSessions([])
       setCurrentPage(1)
       setZoom(1)
-      setChatMessages(initialChatMessages)
       previewPublished = true
       const storedFile = await upsertKnowledgeFile({
         fileName: file.name,
@@ -1364,11 +1379,29 @@ export function PdfWorkspacePage() {
         layoutBlocks: [],
         pdfBuffer: result.buffer,
         courseId: currentCourseId,
-        chatMessages: initialChatMessages,
       })
+      const migrated = migrateReaderChatSessions({
+        documentId: storedFile.id,
+        sessions: storedFile.readerChatSessions,
+        activeSessionId: storedFile.activeChatSessionId,
+        annotations: storedFile.annotations,
+        legacyMessages: storedFile.chatMessages,
+      })
+      const hasStoredConversation = migrated.sessions.some((session) => session.messages.length > 0)
+      const nextSessions = hasStoredConversation
+        ? migrated.sessions
+        : migrated.sessions.map((session) => session.id === migrated.activeSessionId
+            ? { ...session, messages: initialChatMessages, updatedAt: new Date().toISOString() }
+            : session)
+      saveKnowledgeReaderChatState(storedFile.id, nextSessions, migrated.activeSessionId)
+      loadedChatDocumentKeyRef.current = `lecture:${storedFile.id}`
+      readerChatSessionsRef.current = nextSessions
+      activeChatSessionIdRef.current = migrated.activeSessionId
 
       startTransition(() => {
         setKnowledgeFileId(storedFile.id)
+        setReaderChatSessions(nextSessions)
+        setActiveChatSessionId(migrated.activeSessionId)
         try {
           setSearchParams(
             { file: storedFile.id, course: storedFile.courseId, folder: currentFolderType },
@@ -1395,7 +1428,6 @@ export function PdfWorkspacePage() {
         setKnowledgeCourseId(storedFile.courseId)
         setCurrentPage(1)
         setZoom(1)
-        setAnnotations(storedFile.annotations)
         setHomeworkDocuments(
           getKnowledgeHomeworkDocumentsByCourseFolder(storedFile.courseId, currentFolderType),
         )
@@ -1415,10 +1447,6 @@ export function PdfWorkspacePage() {
               }
             : null,
         )
-        setPageFilter(null)
-        setSelectedAnnotationId(storedFile.annotations[0]?.id ?? null)
-        setDraftDoubt(null)
-        setChatMessages(initialChatMessages)
       })
 
     } catch (error) {
@@ -1438,45 +1466,20 @@ export function PdfWorkspacePage() {
   }
 
   const handleInspectPageDoubts = (pageNumber: number) => {
-    setDraftDoubt(null)
-    setPageFilter(pageNumber)
+    setCurrentPage(pageNumber)
     setPageLectureFilter(null)
-    setSelectedAnnotationId(null)
-    setComposerAttachments([])
     setIsCaptureMode(false)
   }
 
   const handleInspectPageQuestions = (pageNumber: number) => {
     setCurrentPage(pageNumber)
     setPageLectureFilter(null)
-    setDraftDoubt(null)
-    setPageFilter(null)
-    setSelectedAnnotationId(null)
     setIsCaptureMode(false)
-  }
-
-  const handleSelectAnnotation = (annotationId: string) => {
-    const nextAnnotation =
-      activeAnnotations.find((annotation) => annotation.id === annotationId) ?? null
-    setSelectedAnnotationId(annotationId)
-    setDraftDoubt(null)
-    setQuestionInput('')
-    setComposerAttachments([])
-    setIsCaptureMode(false)
-    setPageLectureFilter(null)
-    if (nextAnnotation?.pageNumber) {
-      setCurrentPage(nextAnnotation.pageNumber)
-      setPageFilter(nextAnnotation.pageNumber)
-    }
   }
 
   const handleInspectPageLectureSegments = (pageNumber: number) => {
     setCurrentPage(pageNumber)
     setPageLectureFilter(pageNumber)
-    setPageFilter(null)
-    setDraftDoubt(null)
-    setSelectedAnnotationId(null)
-    setComposerAttachments([])
     setIsCaptureMode(false)
   }
 
@@ -1693,8 +1696,6 @@ export function PdfWorkspacePage() {
       documentId: link.homeworkDocumentId,
       questionId: link.questionId,
     })
-    setSelectedAnnotationId(null)
-    setPageFilter(null)
     setViewerSource({ kind: 'homework', documentId: link.homeworkDocumentId })
     setForcedHomeworkPreviewPage(null)
   }
@@ -1920,6 +1921,12 @@ export function PdfWorkspacePage() {
       source?: StructuredDocumentBlock['source']
     }>
   }) => {
+    const referenceDocumentId = viewerSource.kind === 'homework'
+      ? selectedHomework?.id ?? viewerSource.documentId
+      : knowledgeFileId
+    if (!referenceDocumentId) return
+    const sourceType: ChatReference['sourceType'] =
+      viewerSource.kind === 'lecture' ? 'lecture' : currentFolderType
     const selectedBlocks = selection.source === 'block'
       ? selection.blocks?.length
         ? selection.blocks
@@ -1948,6 +1955,17 @@ export function PdfWorkspacePage() {
         kind: 'text',
         name: `第${selection.pageNumber}页文字引用`,
         contentText: `PDF《${currentViewerName}》第 ${selection.pageNumber} 页原文：\n${text}`,
+        blockReference: {
+          id: `reference-${referenceDocumentId}-${selection.pageNumber}-${crypto.randomUUID()}`,
+          sourceType,
+          documentId: referenceDocumentId,
+          documentName: currentViewerName,
+          pageNumber: selection.pageNumber,
+          blockId: null,
+          label: '文字选择',
+          excerpt: text,
+          viewer: viewerSource.kind,
+        },
       }])
       return
     }
@@ -1960,7 +1978,7 @@ export function PdfWorkspacePage() {
           .filter((reference): reference is NonNullable<ComposerAttachment['blockReference']> => Boolean(reference))
           .filter((reference) =>
             reference.viewer === viewerSource.kind &&
-            reference.documentId === (viewerSource.kind === 'homework' ? viewerSource.documentId : null),
+            reference.documentId === referenceDocumentId,
           )
           .map((reference) => reference.blockId),
       )
@@ -1972,10 +1990,16 @@ export function PdfWorkspacePage() {
           name: `第${selection.pageNumber}页引用`,
           contentText: `PDF《${currentViewerName}》第 ${selection.pageNumber} 页${block.label || block.kind || '区块'}（${block.source === 'mineru-local' ? '本地 MinerU 解析块' : 'PDF 文字选择'}）：\n${block.text}`,
           blockReference: {
+            id: `reference-${referenceDocumentId}-${block.id}`,
+            sourceType,
+            documentId: referenceDocumentId,
+            documentName: currentViewerName,
             blockId: block.id,
             pageNumber: selection.pageNumber,
+            label: block.label || block.kind || '区块',
+            kind: block.kind,
+            excerpt: block.text,
             viewer: viewerSource.kind,
-            documentId: viewerSource.kind === 'homework' ? viewerSource.documentId : null,
           },
         }))
       return additions.length ? [...current, ...additions] : current
@@ -2039,72 +2063,6 @@ export function PdfWorkspacePage() {
       }
       return viewerSource.kind === 'homework' && reference.documentId !== viewerSource.documentId
     }))
-  }
-
-  const persistDoubtRecord = async (
-    question: string,
-    source: DraftDoubt | null = draftDoubt,
-  ) => {
-    if (!source || !question.trim()) {
-      return null
-    }
-
-    const annotation: DoubtAnnotation = {
-      id: source.id,
-      pageNumber: source.pageNumber,
-      question: question.trim(),
-      imageAssetId: null,
-      imageName: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }
-
-    let storedAnnotation: StoredDoubtAnnotation
-    try {
-      storedAnnotation =
-        viewerSource.kind === 'homework' && selectedHomework && activeKnowledgeCourseId
-          ? await saveKnowledgeHomeworkAnnotation(
-              activeKnowledgeCourseId,
-              currentFolderType,
-              selectedHomework.id,
-              annotation,
-            )
-          : knowledgeFileId
-            ? await saveKnowledgeAnnotation(knowledgeFileId, annotation)
-            : ({ ...annotation, relatedQuestionIds: [] } satisfies StoredDoubtAnnotation)
-    } catch (error) {
-      console.error('save annotation failed:', error)
-      throw error
-    }
-
-    if (viewerSource.kind === 'homework' && selectedHomework) {
-      setHomeworkDocuments((current) =>
-        current.map((document) =>
-          document.id === selectedHomework.id
-            ? {
-                ...document,
-                annotations: [
-                  storedAnnotation,
-                  ...document.annotations.filter((item) => item.id !== storedAnnotation.id),
-                ].slice(0, 80),
-              }
-            : document,
-        ),
-      )
-    } else {
-      setAnnotations((current) => {
-        const nextAnnotations = [
-          storedAnnotation,
-          ...current.filter((item) => item.id !== storedAnnotation.id),
-        ].slice(0, 80)
-        return nextAnnotations
-      })
-    }
-    if (storedAnnotation.pageNumber !== null) {
-      setPageFilter(storedAnnotation.pageNumber)
-    }
-    setSelectedAnnotationId(storedAnnotation.id)
-    return storedAnnotation
   }
 
   const handleZoom = (nextZoom: number) => {
@@ -2185,119 +2143,49 @@ export function PdfWorkspacePage() {
 
   const runQuestion = async () => {
     const normalizedQuestion = questionInput.trim()
-    const hasQuestionContext = documentText.trim() || selectedHomework?.extractedMarkdown.trim()
-    if (!normalizedQuestion || isAsking || !hasQuestionContext) {
-      return
-    }
-
-    let activeAnnotationId = selectedAnnotationId
-    let activeAnnotationPage = pageFilter ?? currentPage
-    let activeAnnotationRecord = selectedAnnotation
-    const autoDraft =
-      !activeAnnotationId && !draftDoubt
-        ? createDraftDoubt(pageFilter ?? currentPage)
-        : null
-
-    if (!activeAnnotationId && (draftDoubt || autoDraft)) {
-      setIsSavingDoubt(true)
-      try {
-        const storedAnnotation = await persistDoubtRecord(
-          normalizedQuestion,
-          draftDoubt ?? autoDraft,
-        )
-        if (!storedAnnotation) {
-          setIsSavingDoubt(false)
-          return
-        }
-
-        activeAnnotationId = storedAnnotation.id
-        activeAnnotationPage = storedAnnotation.pageNumber ?? currentPage
-        activeAnnotationRecord = storedAnnotation
-        setDraftDoubt(null)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : '创建疑点失败'
-        setChatMessages((current) => [
-          ...current,
-          createMessage('system', `创建疑点失败：${message}`),
-        ])
-        setIsSavingDoubt(false)
-        return
-      } finally {
-        setIsSavingDoubt(false)
-      }
-    }
-
-    if (!activeAnnotationId) {
-      return
-    }
-
-    const legacyConversation = activeAnnotationRecord?.relatedQuestionIds.length
-      ? buildAnnotationConversation(activeAnnotationRecord, chatMessages)
-      : []
-    const baseChatSession = normalizeDoubtChatSession(
-      activeAnnotationRecord?.chatSession,
-      activeAnnotationId,
-      legacyConversation,
+    const hasQuestionContext = Boolean(
+      documentText.trim() ||
+      selectedHomework?.extractedMarkdown.trim() ||
+      currentViewerStructuredBlocks.length,
     )
-    const persistActiveChatSession = (nextSession: DoubtChatSession) => {
-      const updatedAt = new Date().toISOString()
-      if (viewerSource.kind === 'homework' && selectedHomework && activeKnowledgeCourseId) {
-        setHomeworkDocuments((current) =>
-          current.map((document) =>
-            document.id === selectedHomework.id
-              ? {
-                  ...document,
-                  annotations: document.annotations.map((annotation) =>
-                    annotation.id === activeAnnotationId
-                      ? { ...annotation, chatSession: nextSession, updatedAt }
-                      : annotation,
-                  ),
-                  updatedAt,
-                }
-              : document,
-          ),
-        )
-        saveKnowledgeHomeworkAnnotationChatSession(
-          activeKnowledgeCourseId,
-          currentFolderType,
-          selectedHomework.id,
-          activeAnnotationId,
-          nextSession,
-        )
-        return
-      }
-
-      setAnnotations((current) =>
-        current.map((annotation) =>
-          annotation.id === activeAnnotationId
-            ? { ...annotation, chatSession: nextSession, updatedAt }
-            : annotation,
-        ),
-      )
-      if (knowledgeFileId) {
-        saveKnowledgeAnnotationChatSession(
-          knowledgeFileId,
-          activeAnnotationId,
-          nextSession,
-        )
-      }
+    const documentId = viewerSource.kind === 'homework' ? selectedHomework?.id : knowledgeFileId
+    const sessionId = activeChatSessionIdRef.current
+    const baseChatSession = readerChatSessionsRef.current.find((session) => session.id === sessionId)
+    if (
+      !normalizedQuestion ||
+      isAsking ||
+      activeRequestRef.current ||
+      !hasQuestionContext ||
+      !documentId ||
+      !baseChatSession
+    ) {
+      return
     }
 
-    const userMessage = createMessage('user', normalizedQuestion)
-    const attachmentSummary = composerAttachments.length
-      ? `\n\n附件：${composerAttachments.map((attachment) => attachment.name).join('、')}`
+    const requestAttachments = [...composerAttachments]
+    const messageReferences: ChatReference[] = requestAttachments.flatMap((attachment) => {
+      const reference = attachment.blockReference
+      if (!reference) return []
+      return [{
+        id: reference.id,
+        sourceType: reference.sourceType,
+        documentId: reference.documentId,
+        documentName: reference.documentName,
+        pageNumber: reference.pageNumber,
+        blockId: reference.blockId,
+        label: reference.label,
+        kind: reference.kind,
+        excerpt: reference.excerpt,
+      }]
+    })
+    const attachmentSummary = requestAttachments.length
+      ? `\n\n附件：${requestAttachments.map((attachment) => attachment.name).join('、')}`
       : ''
-    const visibleUserMessage = {
-      ...userMessage,
+    const visibleUserMessage: ChatMessage = {
+      ...createMessage('user', normalizedQuestion),
       content: `${normalizedQuestion}${attachmentSummary}`,
+      ...(messageReferences.length ? { references: messageReferences } : {}),
     }
-    setChatMessages((current) => [...current, visibleUserMessage])
-    setQuestionInput('')
-    setIsAsking(true)
-    setIsCaptureMode(false)
-    clearStreamTimer()
-    streamBufferRef.current = ''
-
     const assistantMessageId = crypto.randomUUID()
     const pendingAssistantMessage: ChatMessage = {
       id: assistantMessageId,
@@ -2305,53 +2193,80 @@ export function PdfWorkspacePage() {
       content: '',
       createdAt: new Date().toISOString(),
     }
-    setChatMessages((current) => [
-      ...current,
-      pendingAssistantMessage,
-    ])
-    let workingChatSession = appendDoubtChatMessages(
-      baseChatSession,
+    const titledSession = !baseChatSession.messages.some((message) => message.role === 'user')
+      ? { ...baseChatSession, title: deriveReaderChatTitle(normalizedQuestion) }
+      : baseChatSession
+    let workingChatSession = appendReaderChatMessages(
+      titledSession,
       [visibleUserMessage, pendingAssistantMessage],
     )
-    persistActiveChatSession(workingChatSession)
-
-    if (viewerSource.kind === 'homework' && selectedHomework && activeKnowledgeCourseId) {
-      linkQuestionToHomeworkAnnotation(
-        activeKnowledgeCourseId,
-        currentFolderType,
-        selectedHomework.id,
-        activeAnnotationId,
-        visibleUserMessage.id,
-      )
-    } else if (knowledgeFileId) {
-      linkQuestionToAnnotation(knowledgeFileId, activeAnnotationId, visibleUserMessage.id)
+    const requestKind = viewerSource.kind
+    const requestCourseId = activeKnowledgeCourseId
+    const requestFolderType = currentFolderType
+    const requestDocumentKey = `${requestKind}:${documentId}`
+    const persistRequestState = (sessions: ReaderChatSession[], activeId: string) => {
+      if (requestKind === 'homework') {
+        if (!requestCourseId) return
+        saveKnowledgeHomeworkReaderChatState(
+          requestCourseId,
+          requestFolderType,
+          documentId,
+          sessions,
+          activeId,
+        )
+        setHomeworkDocuments((current) => current.map((document) => document.id === documentId
+          ? { ...document, readerChatSessions: sessions, activeChatSessionId: activeId }
+          : document))
+        return
+      }
+      saveKnowledgeReaderChatState(documentId, sessions, activeId)
     }
-    if (viewerSource.kind === 'homework' && selectedHomework) {
-      setHomeworkDocuments((current) =>
-        current.map((document) =>
-          document.id === selectedHomework.id
-            ? {
-                ...document,
-                annotations: appendRelatedQuestionId(
-                  document.annotations,
-                  activeAnnotationId,
-                  visibleUserMessage.id,
-                ),
-              }
-            : document,
-        ),
+    let requestSessions = readerChatSessionsRef.current
+    const updateRequestSession = (updater: (session: ReaderChatSession) => ReaderChatSession) => {
+      requestSessions = requestSessions.map((session) =>
+        session.id === sessionId ? updater(session) : session,
       )
-    } else {
-      setAnnotations((current) =>
-        appendRelatedQuestionId(current, activeAnnotationId, visibleUserMessage.id),
-      )
+      if (loadedChatDocumentKeyRef.current === requestDocumentKey) {
+        readerChatSessionsRef.current = requestSessions
+        setReaderChatSessions(requestSessions)
+      }
+      return requestSessions
     }
+    const updateRequestMessage = (
+      messageId: string,
+      updater: (content: string) => string,
+    ) => updateRequestSession((session) => ({
+      ...session,
+      messages: updateMessageContent(session.messages, messageId, updater),
+      updatedAt: new Date().toISOString(),
+    }))
+    const controller = new AbortController()
+    const batcher = createChatStreamBatcher((content, mode) => {
+      updateRequestMessage(
+        assistantMessageId,
+        (current) => mode === 'replace' ? content : `${current}${content}`,
+      )
+    })
+    activeRequestRef.current = {
+      controller,
+      sessionId,
+      assistantMessageId,
+      documentKey: requestDocumentKey,
+      batcher,
+      persist: () => persistRequestState(requestSessions, sessionId),
+    }
+    const initialSessions = updateRequestSession(() => workingChatSession)
+    persistRequestState(initialSessions, sessionId)
+    setQuestionInput('')
+    setComposerAttachments([])
+    setIsAsking(true)
+    setIsCaptureMode(false)
 
-    const explicitReferenceContext = composerAttachments
+    const explicitReferenceContext = requestAttachments
       .filter((attachment) => attachment.blockReference && attachment.contentText)
       .map((attachment) => attachment.contentText)
       .join('\n\n')
-    const documentAttachmentContext = composerAttachments
+    const documentAttachmentContext = requestAttachments
       .filter(
         (attachment) => !attachment.blockReference &&
           (attachment.kind === 'document' || attachment.kind === 'text') && attachment.contentText,
@@ -2360,16 +2275,13 @@ export function PdfWorkspacePage() {
       .join('\n\n')
     const currentPageContext = buildStructuredPageContext(
       currentViewerStructuredBlocks,
-      activeAnnotationPage,
+      currentPage,
       currentViewerName,
     )
-    const retrievalDocumentId = viewerSource.kind === 'homework'
-      ? selectedHomework?.id ?? null
-      : knowledgeFileId
-    const retrievalDocumentType = viewerSource.kind === 'homework'
-      ? currentFolderType
+    const retrievalDocumentType = requestKind === 'homework'
+      ? requestFolderType
       : 'lecture'
-    const recentRetrievalMessages = baseChatSession.messages
+    const recentRetrievalMessages = titledSession.messages
       .filter((message) =>
         !message.isSummary &&
         (message.role === 'user' || message.role === 'assistant') &&
@@ -2381,12 +2293,12 @@ export function PdfWorkspacePage() {
         content: message.content,
       }))
     let retrievedSections: PromptSourceSection[] = []
-    if (activeKnowledgeCourseId && retrievalDocumentId) {
+    if (requestCourseId) {
       try {
         const retrieval = await retrieveChatContext({
           query: normalizedQuestion,
-          courseId: activeKnowledgeCourseId,
-          documentId: retrievalDocumentId,
+          courseId: requestCourseId,
+          documentId,
           documentType: retrievalDocumentType,
           topN: 20,
           topK: 6,
@@ -2424,7 +2336,7 @@ export function PdfWorkspacePage() {
         title: '用户显式选择的引用',
         content: explicitReferenceContext,
         bucket: 'pinned',
-        priority: 120,
+        priority: 140,
         trimMode: 'head-tail',
       },
       {
@@ -2432,113 +2344,110 @@ export function PdfWorkspacePage() {
         title: '本次提问附件',
         content: documentAttachmentContext,
         bucket: 'pinned',
-        priority: 115,
+        priority: 130,
         trimMode: 'head-tail',
       },
-      {
-        id: 'current-page',
-        title: `当前查看的第 ${activeAnnotationPage} 页`,
-        content: currentPageContext,
-        bucket: 'pinned',
-        priority: 110,
-        trimMode: 'head-tail',
-      },
+      ...retrievedSections,
       {
         id: 'current-homework-question',
         title: '当前练习题',
         content: activeHomeworkContextMarkdown,
-        bucket: 'pinned',
-        priority: 100,
+        bucket: 'auxiliary',
+        priority: 30,
         trimMode: 'head-tail',
       },
-      ...retrievedSections,
+      ...(explicitReferenceContext ? [] : [{
+        id: 'current-page',
+        title: `当前查看的第 ${currentPage} 页（辅助背景）`,
+        content: currentPageContext,
+        bucket: 'auxiliary' as const,
+        priority: 20,
+        trimMode: 'head-tail' as const,
+      }]),
     ]
-    const imageAttachments = composerAttachments
+    const imageAttachments = requestAttachments
       .filter((attachment) => attachment.kind === 'image' && attachment.dataUrl)
       .map((attachment) => ({
         name: attachment.name,
         dataUrl: attachment.dataUrl!,
       }))
 
-    let memoryContextSession = baseChatSession
+    let memoryContextSession = titledSession
     if (
       apiConfig.doubtProvider === 'api' &&
-      shouldCompactDoubtChatSession(baseChatSession, apiConfig, apiConfig.doubtModel)
+      shouldCompactReaderChatSession(titledSession, apiConfig, apiConfig.doubtModel)
     ) {
       try {
         const memorySummary = await summarizeChatMemoryWithConfiguredApi(
-          buildDoubtChatContext(baseChatSession, Number.MAX_SAFE_INTEGER),
+          buildReaderChatContext(titledSession, Number.MAX_SAFE_INTEGER),
           apiConfig,
         )
         if (memorySummary) {
-          memoryContextSession = commitDoubtChatSummary(baseChatSession, memorySummary)
-          workingChatSession = appendDoubtChatMessages(
+          memoryContextSession = commitReaderChatSummary(titledSession, memorySummary)
+          workingChatSession = appendReaderChatMessages(
             memoryContextSession,
             [visibleUserMessage, pendingAssistantMessage],
           )
-          persistActiveChatSession(workingChatSession)
+          const compactedSessions = updateRequestSession(() => workingChatSession)
+          persistRequestState(compactedSessions, sessionId)
         }
       } catch (error) {
         console.warn('chat memory compaction failed; continuing with recent history:', error)
       }
     }
-    const conversationHistory = buildDoubtChatContext(memoryContextSession)
+    const conversationHistory = buildReaderChatContext(memoryContextSession)
 
     try {
+      if (controller.signal.aborted) throw new Error('Request aborted')
       const result = await askWithConfiguredVisionApi(
-        `请继续围绕第 ${activeAnnotationPage} 页的当前疑点回答：${normalizedQuestion}${attachmentSummary}`,
+        `请回答用户当前问题。如果有显式引用，以显式引用为最高优先级；当前可见页仅作为辅助背景。\n\n${normalizedQuestion}${attachmentSummary}`,
         questionSourceContext,
         apiConfig,
         imageAttachments,
         {
-          onToken: (chunk) => {
-            streamBufferRef.current += chunk
-            if (streamTimerRef.current === null) {
-              flushStreamBuffer(assistantMessageId)
-            }
-          },
+          onToken: batcher.append,
+          onSnapshot: batcher.replace,
+          signal: controller.signal,
         },
         apiConfig.doubtModel,
         conversationHistory,
       )
 
-      workingChatSession = updateDoubtChatMessage(
-        workingChatSession,
+      batcher.flush()
+      const finalSessions = updateRequestMessage(
         assistantMessageId,
-        result.answer,
+        () => result.answer,
       )
-      persistActiveChatSession(workingChatSession)
-
-      startTransition(() => {
-        clearStreamTimer()
-        streamBufferRef.current = ''
-        setChatMessages((current) =>
-          updateMessageContent(current, assistantMessageId, () => result.answer),
-        )
-        setIsAsking(false)
-        setComposerAttachments([])
-      })
+      persistRequestState(finalSessions, sessionId)
     } catch (error) {
-      const message = error instanceof Error ? error.message : '提问失败'
-      const failureContent = `1. 当前无法完成回答。\n2. ${message}\n3. 请检查 API 配置、网络或模型能力后重试。`
-      workingChatSession = updateDoubtChatMessage(
-        workingChatSession,
-        assistantMessageId,
-        failureContent,
-      )
-      persistActiveChatSession(workingChatSession)
-      startTransition(() => {
-        clearStreamTimer()
-        streamBufferRef.current = ''
-        setChatMessages((current) =>
-          updateMessageContent(
-            current,
-            assistantMessageId,
-            () => failureContent,
-          ),
+      batcher.flush()
+      const currentSession = requestSessions.find((session) => session.id === sessionId)
+      const partialAnswer = currentSession?.messages.find(
+        (message) => message.id === assistantMessageId,
+      )?.content.trim() ?? ''
+      if (controller.signal.aborted) {
+        if (!partialAnswer) {
+          updateRequestSession((session) => ({
+            ...session,
+            messages: session.messages.filter((message) => message.id !== assistantMessageId),
+            updatedAt: new Date().toISOString(),
+          }))
+        }
+      } else if (!partialAnswer) {
+        const message = error instanceof Error ? error.message : '提问失败'
+        updateRequestMessage(
+          assistantMessageId,
+          () => `当前无法完成回答：${message}\n\n请检查 API 配置、网络或模型能力后重试。`,
         )
+      }
+      persistRequestState(requestSessions, sessionId)
+    } finally {
+      if (activeRequestRef.current?.controller === controller) {
+        batcher.flush()
+        batcher.dispose()
+        activeRequestRef.current = null
         setIsAsking(false)
-      })
+      }
     }
   }
 
@@ -2649,25 +2558,16 @@ export function PdfWorkspacePage() {
             chatPanel={(
               <ChatPanel
                 messages={visibleConversationMessages}
+                sessions={readerChatSessions}
+                activeSessionId={activeChatSessionId}
+                onSessionChange={handleSessionChange}
+                onNewSession={handleNewChat}
                 isAsking={isAsking}
                 latestAssistantMessageId={latestAssistantMessageId}
                 messagesContainerRef={messagesContainerRef}
                 composerAttachments={composerAttachments}
                 onRemoveAttachment={removeComposerAttachment}
                 questionInput={questionInput}
-                currentPage={currentPage}
-                pageFilter={pageFilter}
-                pageAnnotations={pageFilter === null ? [] : visibleAnnotations}
-                draftDoubt={draftDoubt}
-                selectedAnnotation={selectedAnnotation}
-                onCreateDoubt={() => {
-                  setDraftDoubt(createDraftDoubt(pageFilter ?? currentPage))
-                  setSelectedAnnotationId(null)
-                  setQuestionInput('')
-                  setComposerAttachments([])
-                  setIsCaptureMode(false)
-                }}
-                onSelectAnnotation={handleSelectAnnotation}
                 onQuestionInputChange={setQuestionInput}
                 onQuestionInputKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
@@ -2682,8 +2582,16 @@ export function PdfWorkspacePage() {
                 activeModel={apiConfig.doubtModel}
                 onModelChange={handleModelChange}
                 onSend={() => void runQuestion()}
-                isSavingDoubt={isSavingDoubt}
-                canSend={!(isAsking || isSavingDoubt || !questionInput.trim() || !documentText.trim())}
+                onStop={handleStopGeneration}
+                canSend={!(
+                  isAsking ||
+                  !questionInput.trim() ||
+                  !(
+                    documentText.trim() ||
+                    selectedHomework?.extractedMarkdown.trim() ||
+                    currentViewerStructuredBlocks.length
+                  )
+                )}
               />
             )}
             workspaceHistoryPanel={isLectureViewer ? (
@@ -2775,4 +2683,3 @@ export function PdfWorkspacePage() {
     </main>
   )
 }
-

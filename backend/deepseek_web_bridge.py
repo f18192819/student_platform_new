@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -159,6 +159,38 @@ class DeepSeekWebBridgeClient:
     if not text:
       raise DeepSeekWebBridgeError('page_changed', 'DeepSeek 网页没有返回可用回答。')
     return text
+
+  def chat_stream(
+    self,
+    base_url: str,
+    prompt: str,
+    *,
+    timeout: float = 300,
+  ) -> Iterator[dict[str, Any]]:
+    response = self._request(
+      self._post,
+      f'{normalize_bridge_url(base_url)}/v1/chat/stream',
+      json={
+        'prompt': prompt,
+        'conversation_id': None,
+        'response_format': 'text',
+      },
+      timeout=timeout,
+      stream=True,
+    )
+    for raw_line in response.iter_lines(decode_unicode=True):
+      line = str(raw_line or '').strip()
+      if not line.startswith('data:'):
+        continue
+      payload_text = line[5:].strip()
+      if not payload_text:
+        continue
+      try:
+        payload = json.loads(payload_text)
+      except json.JSONDecodeError as exc:
+        raise DeepSeekWebBridgeError('page_changed', 'DeepSeek Web Bridge 返回了无效流事件。') from exc
+      if isinstance(payload, dict):
+        yield payload
 
   def ocr(
     self,

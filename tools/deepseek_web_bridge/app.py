@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal, Protocol, Sequence
+from typing import AsyncIterator, Literal, Protocol, Sequence
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from backend.config import PROJECT_ROOT
 
@@ -26,6 +28,7 @@ class BridgeClient(Protocol):
   async def open_browser(self) -> dict[str, bool]: ...
   async def status(self) -> dict[str, bool]: ...
   async def chat(self, prompt: str, response_format: Literal['text', 'json'] = 'text') -> str: ...
+  def chat_stream(self, prompt: str) -> AsyncIterator[dict[str, str]]: ...
   async def ocr(
     self,
     files: Sequence[Path],
@@ -79,6 +82,21 @@ def create_bridge_app(client: BridgeClient | None = None) -> FastAPI:
       return ChatResponse(text=await client.chat(request.prompt, request.response_format))
     except BridgeOperationError as exc:
       raise _http_error(exc) from exc
+
+  @app.post('/v1/chat/stream')
+  async def chat_stream(request: ChatRequest):
+    if request.response_format != 'text':
+      raise HTTPException(status_code=422, detail='Streaming only supports text responses.')
+
+    async def events():
+      try:
+        async for event in client.chat_stream(request.prompt):
+          yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
+      except BridgeOperationError as exc:
+        payload = {'type': 'error', 'content': '', 'message': str(exc), 'code': exc.code}
+        yield f'data: {json.dumps(payload, ensure_ascii=False)}\n\n'
+
+    return StreamingResponse(events(), media_type='text/event-stream')
 
   @app.post('/v1/ocr', response_model=OcrResponse)
   async def ocr(
