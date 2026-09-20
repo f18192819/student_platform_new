@@ -3362,7 +3362,6 @@
 .pdf-stage__page-surface {
   position: relative;
   box-sizing: border-box;
-  max-width: 100%;
   min-width: 0;
   min-height: 220px;
   background: #ffffff;
@@ -3410,6 +3409,12 @@
 
 .pdf-stage__page-canvas {
   display: block;
+  visibility: hidden;
+  box-shadow: none;
+}
+
+.pdf-stage__page-canvas[data-visual-ready='true'] {
+  visibility: visible;
 }
 
 .pdf-stage__page-raster {

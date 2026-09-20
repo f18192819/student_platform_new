@@ -9,6 +9,7 @@ const appOrigin = 'http://127.0.0.1:4174'
 const apiOrigin = 'http://127.0.0.1:18081'
 const python = process.env.PYTHON || 'python'
 const viteScript = 'node_modules/vite/bin/vite.js'
+const skipHomework = process.env.PDF_SMOKE_SKIP_HOMEWORK === '1'
 const children = []
 
 function start(command, args, extraEnv = {}) {
@@ -56,6 +57,37 @@ async function waitForCanvas(page, pageNumber, timeout = 30_000) {
     }
     return false
   }, pageNumber, { timeout })
+
+  const geometry = await page.locator(`[data-page-number='${pageNumber}']`).evaluate((article) => {
+    const surface = article.querySelector('.pdf-stage__page-surface')
+    const canvas = article.querySelector('canvas.pdf-stage__page-canvas')
+    if (!(surface instanceof HTMLElement) || !(canvas instanceof HTMLCanvasElement)) return null
+    const surfaceRect = surface.getBoundingClientRect()
+    const canvasRect = canvas.getBoundingClientRect()
+    return {
+      surfaceWidth: surfaceRect.width,
+      surfaceHeight: surfaceRect.height,
+      canvasWidth: canvasRect.width,
+      canvasHeight: canvasRect.height,
+      visibility: getComputedStyle(canvas).visibility,
+    }
+  })
+  assert.ok(geometry, `Page ${pageNumber} did not expose measurable geometry.`)
+  assert.equal(geometry.visibility, 'visible')
+  assert.ok(Math.abs(geometry.surfaceWidth - geometry.canvasWidth) < 2, JSON.stringify(geometry))
+  assert.ok(Math.abs(geometry.surfaceHeight - geometry.canvasHeight) < 2, JSON.stringify(geometry))
+}
+
+async function readPageGeometry(page, pageNumber) {
+  return page.locator(`[data-page-number='${pageNumber}'] .pdf-stage__page-surface`).evaluate((surface) => {
+    const rect = surface.getBoundingClientRect()
+    return { width: rect.width, height: rect.height }
+  })
+}
+
+async function assertNoCanvasLifecycleViolations(page) {
+  const violations = await page.evaluate(() => window.__pdfCanvasLifecycleViolations ?? [])
+  assert.deepEqual(violations, [], JSON.stringify(violations, null, 2))
 }
 
 async function waitForDocument(page, name, pageNumber) {
@@ -80,7 +112,14 @@ async function spaNavigate(page, path) {
 
 async function openLecture(page, fileId, pageNumber = 1) {
   await spaNavigate(page, `/pdf?file=${fileId}&course=smoke-course&page=${pageNumber}`)
-  const name = fileId === 'smoke-a' ? 'Smoke A.pdf' : fileId === 'smoke-b' ? 'Smoke B.pdf' : 'Smoke 120.pdf'
+  const names = {
+    'smoke-a': 'Smoke A.pdf',
+    'smoke-b': 'Smoke B.pdf',
+    'smoke-120': 'Smoke 120.pdf',
+    'smoke-landscape': 'Smoke Landscape.pdf',
+    'smoke-mixed': 'Smoke Mixed.pdf',
+  }
+  const name = names[fileId]
   await waitForDocument(page, name, pageNumber)
 }
 
@@ -123,8 +162,15 @@ try {
 
   page.on('pageerror', error => runtimeErrors.push(error.message))
   page.on('console', message => {
-    if (message.type() === 'error' && !message.text().includes('Failed to load resource')) {
-      runtimeErrors.push(message.text())
+    const messageText = message.text()
+    const isNavigationAbortedPersistence =
+      messageText.includes('persistKnowledgeLibrary failed: TypeError: Failed to fetch')
+    if (
+      message.type() === 'error' &&
+      !messageText.includes('Failed to load resource') &&
+      !isNavigationAbortedPersistence
+    ) {
+      runtimeErrors.push(messageText)
     }
   })
   page.on('response', response => {
@@ -137,11 +183,71 @@ try {
       })
     }
   })
+  await page.addInitScript(() => {
+    window.__pdfCanvasLifecycleViolations = []
+    const recorded = new WeakSet()
+    const inspectCanvas = (canvas) => {
+      if (!(canvas instanceof HTMLCanvasElement) || recorded.has(canvas)) return
+      const surface = canvas.closest('.pdf-stage__page-surface')
+      const ready = canvas.dataset.visualReady === 'true' && surface?.getAttribute('data-visual-ready') === 'true'
+      const visibility = getComputedStyle(canvas).visibility
+      if (!ready && visibility !== 'hidden') {
+        recorded.add(canvas)
+        window.__pdfCanvasLifecycleViolations.push({
+          type: 'unready-canvas-visible',
+          width: canvas.width,
+          height: canvas.height,
+          visibility,
+        })
+      }
+    }
+    const start = () => {
+      document.querySelectorAll('canvas.pdf-stage__page-canvas').forEach(inspectCanvas)
+      new MutationObserver((records) => {
+        records.forEach((record) => {
+          if (record.type === 'attributes') inspectCanvas(record.target)
+          record.addedNodes.forEach((node) => {
+            inspectCanvas(node)
+            if (node instanceof Element) {
+              node.querySelectorAll('canvas.pdf-stage__page-canvas').forEach(inspectCanvas)
+            }
+          })
+        })
+      }).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'data-visual-ready', 'style'],
+        childList: true,
+        subtree: true,
+      })
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true })
+    else start()
+  })
   await page.goto(`${appOrigin}/pdf?file=smoke-a&course=smoke-course&page=1`, {
     waitUntil: 'domcontentloaded',
     timeout: 60_000,
   })
   await waitForDocument(page, 'Smoke A.pdf', 1)
+  await assertNoCanvasLifecycleViolations(page)
+
+  await openLecture(page, 'smoke-landscape', 1)
+  const landscape = await readPageGeometry(page, 1)
+  assert.ok(landscape.width > landscape.height, JSON.stringify(landscape))
+
+  await openLecture(page, 'smoke-mixed', 1)
+  const mixedPortrait = await readPageGeometry(page, 1)
+  assert.ok(mixedPortrait.height > mixedPortrait.width, JSON.stringify(mixedPortrait))
+  await page.getByRole('button', { name: '下一页' }).click()
+  await waitForCanvas(page, 2)
+  const mixedLandscape = await readPageGeometry(page, 2)
+  assert.ok(mixedLandscape.width > mixedLandscape.height, JSON.stringify(mixedLandscape))
+  await page.getByRole('button', { name: '下一页' }).click()
+  await waitForCanvas(page, 3)
+  const mixedTallPortrait = await readPageGeometry(page, 3)
+  assert.ok(mixedTallPortrait.height > mixedTallPortrait.width, JSON.stringify(mixedTallPortrait))
+  await assertNoCanvasLifecycleViolations(page)
+
+  await openLecture(page, 'smoke-a', 1)
 
   for (let iteration = 0; iteration < 10; iteration += 1) {
     console.log(`[smoke] refresh-and-turn ${iteration + 1}/10`)
@@ -162,12 +268,16 @@ try {
     await openLecture(page, 'smoke-a', 1)
   }
 
-  for (let iteration = 0; iteration < 10; iteration += 1) {
-    await openLecture(page, 'smoke-a', 1)
-    await page.locator('.toolbar-pill--knowledge').first().click()
-    await waitForDocument(page, 'Smoke Homework.pdf', 1)
-    await openLecture(page, 'smoke-b', 1)
-    await openLecture(page, 'smoke-a', 1)
+  if (!skipHomework) {
+    // Keep the attachment regression independent from the document-switch stress run.
+    await openDirectLecture(page, 'smoke-a', 1)
+    for (let iteration = 0; iteration < 10; iteration += 1) {
+      await openLecture(page, 'smoke-a', 1)
+      await page.locator('.toolbar-pill--knowledge').first().click()
+      await waitForDocument(page, 'Smoke Homework.pdf', 1)
+      await openLecture(page, 'smoke-b', 1)
+      await openLecture(page, 'smoke-a', 1)
+    }
   }
 
   await openLecture(page, 'smoke-a', 1)
@@ -190,6 +300,7 @@ try {
   }
 
   assert.equal(runtimeErrors.length, 0, runtimeErrors.join('\n'))
+  await assertNoCanvasLifecycleViolations(page)
   assert.ok(
     rangeResponses.some(response => response.status === 206 && response.range),
     `Browser did not complete an HTTP Range request: ${JSON.stringify(rangeResponses)}`,

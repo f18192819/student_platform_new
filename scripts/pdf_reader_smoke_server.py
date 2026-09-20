@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import random
 
@@ -20,6 +21,7 @@ def build_pdf(
   page_count: int,
   hue: tuple[float, float, float],
   range_padding_bytes: int = 0,
+  page_sizes: list[tuple[float, float]] | None = None,
 ) -> Path:
   target = FIXTURE_ROOT / name
   if target.exists() and (not range_padding_bytes or target.stat().st_size > 2 * 65_536):
@@ -29,9 +31,14 @@ def build_pdf(
 
   document = fitz.open()
   for page_index in range(page_count):
-    page = document.new_page(width=612, height=792)
-    page.draw_rect(fitz.Rect(36, 36, 576, 150), color=hue, fill=hue)
-    page.draw_rect(fitz.Rect(72, 220, 540, 650), color=(0.1, 0.2, 0.35), width=3)
+    width, height = page_sizes[page_index] if page_sizes else (612, 792)
+    page = document.new_page(width=width, height=height)
+    page.draw_rect(fitz.Rect(36, 36, width - 36, min(150, height - 36)), color=hue, fill=hue)
+    page.draw_rect(
+      fitz.Rect(72, min(220, height * 0.32), width - 72, height - 72),
+      color=(0.1, 0.2, 0.35),
+      width=3,
+    )
     page.insert_text(
       fitz.Point(64, 105),
       f'{name} / page {page_index + 1}',
@@ -39,7 +46,7 @@ def build_pdf(
       color=(1, 1, 1),
     )
     page.insert_text(
-      fitz.Point(96, 300),
+      fitz.Point(96, min(300, height * 0.48)),
       f'PDF reader smoke fixture {page_index + 1}',
       fontsize=18,
       color=(0.05, 0.08, 0.12),
@@ -57,6 +64,18 @@ PDF_PATHS = {
   'smoke-b': build_pdf('smoke-b.pdf', 3, (0.72, 0.22, 0.32)),
   'smoke-120': build_pdf('smoke-120.pdf', 120, (0.18, 0.58, 0.34), 256 * 1024),
   'smoke-homework': build_pdf('smoke-homework.pdf', 3, (0.55, 0.30, 0.72)),
+  'smoke-landscape': build_pdf(
+    'smoke-landscape.pdf',
+    2,
+    (0.12, 0.48, 0.55),
+    page_sizes=[(960, 540), (960, 540)],
+  ),
+  'smoke-mixed': build_pdf(
+    'smoke-mixed.pdf',
+    3,
+    (0.78, 0.42, 0.12),
+    page_sizes=[(612, 792), (960, 540), (540, 960)],
+  ),
 }
 
 
@@ -101,14 +120,22 @@ def homework_document() -> dict:
   }
 
 
-def file_record(file_id: str, name: str, page_count: int) -> dict:
+def file_record(
+  file_id: str,
+  name: str,
+  page_count: int,
+  page_sizes: list[tuple[float, float]] | None = None,
+) -> dict:
   return {
     'id': file_id,
     'sourceKey': f'smoke:{file_id}',
     'courseId': 'smoke-course',
     'fileName': name,
     'pageCount': page_count,
-    'pageSizes': [{'width': 612, 'height': 792} for _ in range(page_count)],
+    'pageSizes': [
+      {'width': width, 'height': height}
+      for width, height in (page_sizes or [(612, 792) for _ in range(page_count)])
+    ],
     'byteSize': PDF_PATHS[file_id].stat().st_size,
     'hasPdfSource': True,
     'markdown': f'# {name}',
@@ -133,6 +160,8 @@ LIBRARY = {
     file_record('smoke-a', 'Smoke A.pdf', 3),
     file_record('smoke-b', 'Smoke B.pdf', 3),
     file_record('smoke-120', 'Smoke 120.pdf', 120),
+    file_record('smoke-landscape', 'Smoke Landscape.pdf', 2, [(960, 540), (960, 540)]),
+    file_record('smoke-mixed', 'Smoke Mixed.pdf', 3, [(612, 792), (960, 540), (540, 960)]),
   ],
   'courses': [{
     'id': 'smoke-course',
@@ -186,6 +215,8 @@ async def read_pdf(file_id: str) -> FileResponse:
   path = PDF_PATHS.get(file_id)
   if not path:
     raise HTTPException(status_code=404)
+  if file_id == 'smoke-landscape':
+    await asyncio.sleep(0.25)
   return FileResponse(path, media_type='application/pdf')
 
 

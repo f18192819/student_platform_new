@@ -664,15 +664,17 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
     let cancelled = false
     let renderTask: ReturnType<Awaited<ReturnType<PdfController['getPage']>>['render']> | null = null
 
+    setPageData(null)
+    setRenderError(null)
+    setVisualReady(false)
+    setRasterReady(false)
+
     const renderPage = async () => {
       const canvas = canvasRef.current
       if (!canvas) {
         return
       }
 
-      setRenderError(null)
-      setVisualReady(false)
-      setRasterReady(false)
       pdfMark('render-start', pageNumber)
       pdfDiagnostic('page render start', {
         controllerId: getPdfControllerId(pdfController),
@@ -1240,17 +1242,19 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       <canvas
         ref={canvasRef}
         className="pdf-stage__page-canvas"
-        style={
-          pageData
+        data-visual-ready={pageData && visualReady ? 'true' : 'false'}
+        aria-hidden={!pageData || !visualReady}
+        style={{
+          ...(pageData
             ? {
                 width: `${pageData.width}px`,
                 height: `${pageData.height}px`,
                 transform: `scale(${displayScale})`,
                 transformOrigin: 'top left',
-                visibility: 'visible',
               }
-            : undefined
-        }
+            : {}),
+          visibility: pageData && visualReady ? 'visible' : 'hidden',
+        }}
       />
       {interactive && pageData && !hasLocalMineruBlocks ? (
         <div
@@ -2369,14 +2373,14 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     setRenderError(null)
   }
 
-  const firstRenderedPage =
-    renderedPagesRef.current.get(1) ?? renderedPagesRef.current.values().next().value
-  const firstPageWidth =
-    getFallbackRenderedPageWidth(pdfController, 1) ?? firstRenderedPage?.width ?? null
+  const currentPageWidth =
+    getFallbackRenderedPageWidth(pdfController, currentPage) ??
+    renderedPagesRef.current.get(currentPage)?.width ??
+    null
   const effectiveViewportWidth = viewportRef.current?.clientWidth || viewportWidth || 0
   const fitScale =
-    firstPageWidth && effectiveViewportWidth
-      ? Math.min(1, Math.max(0.45, (effectiveViewportWidth - 52) / firstPageWidth))
+    currentPageWidth && effectiveViewportWidth
+      ? Math.min(1, Math.max(0.45, (effectiveViewportWidth - 52) / currentPageWidth))
       : 1
   const displayScale = zoom * fitScale
   return (
@@ -2584,6 +2588,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                   </div>
                   {shouldRenderPage ? (
                     <PdfPageCanvas
+                      key={`${getPdfControllerId(pdfController)}:${pageNumber}`}
                       pdfController={pdfController}
                       pageNumber={pageNumber}
                       fallbackImageUrl={pageImageUrl?.(pageNumber) ?? null}

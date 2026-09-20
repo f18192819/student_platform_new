@@ -359,8 +359,6 @@
 .reader-workspace .pdf-stage__question-banner-meta strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .reader-workspace .pdf-stage__viewport { padding-bottom: 76px; background: var(--reader-canvas-bg); scrollbar-color: #aeb9c8 transparent; scrollbar-width: thin; }
 .reader-workspace .pdf-stage__page-label { color: #53647c; font-size: 11px; font-weight: 600; }
-.reader-workspace .pdf-stage__page-canvas { box-shadow: 0 5px 20px rgba(28, 43, 64, 0.1); }
-
 .reader-workspace-panel .related-materials-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; padding: 0; border: 0; background: transparent; box-shadow: none; }
 .reader-workspace-panel .related-materials-panel__head { display: grid; gap: 4px; padding: 15px 14px 10px; border-bottom: 1px solid var(--reader-border-subtle); }
 .reader-workspace-panel .related-materials-panel__head strong { font-size: 13px; }
