@@ -317,6 +317,23 @@ export function hasUsableApiConfig(config: ApiConfig) {
 }
 
 export type DeepSeekWebBridgeStatus = {
+  bridge: {
+    alive: boolean
+    ready: boolean
+    owned: boolean
+    pid: number | null
+    url: string
+    last_health_check_at: string | null
+    last_error: string | null
+  }
+  browser: {
+    browser_running: boolean
+    logged_in: boolean
+    chat_available: boolean
+    image_upload_available: boolean
+    status_available: boolean
+    error: string | null
+  }
   browser_running: boolean
   logged_in: boolean
   chat_available: boolean

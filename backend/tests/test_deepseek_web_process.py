@@ -100,6 +100,28 @@ class DeepSeekWebProcessManagerTest(unittest.TestCase):
     manager.stop()
     self.assertTrue(owned.terminated)
 
+  def test_status_distinguishes_external_and_owned_bridge(self):
+    external = DeepSeekWebProcessManager(get=lambda *_args, **_kwargs: Response(200))
+    external_status = external.status('http://127.0.0.1:8765')
+    self.assertTrue(external_status['alive'])
+    self.assertTrue(external_status['ready'])
+    self.assertFalse(external_status['owned'])
+    self.assertIsNone(external_status['pid'])
+
+    responses = iter([Response(503), Response(503), Response(200), Response(200)])
+    owned = OwnedProcess()
+    started = DeepSeekWebProcessManager(
+      get=lambda *_args, **_kwargs: next(responses),
+      popen=lambda *_args, **_kwargs: owned,
+      sleep=lambda _seconds: None,
+    )
+    started.ensure_started('http://127.0.0.1:8765')
+    owned_status = started.status('http://127.0.0.1:8765')
+    self.assertTrue(owned_status['alive'])
+    self.assertTrue(owned_status['ready'])
+    self.assertTrue(owned_status['owned'])
+    self.assertEqual(321, owned_status['pid'])
+
 
 if __name__ == '__main__':
   unittest.main()

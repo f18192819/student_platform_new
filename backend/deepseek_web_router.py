@@ -13,7 +13,10 @@ from .deepseek_web_process import (
   DeepSeekWebStartupError,
   deepseek_web_process_manager,
 )
-from .deepseek_web_runtime import ensure_deepseek_web_bridge
+from .deepseek_web_runtime import (
+  ensure_deepseek_web_bridge,
+  get_deepseek_web_bridge_status,
+)
 from .runtime_config import load_api_config
 
 
@@ -51,7 +54,12 @@ def create_deepseek_web_router(
 
   @router.get('/status')
   async def status() -> dict[str, Any]:
-    return await execute(bridge.status, bridge_url())
+    return await asyncio.to_thread(
+      get_deepseek_web_bridge_status,
+      config=load_api_config() or {},
+      bridge=bridge,
+      process_manager=manager,
+    )
 
   @router.post('/open')
   async def open_browser(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:

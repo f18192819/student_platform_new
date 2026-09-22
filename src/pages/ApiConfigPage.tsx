@@ -170,8 +170,9 @@ function DeepSeekBridgePanel({
         <small className="settings-field__hint">仅允许连接本机 127.0.0.1 或 localhost。</small>
       </label>
       <div className="deepseek-bridge-status" aria-live="polite">
-        <span className={status?.browser_running ? 'is-ready' : ''}>Bridge {status?.browser_running ? '已连接' : '未连接'}</span>
+        <span className={status?.bridge.alive ? 'is-ready' : ''}>Bridge {status?.bridge.alive ? '已运行' : '未运行'}</span>
         <span className={status?.logged_in ? 'is-ready' : ''}>网页 {status?.logged_in ? '已登录' : '未登录'}</span>
+        {status?.bridge.pid ? <span>PID {status.bridge.pid}</span> : null}
         <p>{message}</p>
       </div>
       <div className="model-config-actions">
@@ -235,7 +236,13 @@ export function ApiConfigPage() {
     try {
       const next = await fetchDeepSeekWebBridgeStatus()
       setBridgeStatus(next)
-      setBridgeMessage(next.logged_in ? 'Bridge 已连接，DeepSeek 网页已登录。' : 'Bridge 已连接，请打开浏览器完成登录。')
+      setBridgeMessage(
+        next.logged_in
+          ? 'Bridge 进程正常，DeepSeek 网页已登录。'
+          : next.bridge.alive
+            ? 'Bridge 进程正常，请打开浏览器完成 DeepSeek 登录。'
+            : next.bridge.last_error || '未检测到 Bridge 进程，请检查启动日志。',
+      )
     } catch (error) {
       setBridgeStatus(null)
       setBridgeMessage(error instanceof Error ? error.message : '未检测到 DeepSeek Web Bridge。')
@@ -615,10 +622,10 @@ export function ApiConfigPage() {
   const serviceReadiness = {
     text: Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.model.trim()),
     doubt: form.doubtProvider === 'deepseek-web'
-      ? Boolean(bridgeStatus?.logged_in && bridgeStatus.chat_available)
+      ? Boolean(bridgeStatus?.bridge.ready && bridgeStatus.logged_in && bridgeStatus.chat_available)
       : Boolean(form.baseUrl.trim() && form.apiKey.trim() && form.doubtModel.trim()),
     ocr: form.ocrProvider === 'deepseek-web'
-      ? Boolean(bridgeStatus?.logged_in && bridgeStatus.image_upload_available)
+      ? Boolean(bridgeStatus?.bridge.ready && bridgeStatus.logged_in && bridgeStatus.image_upload_available)
       : Boolean(form.ocrBaseUrl.trim() && form.ocrApiKey.trim() && form.ocrModel.trim()),
     knowledge: Boolean(
       form.embeddingBaseUrl.trim() &&

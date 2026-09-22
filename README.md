@@ -94,6 +94,27 @@ npm run dev
 http://127.0.0.1:4173
 ```
 
+### DeepSeek Web mode
+
+When either the question-answering provider (`doubtProvider`) or the grading/OCR provider
+(`ocrProvider`) is set to `deepseek-web`, the backend automatically starts the local
+DeepSeek Web Bridge on demand. API-only mode does not start this process. Switching from
+API mode to Web mode while the service is running triggers the same startup flow before
+the configuration request returns.
+
+The first Web-mode use requires a manual login in the Bridge's dedicated persistent
+browser profile. Install its dependencies once:
+
+```bash
+python -m pip install -r tools/deepseek_web_bridge/requirements.txt
+python -m playwright install chromium
+```
+
+The Bridge normally listens on `http://127.0.0.1:8765`. The main service exposes its
+diagnostic state at `http://127.0.0.1:8000/api/deepseek-web/status`; it reports Bridge
+process health separately from browser login state. If the login session expires, open
+the login browser from the settings page and sign in again.
+
 ## Minimal Startup Checklist
 
 如果你只是想确认“当前项目能不能正常上传 PDF / 上传录音 / 问 AI”，请按这个顺序检查：

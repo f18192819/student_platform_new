@@ -36,13 +36,55 @@ class DeepSeekWebProcessManager:
     self._lock = threading.Lock()
     self._process: subprocess.Popen | None = None
     self._process_url: str | None = None
+    self._last_health_check_at: str | None = None
+    self._last_health_url: str | None = None
+    self._last_error: str | None = None
+
+  @staticmethod
+  def _now_iso() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
   def _healthy(self, base_url: str) -> bool:
+    self._last_health_check_at = self._now_iso()
+    self._last_health_url = base_url
     try:
       response = self._get(f'{base_url}/health', timeout=1)
-      return int(response.status_code) == 200
+      healthy = int(response.status_code) == 200
+      if healthy:
+        self._last_error = None
+      else:
+        self._last_error = f'health returned HTTP {response.status_code}'
+      return healthy
     except requests.RequestException:
+      self._last_error = 'health check connection failed'
       return False
+
+  def status(self, base_url: str, *, probe: bool = True) -> dict[str, Any]:
+    """Return process/health state without starting a Bridge process."""
+    normalized_url = normalize_bridge_url(base_url)
+    if probe:
+      ready = self._healthy(normalized_url)
+    else:
+      ready = False
+      if self._last_health_url == normalized_url:
+        ready = self._last_error is None and self._last_health_check_at is not None
+
+    process = self._process if self._process_url == normalized_url else None
+    process_alive = process is not None and process.poll() is None
+    if not ready and not process_alive and self._last_health_url != normalized_url:
+      self._last_error = None
+
+    return {
+      'alive': bool(ready or process_alive),
+      'ready': bool(ready),
+      'owned': bool(process_alive),
+      'pid': process.pid if process_alive else None,
+      'url': normalized_url,
+      'last_health_check_at': (
+        self._last_health_check_at if self._last_health_url == normalized_url else None
+      ),
+      'last_error': self._last_error if self._last_health_url == normalized_url else None,
+    }
 
   def ensure_started(self, base_url: str, *, timeout: float = 15) -> dict[str, Any]:
     normalized_url = normalize_bridge_url(base_url)
@@ -50,11 +92,25 @@ class DeepSeekWebProcessManager:
     if parsed.scheme != 'http':
       raise DeepSeekWebStartupError('本地 DeepSeek Bridge 自动启动仅支持 http 地址。')
     if self._healthy(normalized_url):
-      return {'started': False, 'ready': True, 'pid': None}
+      return {
+        'started': False,
+        'ready': True,
+        'pid': None,
+        'owned': False,
+        'url': normalized_url,
+        'last_health_check_at': self._last_health_check_at,
+      }
 
     with self._lock:
       if self._healthy(normalized_url):
-        return {'started': False, 'ready': True, 'pid': None}
+        return {
+          'started': False,
+          'ready': True,
+          'pid': None,
+          'owned': False,
+          'url': normalized_url,
+          'last_health_check_at': self._last_health_check_at,
+        }
       if self._process is not None and self._process.poll() is not None:
         self._process = None
         self._process_url = None
@@ -78,6 +134,9 @@ class DeepSeekWebProcessManager:
             'started': started,
             'ready': True,
             'pid': self._process.pid if self._process else None,
+            'owned': self._process is not None,
+            'url': normalized_url,
+            'last_health_check_at': self._last_health_check_at,
           }
         if self._process is not None and self._process.poll() is not None:
           break
@@ -85,6 +144,7 @@ class DeepSeekWebProcessManager:
 
       details = self._latest_log_details()
       self._stop_owned_process()
+      self._last_error = details or 'health check timed out'
       raise DeepSeekWebStartupError(
         'DeepSeek Web Bridge 启动失败。'
         + (f' {details}' if details else '请检查 Playwright 和 Chromium 是否已安装。')

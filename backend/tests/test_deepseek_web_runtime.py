@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from backend.deepseek_web_runtime import (
   ensure_deepseek_web_bridge,
+  get_deepseek_web_bridge_status,
   resolve_deepseek_web_bridge_url,
   should_auto_start_deepseek_web_bridge,
 )
@@ -49,6 +50,36 @@ class DeepSeekWebRuntimeTest(unittest.TestCase):
     self.assertFalse(should_auto_start_deepseek_web_bridge({
       'doubtProvider': 'api', 'ocrProvider': 'api',
     }))
+
+  def test_status_keeps_bridge_health_separate_from_login_state(self):
+    manager = Mock()
+    manager.status.return_value = {
+      'alive': True,
+      'ready': True,
+      'owned': True,
+      'pid': 42,
+      'url': 'http://127.0.0.1:8765',
+      'last_health_check_at': '2026-09-22T00:00:00Z',
+      'last_error': None,
+    }
+    bridge = Mock()
+    bridge.status.return_value = {
+      'browser_running': True,
+      'logged_in': False,
+      'chat_available': False,
+      'image_upload_available': False,
+    }
+
+    result = get_deepseek_web_bridge_status(
+      {'deepseekWebBridgeUrl': 'http://127.0.0.1:8765'},
+      bridge=bridge,
+      process_manager=manager,
+    )
+
+    self.assertTrue(result['bridge']['ready'])
+    self.assertTrue(result['bridge']['owned'])
+    self.assertFalse(result['browser']['logged_in'])
+    self.assertFalse(result['logged_in'])
 
 
 if __name__ == '__main__':

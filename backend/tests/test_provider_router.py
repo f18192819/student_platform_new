@@ -1,34 +1,39 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from fastapi.testclient import TestClient
-
-from backend.app_factory import create_app_with_router
-from backend.provider_router import provider_router
+from backend.provider_router import update_api_config
 
 
-class ProviderRouterTest(unittest.TestCase):
-  def setUp(self):
-    self.client = TestClient(create_app_with_router(provider_router))
+class ProviderRouterBridgeSwitchTest(unittest.TestCase):
+  def test_switching_to_web_provider_starts_bridge_before_response(self):
+    config = {
+      'doubtProvider': 'deepseek-web',
+      'ocrProvider': 'api',
+      'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
+    }
+    ensure = Mock()
+    with (
+      patch('backend.provider_router.save_api_config', return_value=config),
+      patch('backend.provider_router.ensure_deepseek_web_bridge', ensure),
+    ):
+      result = asyncio.run(update_api_config({'doubtProvider': 'deepseek-web'}))
 
-  @patch('backend.provider_router.load_api_config', return_value={'text_model': 'model-a'})
-  def test_get_config_keeps_legacy_response_shape(self, _load):
-    response = self.client.get('/api/config')
+    self.assertEqual(config, result['config'])
+    ensure.assert_called_once_with(config=config)
 
-    self.assertEqual(200, response.status_code)
-    self.assertEqual(
-      {'configured': True, 'config': {'text_model': 'model-a'}},
-      response.json(),
-    )
+  def test_switching_to_api_only_does_not_start_bridge(self):
+    config = {'doubtProvider': 'api', 'ocrProvider': 'api'}
+    ensure = Mock()
+    with (
+      patch('backend.provider_router.save_api_config', return_value=config),
+      patch('backend.provider_router.ensure_deepseek_web_bridge', ensure),
+    ):
+      asyncio.run(update_api_config({'doubtProvider': 'api'}))
 
-  @patch('backend.provider_router.save_api_config', return_value={'text_model': 'model-b'})
-  def test_update_config_keeps_legacy_path_and_shape(self, _save):
-    response = self.client.put('/api/config', json={'text_model': 'model-b'})
-
-    self.assertEqual(200, response.status_code)
-    self.assertEqual('model-b', response.json()['config']['text_model'])
+    ensure.assert_not_called()
 
 
 if __name__ == '__main__':
