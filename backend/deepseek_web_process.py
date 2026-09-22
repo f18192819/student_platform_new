@@ -35,6 +35,7 @@ class DeepSeekWebProcessManager:
     self._sleep = sleep
     self._lock = threading.Lock()
     self._process: subprocess.Popen | None = None
+    self._process_url: str | None = None
 
   def _healthy(self, base_url: str) -> bool:
     try:
@@ -54,8 +55,18 @@ class DeepSeekWebProcessManager:
     with self._lock:
       if self._healthy(normalized_url):
         return {'started': False, 'ready': True, 'pid': None}
-      if self._process is None or self._process.poll() is not None:
+      if self._process is not None and self._process.poll() is not None:
+        self._process = None
+        self._process_url = None
+      if (
+        self._process is not None
+        and self._process_url is not None
+        and self._process_url != normalized_url
+      ):
+        self._stop_owned_process()
+      if self._process is None:
         self._process = self._launch(parsed.port or 8765)
+        self._process_url = normalized_url
         started = True
       else:
         started = False
@@ -73,10 +84,33 @@ class DeepSeekWebProcessManager:
         self._sleep(0.2)
 
       details = self._latest_log_details()
+      self._stop_owned_process()
       raise DeepSeekWebStartupError(
         'DeepSeek Web Bridge 启动失败。'
         + (f' {details}' if details else '请检查 Playwright 和 Chromium 是否已安装。')
       )
+
+  def _stop_owned_process(self) -> None:
+    process = self._process
+    self._process = None
+    self._process_url = None
+    if process is None:
+      return
+    try:
+      if process.poll() is None:
+        process.terminate()
+        try:
+          process.wait(timeout=3)
+        except (subprocess.TimeoutExpired, TimeoutError):
+          process.kill()
+          process.wait(timeout=3)
+    except (OSError, subprocess.SubprocessError):
+      pass
+
+  def stop(self) -> None:
+    """Stop only a Bridge process launched by this manager instance."""
+    with self._lock:
+      self._stop_owned_process()
 
   def _launch(self, port: int) -> subprocess.Popen:
     log_path = PROJECT_ROOT / '.runtime' / 'logs' / 'deepseek-web-bridge.log'

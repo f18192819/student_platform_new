@@ -18,6 +18,7 @@ from .deepseek_web_bridge import (
   DeepSeekWebBridgeError,
   extract_web_json_object,
 )
+from .deepseek_web_runtime import ensure_deepseek_web_bridge
 from .knowledge_storage import read_knowledge_library
 from .learning_state import LearningStateStore
 from .ocr_transport import (
@@ -437,6 +438,7 @@ class UserAnswerGradingService:
     prompt = StudentAnswerReconstructionPrompt.build(context, mineru)
     if str(config.get('ocrProvider') or 'api') == 'deepseek-web':
       try:
+        ensure_deepseek_web_bridge(config=config)
         raw = self.web_bridge_client.ocr(
           str(config.get('deepseekWebBridgeUrl') or '').strip(),
           [path for path, _ in images],
@@ -555,6 +557,7 @@ class UserAnswerGradingService:
         }, ensure_ascii=False),
       ])
       try:
+        ensure_deepseek_web_bridge(config=config)
         raw = self.web_bridge_client.chat(
           bridge_url,
           _web_structured_prompt(prompt),
@@ -767,6 +770,7 @@ class UserAnswerGradingService:
     bridge_url = str(config.get('deepseekWebBridgeUrl') or '').strip()
     question_transcription = ''
     if question_images:
+      ensure_deepseek_web_bridge(config=config)
       question_transcription = self.web_bridge_client.ocr(
         bridge_url,
         [path for path, _ in question_images],
@@ -775,6 +779,7 @@ class UserAnswerGradingService:
           '不要解题，不要补充原图中不存在的内容。'
         ),
       )
+    ensure_deepseek_web_bridge(config=config)
     answer_transcription = self.web_bridge_client.ocr(
       bridge_url,
       [path for path, _ in answer_images],

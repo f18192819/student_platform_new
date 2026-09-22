@@ -408,7 +408,10 @@ line two with "P point" and \\frac{1}{2}","steps":[],"final_answer":"1/2","block
     self.assertLess(prompt.index('pdf page one'), prompt.index('pdf page two'))
 
   @patch('backend.user_answer_grading.load_api_config')
-  def test_web_mode_uses_bridge_for_reconstruction_and_grading_without_api(self, load_config):
+  @patch('backend.user_answer_grading.ensure_deepseek_web_bridge', return_value={
+    'started': False, 'ready': True, 'pid': None,
+  })
+  def test_web_mode_uses_bridge_for_reconstruction_and_grading_without_api(self, _ensure, load_config):
     load_config.return_value = {
       'ocrProvider': 'deepseek-web',
       'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',

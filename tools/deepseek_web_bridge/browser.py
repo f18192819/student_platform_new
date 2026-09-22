@@ -42,7 +42,8 @@ class PersistentBrowser:
       from playwright.async_api import async_playwright
     except ImportError as exc:
       raise RuntimeError(
-        'Playwright is not installed. Run: pip install -r tools/deepseek_web_bridge/requirements.txt'
+        'DeepSeek Web Bridge requires Playwright. Run: '
+        'python -m pip install -r tools/deepseek_web_bridge/requirements.txt'
       ) from exc
     self.profile_dir.mkdir(parents=True, exist_ok=True)
     self._playwright = await async_playwright().start()
@@ -53,10 +54,15 @@ class PersistentBrowser:
         viewport={'width': 1440, 'height': 960},
         accept_downloads=False,
       )
-    except Exception:
+    except Exception as exc:
       await self._playwright.stop()
       self._playwright = None
-      raise
+      message = str(exc)
+      if 'executable' in message.lower() or 'browserType.launch' in message:
+        raise RuntimeError(
+          'Playwright Chromium is not installed. Run: python -m playwright install chromium'
+        ) from exc
+      raise RuntimeError(f'Unable to launch Playwright Chromium: {message}') from exc
     return self._context
 
   async def page(self):

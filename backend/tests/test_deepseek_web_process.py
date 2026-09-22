@@ -20,6 +20,21 @@ class Process:
     return None
 
 
+class OwnedProcess(Process):
+  def __init__(self):
+    self.terminated = False
+    self.killed = False
+
+  def terminate(self):
+    self.terminated = True
+
+  def kill(self):
+    self.killed = True
+
+  def wait(self, timeout=None):
+    return 0
+
+
 class DeepSeekWebProcessManagerTest(unittest.TestCase):
   def test_ready_bridge_is_not_started_twice(self):
     launches = []
@@ -62,6 +77,28 @@ class DeepSeekWebProcessManagerTest(unittest.TestCase):
     manager = DeepSeekWebProcessManager(get=lambda *_args, **_kwargs: Response(503))
     with self.assertRaises(DeepSeekWebStartupError):
       manager.ensure_started('https://127.0.0.1:8765')
+
+  def test_stop_only_terminates_process_created_by_manager(self):
+    owned = OwnedProcess()
+    manager = DeepSeekWebProcessManager(
+      get=lambda *_args, **_kwargs: Response(200),
+      popen=lambda *_args, **_kwargs: owned,
+    )
+
+    # A healthy external Bridge does not populate _process and must not be stopped.
+    manager.ensure_started('http://127.0.0.1:8765')
+    manager.stop()
+    self.assertFalse(owned.terminated)
+
+    responses = iter([Response(503), Response(503), Response(200)])
+    manager = DeepSeekWebProcessManager(
+      get=lambda *_args, **_kwargs: next(responses),
+      popen=lambda *_args, **_kwargs: owned,
+      sleep=lambda _seconds: None,
+    )
+    manager.ensure_started('http://127.0.0.1:8765')
+    manager.stop()
+    self.assertTrue(owned.terminated)
 
 
 if __name__ == '__main__':

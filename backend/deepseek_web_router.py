@@ -13,6 +13,7 @@ from .deepseek_web_process import (
   DeepSeekWebStartupError,
   deepseek_web_process_manager,
 )
+from .deepseek_web_runtime import ensure_deepseek_web_bridge
 from .runtime_config import load_api_config
 
 
@@ -35,24 +36,32 @@ def create_deepseek_web_router(
       status = 503 if exc.code in {'bridge_not_ready', 'browser_closed'} else 409
       raise HTTPException(status_code=status, detail={'code': exc.code, 'message': str(exc)}) from exc
 
+  async def ensure_bridge(url: str) -> dict[str, Any]:
+    try:
+      return await asyncio.to_thread(
+        ensure_deepseek_web_bridge,
+        bridge_url=url,
+        process_manager=manager,
+      )
+    except (DeepSeekWebBridgeError, DeepSeekWebStartupError) as exc:
+      raise HTTPException(
+        status_code=503,
+        detail={'code': 'bridge_start_failed', 'message': str(exc)},
+      ) from exc
+
   @router.get('/status')
   async def status() -> dict[str, Any]:
     return await execute(bridge.status, bridge_url())
 
   @router.post('/open')
   async def open_browser(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    return await execute(bridge.open_browser, bridge_url(payload))
+    url = bridge_url(payload)
+    await ensure_bridge(url)
+    return await execute(bridge.open_browser, url)
 
   @router.post('/start')
   async def start_bridge(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    try:
-      return await asyncio.to_thread(manager.ensure_started, bridge_url(payload))
-    except (DeepSeekWebBridgeError, DeepSeekWebStartupError) as exc:
-      message = str(exc) or 'DeepSeek Web Bridge 启动失败。'
-      raise HTTPException(
-        status_code=503,
-        detail={'code': 'bridge_start_failed', 'message': message},
-      ) from exc
+    return await ensure_bridge(bridge_url(payload))
 
   @router.post('/chat')
   async def chat(payload: dict[str, Any] = Body(...)) -> dict[str, str]:
@@ -62,9 +71,11 @@ def create_deepseek_web_router(
     response_format = str(payload.get('response_format') or 'text')
     if response_format not in {'text', 'json'}:
       raise HTTPException(status_code=422, detail='response_format must be text or json.')
+    url = bridge_url(payload)
+    await ensure_bridge(url)
     text = await execute(
       bridge.chat,
-      bridge_url(payload),
+      url,
       prompt,
       response_format=response_format,
     )
@@ -75,10 +86,12 @@ def create_deepseek_web_router(
     prompt = str(payload.get('prompt') or '').strip()
     if not prompt:
       raise HTTPException(status_code=422, detail='prompt is required.')
+    url = bridge_url(payload)
+    await ensure_bridge(url)
 
     def events():
       try:
-        for event in bridge.chat_stream(bridge_url(payload), prompt):
+        for event in bridge.chat_stream(url, prompt):
           yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
       except DeepSeekWebBridgeError as exc:
         event = {'type': 'error', 'content': '', 'message': str(exc), 'code': exc.code}

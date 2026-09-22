@@ -17,6 +17,7 @@ from backend.deepseek_web_bridge import (
   normalize_bridge_url,
 )
 from backend.deepseek_web_router import create_deepseek_web_router
+from backend.deepseek_web_process import DeepSeekWebStartupError
 from tools.deepseek_web_bridge.browser import SerializedBrowserTasks
 from tools.deepseek_web_bridge.app import create_bridge_app
 from tools.deepseek_web_bridge.deepseek_client import BridgeOperationError, DeepSeekWebClient
@@ -141,7 +142,10 @@ class DeepSeekWebRouterTest(unittest.TestCase):
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
   })
-  def test_proxy_contract(self, _load):
+  @patch('backend.deepseek_web_router.ensure_deepseek_web_bridge', return_value={
+    'started': False, 'ready': True, 'pid': None,
+  })
+  def test_proxy_contract(self, _ensure, _load):
     client = TestClient(create_app_with_router(create_deepseek_web_router(self.FakeClient())))
     self.assertTrue(client.get('/api/deepseek-web/status').json()['logged_in'])
     self.assertEqual('answer:why', client.post('/api/deepseek-web/chat', json={'prompt': 'why'}).json()['text'])
@@ -149,7 +153,10 @@ class DeepSeekWebRouterTest(unittest.TestCase):
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
   })
-  def test_stream_proxy_contract(self, _load):
+  @patch('backend.deepseek_web_router.ensure_deepseek_web_bridge', return_value={
+    'started': False, 'ready': True, 'pid': None,
+  })
+  def test_stream_proxy_contract(self, _ensure, _load):
     client = TestClient(create_app_with_router(create_deepseek_web_router(self.FakeClient())))
     response = client.post('/api/deepseek-web/chat/stream', json={'prompt': 'why'})
 
@@ -183,7 +190,10 @@ class DeepSeekWebRouterTest(unittest.TestCase):
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
   })
-  def test_proxy_forwards_structured_response_mode(self, _load):
+  @patch('backend.deepseek_web_router.ensure_deepseek_web_bridge', return_value={
+    'started': False, 'ready': True, 'pid': None,
+  })
+  def test_proxy_forwards_structured_response_mode(self, _ensure, _load):
     fake = self.FakeClient()
     client = TestClient(create_app_with_router(create_deepseek_web_router(fake)))
     response = client.post('/api/deepseek-web/chat', json={
@@ -197,7 +207,10 @@ class DeepSeekWebRouterTest(unittest.TestCase):
   @patch('backend.deepseek_web_router.load_api_config', return_value={
     'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
   })
-  def test_not_logged_in_has_stable_error(self, _load):
+  @patch('backend.deepseek_web_router.ensure_deepseek_web_bridge', return_value={
+    'started': False, 'ready': True, 'pid': None,
+  })
+  def test_not_logged_in_has_stable_error(self, _ensure, _load):
     class NotLoggedIn(self.FakeClient):
       def chat(self, _url, _prompt, *, response_format='text'):
         raise DeepSeekWebBridgeError('not_logged_in')
@@ -206,6 +219,31 @@ class DeepSeekWebRouterTest(unittest.TestCase):
     response = client.post('/api/deepseek-web/chat', json={'prompt': 'why'})
     self.assertEqual(409, response.status_code)
     self.assertEqual('not_logged_in', response.json()['detail']['code'])
+
+  @patch('backend.deepseek_web_router.load_api_config', return_value={
+    'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
+  })
+  @patch('backend.deepseek_web_router.ensure_deepseek_web_bridge', return_value={
+    'started': False, 'ready': True, 'pid': None,
+  })
+  def test_open_endpoint_lazy_ensures_before_open(self, ensure, _load):
+    fake = self.FakeClient()
+    client = TestClient(create_app_with_router(create_deepseek_web_router(fake)))
+    response = client.post('/api/deepseek-web/open', json={})
+
+    self.assertEqual(200, response.status_code)
+    ensure.assert_called_once()
+
+  @patch('backend.deepseek_web_router.load_api_config', return_value={
+    'deepseekWebBridgeUrl': 'http://127.0.0.1:8765',
+  })
+  @patch('backend.deepseek_web_router.ensure_deepseek_web_bridge', side_effect=DeepSeekWebStartupError('missing chromium'))
+  def test_lazy_ensure_failure_is_503(self, _ensure, _load):
+    client = TestClient(create_app_with_router(create_deepseek_web_router(self.FakeClient())))
+    response = client.post('/api/deepseek-web/chat', json={'prompt': 'why'})
+
+    self.assertEqual(503, response.status_code)
+    self.assertEqual('bridge_start_failed', response.json()['detail']['code'])
 
 
 class SerializedBrowserTasksTest(unittest.IsolatedAsyncioTestCase):

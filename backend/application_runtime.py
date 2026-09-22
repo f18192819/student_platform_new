@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -24,6 +25,16 @@ from .user_answer_grading import (
   UserAnswerGradingService,
 )
 from .user_answer_review import UserAnswerReviewService
+from .deepseek_web_process import deepseek_web_process_manager
+from .deepseek_web_runtime import (
+  ensure_deepseek_web_bridge,
+  resolve_deepseek_web_bridge_url,
+  should_auto_start_deepseek_web_bridge,
+)
+from .runtime_config import load_api_config
+
+
+logger = logging.getLogger(__name__)
 
 
 class ApplicationRuntime:
@@ -91,6 +102,7 @@ class ApplicationRuntime:
   def start(self) -> None:
     if self.document_pipeline is not None:
       return
+    self._auto_start_deepseek_web_bridge()
     self.user_answer_store.cleanup_deleted_attempt_dirs()
     self._pipeline_executor = ThreadPoolExecutor(
       max_workers=1,
@@ -144,6 +156,20 @@ class ApplicationRuntime:
       print(f'Legacy Qdrant partition migration deferred: {exc}')
     local_mineru_service.start()
     self.user_answer_grading.resume_pending()
+
+  def _auto_start_deepseek_web_bridge(self) -> None:
+    try:
+      config = load_api_config() or {}
+      if should_auto_start_deepseek_web_bridge(config):
+        result = ensure_deepseek_web_bridge(config=config)
+        logger.info(
+          'DeepSeek Web Bridge ready: url=%s ready=%s pid=%s',
+          resolve_deepseek_web_bridge_url(config),
+          result.get('ready'),
+          result.get('pid'),
+        )
+    except Exception as exc:  # noqa: BLE001 - Bridge is optional for main service startup.
+      logger.exception('DeepSeek Web Bridge auto-start failed; continuing without it: %s', exc)
 
   async def run_pipeline_task(self, function, *args, **kwargs):
     if self._pipeline_executor is None:
@@ -199,6 +225,10 @@ class ApplicationRuntime:
     self.pipeline_coordinator = None
     local_mineru_service.stop()
     self.user_answer_grading.shutdown()
+    try:
+      deepseek_web_process_manager.stop()
+    except Exception as exc:  # noqa: BLE001 - shutdown must remain best effort.
+      logger.warning('DeepSeek Web Bridge shutdown cleanup failed: %s', exc)
 
   @asynccontextmanager
   async def lifespan(self, _app):
