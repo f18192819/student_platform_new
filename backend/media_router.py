@@ -2451,29 +2451,125 @@ async def transcribe_audio(
   file: UploadFile = File(...),
   course_id: str | None = Form(None),
   document_id: str | None = Form(None),
+  client_recording_id: str | None = Form(None),
 ) -> dict[str, Any]:
   source_dir: Path | None = None
   source_path: Path | None = None
+  recording: LectureRecording | None = None
+  store = AudioAlignmentService().store
   try:
     source_dir, source_path = _write_upload_file_to_temp(file)
-    result = transcribe_audio_file_with_chunking(source_path)
     normalized_course_id = str(course_id or '').strip()
     normalized_document_id = str(document_id or '').strip()
+    normalized_client_recording_id = str(client_recording_id or '').strip()
     if normalized_document_id and not normalized_course_id:
       raise HTTPException(status_code=422, detail='course_id is required when document_id is provided.')
+    if normalized_client_recording_id and not re.fullmatch(r'[A-Za-z0-9._-]{1,160}', normalized_client_recording_id):
+      raise HTTPException(status_code=422, detail='client_recording_id is invalid.')
+
     storage_course_id = normalized_course_id or UNASSIGNED_AUDIO_COURSE_ID
-    recording_id = str(uuid.uuid4())
+    recording_id = normalized_client_recording_id or str(uuid.uuid4())
+
+    # Idempotent retry: if this client recording already reached durable ASR
+    # storage, return its transcript instead of creating a duplicate history item.
+    if normalized_client_recording_id:
+      try:
+        existing = store.read(storage_course_id, recording_id)
+      except FileNotFoundError:
+        existing = None
+      if isinstance(existing, dict) and str(existing.get('status') or '') in {
+        'transcribed',
+        'aligning',
+        'aligned',
+        'alignment_failed',
+      }:
+        existing_recording = LectureRecording.model_validate(existing.get('recording') or {})
+        existing_segments = [
+          TranscriptSegment.model_validate(item)
+          for item in (existing.get('transcript_segments') or [])
+        ]
+        transcript = '\n'.join(item.text.strip() for item in existing_segments if item.text.strip()).strip()
+        if transcript:
+          return {
+            'text': transcript,
+            'chunks': [{
+              'index': 1,
+              'file_name': Path(existing_recording.audio_path).name,
+              'start_seconds': 0,
+              'end_seconds': existing_recording.duration,
+              'text': transcript,
+              'segments': [{
+                'text': item.text,
+                'start_seconds': item.start_time,
+                'end_seconds': item.end_time,
+              } for item in existing_segments],
+            }],
+            'chunk_count': 1,
+            'duration_seconds': existing_recording.duration,
+            'engine': 'persisted-recording',
+            'model': '',
+            'markdown_path': '',
+            'recording': existing_recording.model_dump(),
+            'transcript_segment_count': len(existing_segments),
+            'pending_course_assignment': existing_recording.course_id == UNASSIGNED_AUDIO_COURSE_ID,
+            'reused_recording': True,
+          }
+
     recording_dir = PROJECT_ROOT / '.runtime' / 'audio-recordings' / storage_course_id / recording_id
     recording_dir.mkdir(parents=True, exist_ok=True)
     saved_audio_path = recording_dir / f'source{source_path.suffix or ".bin"}'
     shutil.copy2(source_path, saved_audio_path)
+
+    created_at = time.time()
+    if normalized_client_recording_id:
+      try:
+        previous = store.read(storage_course_id, recording_id)
+        previous_recording = LectureRecording.model_validate(previous.get('recording') or {})
+        created_at = previous_recording.created_at
+      except (FileNotFoundError, ValueError):
+        pass
+
     recording = LectureRecording(
       id=recording_id,
       course_id=storage_course_id,
       document_id=normalized_document_id or None,
       audio_path=str(saved_audio_path.relative_to(PROJECT_ROOT)),
-      duration=float(result.get('duration_seconds') or 0),
+      duration=0,
+      created_at=created_at,
     )
+
+    # Durably publish the raw audio before ASR. A transcription failure must
+    # never make a successfully captured classroom recording disappear.
+    store.save(recording, [], {
+      'windows': [],
+      'alignments': [],
+      'relations': [],
+      'page_transcripts': [],
+      'status': 'transcribing',
+      'transcription_error': '',
+      'updated_at': time.time(),
+    })
+
+    try:
+      # FunASR/ffmpeg are blocking CPU/subprocess work. Keep them off the
+      # FastAPI event loop so PDF/network-school requests stay responsive.
+      result = await asyncio.to_thread(transcribe_audio_file_with_chunking, source_path)
+    except Exception as exc:
+      detail = str(getattr(exc, 'detail', exc))
+      store.save(recording, [], {
+        'windows': [],
+        'alignments': [],
+        'relations': [],
+        'page_transcripts': [],
+        'status': 'transcription_failed',
+        'transcription_error': detail,
+        'updated_at': time.time(),
+      })
+      raise
+
+    recording = recording.model_copy(update={
+      'duration': float(result.get('duration_seconds') or 0),
+    })
     transcript_segments: list[TranscriptSegment] = []
     for chunk_index, chunk in enumerate(result.get('chunks') or [], start=1):
       if not isinstance(chunk, dict):
@@ -2499,8 +2595,27 @@ async def transcribe_audio(
           text=str(chunk.get('text') or '').strip(),
         ))
     if not transcript_segments:
-      raise HTTPException(status_code=502, detail='ASR returned text but no timestamped transcript segments.')
-    AudioAlignmentService().register(recording, transcript_segments)
+      error = HTTPException(status_code=502, detail='ASR returned text but no timestamped transcript segments.')
+      store.save(recording, [], {
+        'windows': [],
+        'alignments': [],
+        'relations': [],
+        'page_transcripts': [],
+        'status': 'transcription_failed',
+        'transcription_error': error.detail,
+        'updated_at': time.time(),
+      })
+      raise error
+
+    store.save(recording, transcript_segments, {
+      'windows': [],
+      'alignments': [],
+      'relations': [],
+      'page_transcripts': [],
+      'status': 'transcribed',
+      'transcription_error': '',
+      'updated_at': time.time(),
+    })
     result['recording'] = recording.model_dump()
     result['transcript_segment_count'] = len(transcript_segments)
     result['pending_course_assignment'] = not normalized_course_id
