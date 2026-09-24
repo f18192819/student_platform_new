@@ -332,5 +332,33 @@ class PendingAudioAlignmentTest(unittest.TestCase):
         self.assertEqual('recording-unassigned', result['recordings'][0]['recording']['id'])
 
 
+  def test_transcribe_persists_raw_audio_before_asr_failure(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      upload = UploadFile(filename='lesson.webm', file=io.BytesIO(b'audio-bytes'))
+      with (
+        patch('backend.media_router.PROJECT_ROOT', root),
+        patch('backend.audio_alignment.AUDIO_ALIGNMENT_ROOT', root / 'audio-alignment'),
+        patch(
+          'backend.media_router.transcribe_audio_file_with_chunking',
+          side_effect=RuntimeError('simulated ASR failure'),
+        ),
+      ):
+        with self.assertRaisesRegex(RuntimeError, 'simulated ASR failure'):
+          asyncio.run(transcribe_audio(
+            file=upload,
+            course_id='course-1',
+            document_id=None,
+            client_recording_id='draft-recording-1',
+          ))
+
+        stored = AudioAlignmentStore().read('course-1', 'draft-recording-1')
+        self.assertEqual('transcription_failed', stored['status'])
+        self.assertIn('simulated ASR failure', stored['transcription_error'])
+        audio_path = root / stored['recording']['audio_path']
+        self.assertTrue(audio_path.is_file())
+        self.assertEqual(b'audio-bytes', audio_path.read_bytes())
+
+
 if __name__ == '__main__':
   unittest.main()
