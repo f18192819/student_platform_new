@@ -35,3 +35,17 @@ test('classroom history exposes original audio, ASR segments, and processing sta
   assert.match(pageSource, /workspaceHistoryTitle="课堂录音与 ASR"/)
   assert.match(pageSource, /workspaceHistoryLabel="课堂记录"/)
 })
+
+
+test('recording sessions isolate stop finalization from the next capture', () => {
+  assert.match(controllerSource, /type ActiveRecordingSession/)
+  assert.match(controllerSource, /activeSessionRef/)
+  assert.match(controllerSource, /finalizeRecording\(session/)
+  assert.doesNotMatch(controllerSource, /chunksRef|streamRef|chunkWritesRef/)
+})
+
+test('recovery can find legacy stranded IndexedDB drafts', () => {
+  assert.match(draftSource, /window\.localStorage\.getItem\(OWNER_KEY\)/)
+  assert.match(draftSource, /readRecoverableLessonRecordingDrafts/)
+  assert.match(controllerSource, /readRecoverableLessonRecordingDrafts\(\)/)
+})
