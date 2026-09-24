@@ -3,6 +3,7 @@ const DATABASE_VERSION = 1
 const DRAFT_STORE = 'drafts'
 const CHUNK_STORE = 'chunks'
 const OWNER_KEY = 'student-platform:lesson-recording-owner'
+const LEGACY_OWNER_KEY = OWNER_KEY
 
 export type LessonRecordingDraft = {
   id: string
@@ -56,10 +57,15 @@ function openDatabase() {
 }
 
 export function getLessonRecordingOwnerId() {
-  const existing = window.sessionStorage.getItem(OWNER_KEY)?.trim()
-  if (existing) return existing
-  const ownerId = crypto.randomUUID()
-  window.sessionStorage.setItem(OWNER_KEY, ownerId)
+  const persistent = window.localStorage.getItem(OWNER_KEY)?.trim()
+  if (persistent) return persistent
+
+  // Migrate the pre-reliability owner stored in sessionStorage so drafts created
+  // before this change remain recoverable after the next refresh.
+  const legacy = window.sessionStorage.getItem(LEGACY_OWNER_KEY)?.trim()
+  const ownerId = legacy || crypto.randomUUID()
+  window.localStorage.setItem(OWNER_KEY, ownerId)
+  window.sessionStorage.removeItem(LEGACY_OWNER_KEY)
   return ownerId
 }
 
@@ -133,14 +139,14 @@ async function chunksForDraft(database: IDBDatabase, draftId: string) {
   return chunks.sort((left, right) => left.order - right.order)
 }
 
-export async function readLessonRecordingDrafts(ownerId: string) {
+async function readDrafts(ownerId: string | null) {
   const database = await openDatabase()
   try {
     const transaction = database.transaction(DRAFT_STORE, 'readonly')
     const drafts = await requestResult(transaction.objectStore(DRAFT_STORE).getAll()) as LessonRecordingDraft[]
     await transactionDone(transaction)
-    const owned = drafts.filter((draft) => draft.ownerId === ownerId)
-    return Promise.all(owned.map(async (draft) => ({
+    const selected = ownerId ? drafts.filter((draft) => draft.ownerId === ownerId) : drafts
+    return Promise.all(selected.map(async (draft) => ({
       draft,
       blob: new Blob(
         (await chunksForDraft(database, draft.id)).map((chunk) => chunk.blob),
@@ -150,6 +156,19 @@ export async function readLessonRecordingDrafts(ownerId: string) {
   } finally {
     database.close()
   }
+}
+
+export function readLessonRecordingDrafts(ownerId: string) {
+  return readDrafts(ownerId)
+}
+
+/**
+ * Recovery-only escape hatch for drafts created by older tab-scoped owner ids.
+ * This app is local-first/single-user, so a stranded IndexedDB draft is safer
+ * to recover than to silently hide forever.
+ */
+export function readRecoverableLessonRecordingDrafts() {
+  return readDrafts(null)
 }
 
 export async function removeLessonRecordingDraft(draftId: string) {
