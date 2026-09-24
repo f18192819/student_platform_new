@@ -2477,6 +2477,8 @@ async def transcribe_audio(
         existing = store.read(storage_course_id, recording_id)
       except FileNotFoundError:
         existing = None
+      if isinstance(existing, dict) and str(existing.get('status') or '') == 'transcribing':
+        raise HTTPException(status_code=409, detail='This recording is already being transcribed.')
       if isinstance(existing, dict) and str(existing.get('status') or '') in {
         'transcribed',
         'aligning',
