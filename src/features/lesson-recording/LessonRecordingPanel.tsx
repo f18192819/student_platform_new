@@ -3,6 +3,8 @@ import { lectureRecordingMediaUrl, type LectureRecordingView } from './lessonRec
 import './lesson-recording.css'
 
 const STATUS_LABELS: Record<string, string> = {
+  transcribing: '原始录音已保存，正在 ASR',
+  transcription_failed: '原始录音已保存，ASR 失败',
   transcribed: 'ASR 已完成，等待讲义',
   aligning: '正在映射讲义页',
   aligned: '已完成页码映射',
@@ -81,6 +83,7 @@ export function LessonRecordingPanel({
                         </p>
                       )) : <p className="lesson-recording__missing">{transcript || '暂无可展示的识别文本。'}</p>}
                     </div>
+                    {item.transcription_error ? <p className="lesson-recording__warning">ASR：{item.transcription_error}</p> : null}
                     {item.alignment_error ? <p className="lesson-recording__warning">{item.alignment_error}</p> : null}
                   </div>
                 ) : null}
