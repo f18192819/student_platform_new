@@ -886,7 +886,11 @@ export async function askWithConfiguredApi(
 export async function transcribeAudioWithConfiguredAsr(
   audioBlob: Blob,
   _config: ApiConfig,
-  context?: { courseId: string; documentId?: string | null },
+  context?: {
+    courseId: string
+    documentId?: string | null
+    clientRecordingId?: string | null
+  },
 ): Promise<AsrTranscriptionResult> {
   const formData = new FormData()
   const extension = audioBlob.type.includes('mpeg')
@@ -915,6 +919,9 @@ export async function transcribeAudioWithConfiguredAsr(
     if (context.documentId?.trim()) {
       formData.append('document_id', context.documentId.trim())
     }
+  }
+  if (context?.clientRecordingId?.trim()) {
+    formData.append('client_recording_id', context.clientRecordingId.trim())
   }
 
   const response = await fetch(resolveAudioDebugApiUrl(), {

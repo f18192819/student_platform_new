@@ -14,7 +14,8 @@ export type LectureRecordingView = {
     end_time: number
     text: string
   }>
-  status: 'transcribed' | 'aligning' | 'aligned' | 'alignment_failed' | string
+  status: 'transcribing' | 'transcription_failed' | 'transcribed' | 'aligning' | 'aligned' | 'alignment_failed' | string
+  transcription_error?: string
   alignment_error?: string
   updated_at?: number
 }

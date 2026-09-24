@@ -16,6 +16,7 @@ import {
   getLessonRecordingOwnerId,
   markLessonRecordingPending,
   readLessonRecordingDrafts,
+  readRecoverableLessonRecordingDrafts,
   removeLessonRecordingDraft,
 } from './recordingDraftStore'
 import {
@@ -30,6 +31,16 @@ type RecordingContext = {
   documentId: string | null
 }
 
+type ActiveRecordingSession = {
+  recorder: MediaRecorder
+  stream: MediaStream
+  chunks: Blob[]
+  chunkOrder: number
+  chunkWrites: Promise<void>
+  draftId: string | null
+  context: RecordingContext
+}
+
 function contextFromLocation(search: string): RecordingContext {
   const params = new URLSearchParams(search)
   return {
@@ -41,11 +52,7 @@ function contextFromLocation(search: string): RecordingContext {
 export function LessonRecordingController() {
   const location = useLocation()
   const routeContextRef = useRef<RecordingContext>(contextFromLocation(location.search))
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const streamRef = useRef<MediaStream | null>(null)
-  const chunksRef = useRef<Blob[]>([])
-  const chunkOrderRef = useRef(0)
-  const chunkWritesRef = useRef<Promise<void>>(Promise.resolve())
+  const activeSessionRef = useRef<ActiveRecordingSession | null>(null)
   const recoveryStartedRef = useRef(false)
   const startingRef = useRef(false)
 
@@ -57,6 +64,7 @@ export function LessonRecordingController() {
     audioBlob: Blob,
     context: RecordingContext,
     sourceLabel: string,
+    clientRecordingId?: string | null,
   ) => {
     if (!audioBlob.size) return false
 
@@ -68,8 +76,14 @@ export function LessonRecordingController() {
         audioBlob,
         config,
         context.courseId
-          ? { courseId: context.courseId, documentId: context.documentId }
-          : undefined,
+          ? {
+              courseId: context.courseId,
+              documentId: context.documentId,
+              clientRecordingId,
+            }
+          : clientRecordingId
+            ? { courseId: '', documentId: null, clientRecordingId }
+            : undefined,
       )
       recordingPersisted = Boolean(transcript.recording)
 
@@ -98,50 +112,53 @@ export function LessonRecordingController() {
     } catch (error) {
       console.warn(`${sourceLabel} processing failed:`, error)
       emitLessonProcessingState(recordingPersisted ? '课堂映射失败，录音与 ASR 已保存' : '处理失败')
-      if (recordingPersisted) publishLessonRecordingUpdated()
+      // The backend now persists the raw recording before ASR, so a failed
+      // transcription may still have a durable history entry.
+      publishLessonRecordingUpdated()
       return recordingPersisted
     } finally {
       window.setTimeout(() => emitLessonProcessingState(''), 1800)
     }
   }, [])
 
-  const finalizeRecording = useCallback(async (
-    recorder: MediaRecorder,
-    draftId: string | null,
-    context: RecordingContext,
-  ) => {
-    publishLessonRecordingState(false)
-    streamRef.current?.getTracks().forEach((track) => track.stop())
-    streamRef.current = null
-    mediaRecorderRef.current = null
+  const finalizeRecording = useCallback(async (session: ActiveRecordingSession) => {
+    if (activeSessionRef.current === session) {
+      activeSessionRef.current = null
+      publishLessonRecordingState(false)
+    }
+    session.stream.getTracks().forEach((track) => track.stop())
 
-    await chunkWritesRef.current
-    let audioBlob = new Blob(chunksRef.current, {
-      type: recorder.mimeType || 'audio/webm',
+    await session.chunkWrites
+    let audioBlob = new Blob(session.chunks, {
+      type: session.recorder.mimeType || 'audio/webm',
     })
-    chunksRef.current = []
 
-    if (draftId) {
+    if (session.draftId) {
       try {
-        await markLessonRecordingPending(draftId)
+        await markLessonRecordingPending(session.draftId)
         const recovered = (await readLessonRecordingDrafts(getLessonRecordingOwnerId()))
-          .find((item) => item.draft.id === draftId)
+          .find((item) => item.draft.id === session.draftId)
         if (recovered?.blob.size) audioBlob = recovered.blob
       } catch (error) {
         console.warn('Failed to finalize the persistent recording draft:', error)
       }
     }
 
-    const saved = await processRecording(audioBlob, context, '课堂录音')
-    if (saved && draftId) {
-      await removeLessonRecordingDraft(draftId).catch((error) => {
+    const saved = await processRecording(
+      audioBlob,
+      session.context,
+      '课堂录音',
+      session.draftId,
+    )
+    if (saved && session.draftId) {
+      await removeLessonRecordingDraft(session.draftId).catch((error) => {
         console.warn('Failed to remove a submitted recording draft:', error)
       })
     }
   }, [processRecording])
 
   const startRecording = useCallback(async () => {
-    if (startingRef.current || mediaRecorderRef.current?.state === 'recording') return
+    if (startingRef.current || activeSessionRef.current) return
     startingRef.current = true
 
     try {
@@ -161,24 +178,29 @@ export function LessonRecordingController() {
         console.warn('Recording draft persistence is unavailable:', error)
       }
 
-      chunksRef.current = []
-      chunkOrderRef.current = 0
-      chunkWritesRef.current = Promise.resolve()
-      streamRef.current = stream
-      mediaRecorderRef.current = recorder
+      const session: ActiveRecordingSession = {
+        recorder,
+        stream,
+        chunks: [],
+        chunkOrder: 0,
+        chunkWrites: Promise.resolve(),
+        draftId,
+        context,
+      }
+      activeSessionRef.current = session
 
       recorder.addEventListener('dataavailable', (event) => {
         if (!event.data.size) return
-        chunksRef.current.push(event.data)
-        if (!draftId) return
-        const order = chunkOrderRef.current++
-        chunkWritesRef.current = chunkWritesRef.current
-          .then(() => appendLessonRecordingChunk(draftId, order, event.data))
+        session.chunks.push(event.data)
+        if (!session.draftId) return
+        const order = session.chunkOrder++
+        session.chunkWrites = session.chunkWrites
+          .then(() => appendLessonRecordingChunk(session.draftId!, order, event.data))
           .catch((error) => console.warn('Failed to persist a classroom recording chunk:', error))
       })
       recorder.addEventListener(
         'stop',
-        () => void finalizeRecording(recorder, draftId, context),
+        () => void finalizeRecording(session),
         { once: true },
       )
 
@@ -196,9 +218,9 @@ export function LessonRecordingController() {
   }, [finalizeRecording])
 
   const stopRecording = useCallback(() => {
-    const recorder = mediaRecorderRef.current
-    if (!recorder || recorder.state === 'inactive') return
-    recorder.stop()
+    const session = activeSessionRef.current
+    if (!session || session.recorder.state === 'inactive') return
+    session.recorder.stop()
   }, [])
 
   useEffect(() => {
@@ -207,7 +229,7 @@ export function LessonRecordingController() {
 
     const recoverInterruptedRecordings = async () => {
       try {
-        const drafts = await readLessonRecordingDrafts(getLessonRecordingOwnerId())
+        const drafts = await readRecoverableLessonRecordingDrafts()
         const recoverable = drafts.filter((item) => item.blob.size > 0)
         if (!recoverable.length) return
         emitLessonProcessingState(`正在恢复 ${recoverable.length} 段未提交录音`)
@@ -216,7 +238,7 @@ export function LessonRecordingController() {
           const saved = await processRecording(item.blob, {
             courseId: item.draft.courseId,
             documentId: item.draft.documentId,
-          }, '刷新前的课堂录音')
+          }, '刷新前的课堂录音', item.draft.id)
           if (saved) await removeLessonRecordingDraft(item.draft.id)
         }
       } catch (error) {
@@ -231,7 +253,7 @@ export function LessonRecordingController() {
   useEffect(() => {
     const handleToggle = (event: Event) => {
       const detail = (event as CustomEvent<{ nextRecording?: boolean; action?: 'toggle' }>).detail
-      const isRecording = mediaRecorderRef.current?.state === 'recording'
+      const isRecording = activeSessionRef.current?.recorder.state === 'recording'
       const shouldRecord = detail?.action === 'toggle'
         ? !isRecording
         : Boolean(detail?.nextRecording)
@@ -239,10 +261,10 @@ export function LessonRecordingController() {
       else stopRecording()
     }
     const handleStateQuery = () => {
-      publishLessonRecordingState(mediaRecorderRef.current?.state === 'recording')
+      publishLessonRecordingState(activeSessionRef.current?.recorder.state === 'recording')
     }
     const persistLatestSlice = () => {
-      const recorder = mediaRecorderRef.current
+      const recorder = activeSessionRef.current?.recorder
       if (recorder?.state !== 'recording') return
       try {
         recorder.requestData()

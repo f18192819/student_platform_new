@@ -40,7 +40,7 @@ export function useLessonRecordings(courseId: string | null, enabled = true) {
   }, [enabled, refresh])
 
   useEffect(() => {
-    if (!enabled || !records.some((item) => item.status === 'transcribed' || item.status === 'aligning')) {
+    if (!enabled || !records.some((item) => item.status === 'transcribing' || item.status === 'transcribed' || item.status === 'aligning')) {
       return
     }
     const timer = window.setTimeout(() => void refresh(), 2500)
