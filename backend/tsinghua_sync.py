@@ -2021,6 +2021,8 @@ def _fetch_course_entries_via_cookie_session_v2(cookies: list[dict[str, Any]]) -
 def _fetch_course_entries_for_semester_via_cookie_session(
   cookies: list[dict[str, Any]],
   semester_id: str,
+  *,
+  semester_name: str = '',
 ) -> list[dict[str, str]]:
   target_semester_id = _normalize_text(semester_id)
   if not target_semester_id:
@@ -2028,23 +2030,7 @@ def _fetch_course_entries_for_semester_via_cookie_session(
 
   http_session = _build_requests_session_from_cookies(cookies)
   csrf_token = _extract_xsrf_token_from_cookies(cookies)
-  target_semester_name = ''
-
-  try:
-    semesters = _fetch_semesters_via_cookie_session(cookies)
-  except HTTPException:
-    semesters = []
-
-  matched_semester = next(
-    (
-      item
-      for item in semesters
-      if _normalize_text(str(item.get('id') or item.get('semesterId') or '')) == target_semester_id
-    ),
-    None,
-  )
-  if matched_semester is not None:
-    target_semester_name = _normalize_text(str(matched_semester.get('semesterName') or ''))
+  target_semester_name = _normalize_text(semester_name)
 
   api_url = (
     f'https://{LEARN_HOST}/b/wlxt/kc/v_wlkc_xs_xkb_kcb_extend/student/'
@@ -2970,17 +2956,36 @@ def _ensure_api_ready_session(session: LearnSyncSession) -> list[dict[str, Any]]
   raise HTTPException(status_code=502, detail='当前同步会话没有可用的网络学堂登录 cookie。')
 
 
-def _load_semesters_for_session(session: LearnSyncSession) -> list[dict[str, Any]]:
+def _record_sync_timing(session: LearnSyncSession, key: str, started_at: float) -> None:
+  elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+  session.performance_timings_ms[key] = elapsed_ms
+  print(f'[tsinghua sync timing] {key}={elapsed_ms}ms')
+
+
+def _load_semesters_for_session(
+  session: LearnSyncSession,
+  *,
+  refresh: bool = False,
+) -> list[dict[str, Any]]:
   cookies = _ensure_api_ready_session(session)
-  return _fetch_semesters_via_cookie_session(cookies)
+  with session.metadata_cache_lock:
+    if session.semesters_cache is not None and not refresh:
+      return session.semesters_cache
+    started_at = time.perf_counter()
+    semesters = _fetch_semesters_via_cookie_session(cookies)
+    session.semesters_cache = semesters
+    _record_sync_timing(session, 'semester_load', started_at)
+    return semesters
 
 
 def _load_course_entries_for_session(
   session: LearnSyncSession,
   semester_id: str,
+  *,
+  refresh: bool = False,
 ) -> tuple[list[dict[str, str]], dict[str, Any] | None]:
   cookies = _ensure_api_ready_session(session)
-  semesters = _fetch_semesters_via_cookie_session(cookies)
+  semesters = _load_semesters_for_session(session, refresh=refresh)
   target_semester_id = _normalize_text(semester_id)
   matched_semester = next(
     (
@@ -2997,7 +3002,18 @@ def _load_course_entries_for_session(
   resolved_semester_id = _normalize_text(
     str((resolved_semester or {}).get('id') or (resolved_semester or {}).get('semesterId') or '')
   )
-  entries = _fetch_course_entries_for_semester_via_cookie_session(cookies, resolved_semester_id)
+  cache_key = resolved_semester_id or '__current__'
+  with session.metadata_cache_lock:
+    entries = None if refresh else session.course_entries_by_semester.get(cache_key)
+    if entries is None:
+      started_at = time.perf_counter()
+      entries = _fetch_course_entries_for_semester_via_cookie_session(
+        cookies,
+        resolved_semester_id,
+        semester_name=_normalize_text(str((resolved_semester or {}).get('semesterName') or '')),
+      )
+      session.course_entries_by_semester[cache_key] = entries
+      _record_sync_timing(session, f'course_list:{cache_key}', started_at)
   # A historical-term pageList response must never be reused for another term.
   # Keep only entries explicitly belonging to the semester selected for this request.
   if resolved_semester_id:
@@ -3195,6 +3211,7 @@ def _homework_catalog_by_course_identity(
     wlkcid=resolved_wlkcid,
     semester_id=_normalize_text(entry.get('semesterId')),
     semester_name=_normalize_text(entry.get('semesterName')),
+    detail_cache=session.homework_detail_cache,
   )
   session.updated_at = _utc_now()
   return records, matched_semester
@@ -3261,9 +3278,9 @@ def get_tsinghua_sync_status(session_id: str) -> dict[str, Any]:
 
 
 @tsinghua_router.get('/{session_id}/semesters')
-def get_tsinghua_sync_semesters(session_id: str) -> dict[str, Any]:
+def get_tsinghua_sync_semesters(session_id: str, refresh: bool = False) -> dict[str, Any]:
   session = _registry.get(session_id)
-  semesters = _load_semesters_for_session(session)
+  semesters = _load_semesters_for_session(session, refresh=refresh)
   current = next((item for item in semesters if item.get('isCurrent')), None)
   return {
     'sessionId': session.session_id,
@@ -3280,7 +3297,12 @@ def import_tsinghua_courses(
 ) -> dict[str, Any]:
   session = _registry.get(session_id)
   requested_semester_id = _normalize_text(str((payload or {}).get('semesterId') or ''))
-  courses, matched_semester = _load_course_entries_for_session(session, requested_semester_id)
+  refresh = bool((payload or {}).get('refresh'))
+  courses, matched_semester = _load_course_entries_for_session(
+    session,
+    requested_semester_id,
+    refresh=refresh,
+  )
   session.imported_courses = courses
   session.updated_at = _utc_now()
   return {

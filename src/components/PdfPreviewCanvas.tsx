@@ -5,6 +5,7 @@ import { useEffectEvent } from 'react'
 import { pdfPageRenderPriority } from '../lib/pdf-core/renderPriority'
 import { getPdfControllerId, pdfDiagnostic, pdfMark } from '../lib/pdf-core/performance'
 import { prefetchPdfPageSizes } from '../lib/pdf-core/pageSizePrefetch'
+import { notifyPdfFirstVisualReady } from '../lib/startupScheduler'
 import type {
   ClassroomLectureSegment,
   HomeworkKnowledgeLink,
@@ -525,6 +526,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   onUpdateAnnotation,
   onRemoveAnnotation,
   interactive = true,
+  renderPriority = 0,
 }: {
   pdfController: PdfController
   fallbackImageUrl?: string | null
@@ -555,6 +557,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
   ) => void
   onRemoveAnnotation?: (id: string) => void
   interactive?: boolean
+  renderPriority?: 0 | 1 | 2
 }) {
   const surfaceRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -676,6 +679,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       }
 
       pdfMark('render-start', pageNumber)
+      if (renderPriority > 0) pdfMark('neighbor-render-start', pageNumber)
       pdfDiagnostic('page render start', {
         controllerId: getPdfControllerId(pdfController),
         pageNumber,
@@ -769,7 +773,7 @@ const PdfPageCanvas = memo(function PdfPageCanvas({
       cancelled = true
       renderTask?.cancel()
     }
-  }, [interactive, pageNumber, pdfController])
+  }, [interactive, pageNumber, pdfController, renderPriority])
 
   useEffect(() => {
     setRasterReady(false)
@@ -1871,8 +1875,10 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
   const [viewportWidth, setViewportWidth] = useState(0)
   const [geometryVersion, setGeometryVersion] = useState(0)
   const [visualPages, setVisualPages] = useState<{ controller: PdfController | null; pages: Set<number> }>({ controller: null, pages: new Set() })
+  const [neighborRenderReleased, setNeighborRenderReleased] = useState(false)
   const isPageVisualReady = (number: number) =>
     visualPages.controller === pdfController && visualPages.pages.has(number)
+  const isCurrentPageVisualReady = isPageVisualReady(currentPage)
   const handlePageVisualReady = (number: number) => {
     setVisualPages(previous => ({
       controller: pdfController,
@@ -1882,6 +1888,8 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       pdfMark('prefetch-release', number)
     }
     if (number === currentPage) {
+      setNeighborRenderReleased(true)
+      notifyPdfFirstVisualReady(number)
       onVisualReady?.(number)
     }
   }
@@ -1935,6 +1943,20 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
       currentPage: currentPageRef.current,
     })
   }, [pdfController])
+
+  useEffect(() => {
+    if (!pdfController) return
+    if (isCurrentPageVisualReady) {
+      setNeighborRenderReleased(true)
+      return
+    }
+    setNeighborRenderReleased(false)
+    const safetyTimer = window.setTimeout(() => {
+      pdfMark('prefetch-safety-release', currentPage)
+      setNeighborRenderReleased(true)
+    }, 450)
+    return () => window.clearTimeout(safetyTimer)
+  }, [currentPage, isCurrentPageVisualReady, pdfController])
 
   useEffect(() => () => {
     if (questionAnchorTimerRef.current !== null) {
@@ -2377,10 +2399,17 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
     getFallbackRenderedPageWidth(pdfController, currentPage) ??
     renderedPagesRef.current.get(currentPage)?.width ??
     null
-  const effectiveViewportWidth = viewportRef.current?.clientWidth || viewportWidth || 0
+  const viewportElement = viewportRef.current
+  const measuredViewportWidth = viewportElement?.clientWidth || viewportWidth || 0
+  const viewportStyles = viewportElement ? window.getComputedStyle(viewportElement) : null
+  const horizontalViewportPadding = viewportStyles
+    ? (Number.parseFloat(viewportStyles.paddingLeft) || 0) +
+      (Number.parseFloat(viewportStyles.paddingRight) || 0)
+    : 0
+  const effectiveViewportWidth = Math.max(0, measuredViewportWidth - horizontalViewportPadding)
   const fitScale =
     currentPageWidth && effectiveViewportWidth
-      ? Math.min(1, Math.max(0.45, (effectiveViewportWidth - 52) / currentPageWidth))
+      ? Math.min(1, Math.max(0.45, effectiveViewportWidth / currentPageWidth))
       : 1
   const displayScale = zoom * fitScale
   return (
@@ -2479,8 +2508,14 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                 pageNumber,
                 displayScale,
               )
-              const priority = pdfPageRenderPriority(pageNumber, currentPage, pdfController.pageCount, isPageVisualReady)
-              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1
+              const priority = pdfPageRenderPriority(
+                pageNumber,
+                currentPage,
+                pdfController.pageCount,
+                isPageVisualReady,
+                neighborRenderReleased,
+              )
+              const shouldRenderPage = Math.abs(pageNumber - currentPage) <= 1 && priority !== null
               const hasLectureExplanation = lectureSegments.length > 0
               const hasPlayableLecture = lectureSegments.some(
                 (segment) =>
@@ -2610,6 +2645,7 @@ export const PdfPreviewCanvas = memo(function PdfPreviewCanvas({
                       onUpdateAnnotation={onUpdateAnnotation}
                       onRemoveAnnotation={onRemoveAnnotation}
                       interactive={!isReadonly}
+                      renderPriority={priority ?? 0}
                     />
                   ) : (
                     <div

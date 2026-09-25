@@ -7,6 +7,7 @@ const hookSource = readFileSync('src/features/pdf-workspace/hooks/useReaderWorks
 const panelSource = readFileSync('src/features/pdf-workspace/components/WorkspacePanel.tsx', 'utf8')
 const activityBarSource = readFileSync('src/features/pdf-workspace/components/ReaderActivityBar.tsx', 'utf8')
 const readerCss = readFileSync('src/features/pdf-workspace/styles/reader-floating-ui.css', 'utf8')
+const appCss = readFileSync('src/App.css', 'utf8')
 
 test('reader workspace uses IDE-style activity rails around collapsible side panels', () => {
   assert.match(layoutSource, /reader-workspace__main/)
@@ -30,14 +31,13 @@ test('classroom tools, grading and history live on the left while AI owns the ri
   assert.match(layoutSource, /left\.panel === 'history'/)
   assert.match(layoutSource, /title="AI 助手"/)
   assert.match(layoutSource, /id: 'related' as const, label: '习题关联'/)
-  assert.match(layoutSource, /clamp\(280px, 22vw, 360px\)/)
-  assert.match(layoutSource, /clamp\(360px, 27vw, 460px\)/)
+  assert.match(layoutSource, /clamp\(300px, 20vw, 350px\)/)
+  assert.match(layoutSource, /clamp\(380px, 25vw, 440px\)/)
 })
 
 test('workspace opens by click, closes by repeat click or Escape, and keeps PDF mounted', () => {
-  assert.match(hookSource, /WIDE_LAYOUT/)
-  assert.match(hookSource, /left: \{ panel: 'related' \}/)
-  assert.match(hookSource, /right: \{ panel: 'chat' \}/)
+  assert.match(hookSource, /useState<WorkspaceLayoutState>\(EMPTY_LAYOUT\)/)
+  assert.doesNotMatch(hookSource, /WIDE_LAYOUT/)
   assert.match(hookSource, /const togglePanel/)
   assert.match(hookSource, /current\.panel === panel/)
   assert.match(hookSource, /mode !== 'wide'/)
@@ -49,13 +49,25 @@ test('workspace opens by click, closes by repeat click or Escape, and keeps PDF 
   assert.doesNotMatch(readerCss.split('@media (max-width: 899px)')[0], /\.reader-workspace__left[^}]*position: absolute/s)
 })
 
+test('reader uses a full-height layout with readable controls and no legacy grid override', () => {
+  assert.match(readerCss, /--reader-rail-width: 56px/)
+  assert.match(readerCss, /grid-template-rows: 60px minmax\(0, 1fr\)/)
+  assert.match(readerCss, /\.octopus-app-header--reader \{[^}]*height: 60px/s)
+  assert.match(readerCss, /\.pdf-stage__viewport \{[^}]*padding: 24px 32px 76px/s)
+  assert.doesNotMatch(readerCss, /\.reader-workspace\s*\{[^}]*transform:\s*scale\(/s)
+  assert.doesNotMatch(readerCss, /\bzoom\s*:/)
+  assert.doesNotMatch(appCss, /\.pdf-workspace__reader-grid\s*\{/)
+  assert.match(appCss, /\.app-shell--reader-page\s*\{[^}]*padding-bottom:\s*0/s)
+  assert.doesNotMatch(appCss, /\.app-shell--reader-page\s*\{[^}]*padding-bottom:\s*14px/s)
+})
+
 test('activity rails expose settings, accessible toggles and mobile drawers', () => {
   assert.match(activityBarSource, /to="\/settings\/api"/)
   assert.match(activityBarSource, /aria-pressed=\{active\}/)
   assert.match(activityBarSource, /active \? `收起\$\{item\.label\}` : `打开\$\{item\.label\}`/)
   assert.match(activityBarSource, /reader-activity-bar--\$\{side\}/)
   assert.match(readerCss, /@media \(max-width: 899px\)/)
-  assert.match(readerCss, /width: min\(390px, calc\(100% - 112px\)\)/)
+  assert.match(readerCss, /width: min\(410px, calc\(100% - 128px\)\)/)
   assert.match(readerCss, /@media \(max-width: 640px\)/)
   assert.match(readerCss, /flex-direction: row/)
   assert.match(readerCss, /@media \(prefers-reduced-motion: reduce\)/)

@@ -16,6 +16,7 @@ import {
   type TsinghuaSemesterOption,
 } from '../lib/tsinghuaCourses'
 import { useKnowledgeLibraryState } from '../features/knowledge-library/useKnowledgeLibraryState'
+import { KnowledgeLibraryConnectionError } from '../features/knowledge-library/KnowledgeLibraryConnectionError'
 import { getKnowledgeCourseDisplayName } from '../lib/knowledgeBaseCourses'
 
 function formatCourseMeta(fileCount: number) {
@@ -29,7 +30,7 @@ type CourseSyncPickerItem = {
 
 export function DashboardPage() {
   const navigate = useNavigate()
-  const { knowledgeLibrary, isReady } = useKnowledgeLibraryState()
+  const { knowledgeLibrary, isReady, loadError, retryConnection } = useKnowledgeLibraryState()
   const [courseName, setCourseName] = useState('')
   const [syncBusy, setSyncBusy] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
@@ -439,6 +440,8 @@ export function DashboardPage() {
             <strong>还没有课程知识库</strong>
             <p>你可以先手动创建课程，或者直接从网络学堂同步课程列表。</p>
           </div>
+        ) : loadError ? (
+          <KnowledgeLibraryConnectionError onRetry={retryConnection} />
         ) : (
           <div className="octopus-empty-card">
             <strong>正在加载知识库</strong>

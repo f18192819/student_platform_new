@@ -17,11 +17,6 @@ const EMPTY_LAYOUT: WorkspaceLayoutState = {
   right: { panel: null },
 }
 
-const WIDE_LAYOUT: WorkspaceLayoutState = {
-  left: { panel: 'related' },
-  right: { panel: 'chat' },
-}
-
 function slotOf(panel: WorkspacePanelId): keyof WorkspaceLayoutState {
   return panel === 'chat' ? 'right' : 'left'
 }
@@ -34,9 +29,7 @@ function viewportMode(): WorkspaceLayoutMode {
 
 export function useReaderWorkspacePanels() {
   const [mode, setMode] = useState<WorkspaceLayoutMode>(viewportMode)
-  const [layout, setLayout] = useState<WorkspaceLayoutState>(() => (
-    viewportMode() === 'wide' ? WIDE_LAYOUT : EMPTY_LAYOUT
-  ))
+  const [layout, setLayout] = useState<WorkspaceLayoutState>(EMPTY_LAYOUT)
   const lastPanelRef = useRef<WorkspacePanelId | null>(null)
 
   const openPanel = useCallback((panel: WorkspacePanelId) => {

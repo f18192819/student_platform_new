@@ -56,10 +56,10 @@ function openDatabase() {
 }
 
 export function getLessonRecordingOwnerId() {
-  const existing = window.sessionStorage.getItem(OWNER_KEY)?.trim()
+  const existing = window.localStorage.getItem(OWNER_KEY)?.trim()
   if (existing) return existing
-  const ownerId = crypto.randomUUID()
-  window.sessionStorage.setItem(OWNER_KEY, ownerId)
+  const ownerId = window.sessionStorage.getItem(OWNER_KEY)?.trim() || crypto.randomUUID()
+  window.localStorage.setItem(OWNER_KEY, ownerId)
   return ownerId
 }
 
@@ -133,13 +133,14 @@ async function chunksForDraft(database: IDBDatabase, draftId: string) {
   return chunks.sort((left, right) => left.order - right.order)
 }
 
-export async function readLessonRecordingDrafts(ownerId: string) {
+export async function readLessonRecordingDrafts(ownerId: string, includeLegacyOwners = false) {
   const database = await openDatabase()
   try {
     const transaction = database.transaction(DRAFT_STORE, 'readonly')
     const drafts = await requestResult(transaction.objectStore(DRAFT_STORE).getAll()) as LessonRecordingDraft[]
     await transactionDone(transaction)
-    const owned = drafts.filter((draft) => draft.ownerId === ownerId)
+    // Older drafts used a tab-scoped owner ID that vanished when the browser closed.
+    const owned = drafts.filter((draft) => includeLegacyOwners || draft.ownerId === ownerId)
     return Promise.all(owned.map(async (draft) => ({
       draft,
       blob: new Blob(

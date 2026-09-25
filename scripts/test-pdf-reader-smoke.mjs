@@ -90,6 +90,29 @@ async function assertNoCanvasLifecycleViolations(page) {
   assert.deepEqual(violations, [], JSON.stringify(violations, null, 2))
 }
 
+async function readFirstVisualTiming(page, pageNumber) {
+  return page.evaluate((number) => {
+    const marks = performance.getEntriesByType('mark')
+    const find = (prefix) => marks.find(entry => entry.name.startsWith(prefix))?.startTime ?? null
+    const documentReady = find('pdf:document-ready:')
+    const renderStart = find(`pdf:render-start:page-${number}:`)
+    const renderComplete = find(`pdf:render-complete:page-${number}:`)
+    const visualReady = find(`pdf:visual-ready:page-${number}:`)
+    const neighborRenderStart = marks.find(
+      entry => entry.name.startsWith('pdf:render-start:page-')
+        && !entry.name.startsWith(`pdf:render-start:page-${number}:`),
+    )?.startTime ?? null
+    return {
+      documentReadyToFirstVisualMs:
+        documentReady === null || visualReady === null ? null : visualReady - documentReady,
+      currentRenderMs:
+        renderStart === null || renderComplete === null ? null : renderComplete - renderStart,
+      neighborStartedBeforeFirstVisual:
+        neighborRenderStart !== null && visualReady !== null && neighborRenderStart < visualReady,
+    }
+  }, pageNumber)
+}
+
 async function waitForDocument(page, name, pageNumber) {
   try {
     await page.locator('.pdf-stage__document strong').filter({ hasText: name }).waitFor({ state: 'visible' })
@@ -130,6 +153,92 @@ async function openDirectLecture(page, fileId, pageNumber) {
   })
   const name = fileId === 'smoke-a' ? 'Smoke A.pdf' : fileId === 'smoke-b' ? 'Smoke B.pdf' : 'Smoke 120.pdf'
   await waitForDocument(page, name, pageNumber)
+}
+
+async function readReaderLayout(page) {
+  return page.evaluate(() => {
+    const measure = (selector) => {
+      const element = document.querySelector(selector)
+      if (!(element instanceof HTMLElement)) return null
+      const rect = element.getBoundingClientRect()
+      return {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        width: rect.width,
+        height: rect.height,
+      }
+    }
+    return {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      shell: measure('.app-shell--reader-page'),
+      workspace: measure('.reader-workspace'),
+      main: measure('.reader-workspace__main'),
+      stage: measure('.reader-workspace__stage-frame'),
+      left: measure('.reader-workspace__left'),
+      right: measure('.reader-workspace__right'),
+      leftRail: measure('.reader-workspace__activity--left'),
+      rightRail: measure('.reader-workspace__activity--right'),
+      header: measure('.octopus-app-header--reader'),
+      leftOpen: document.querySelector('.reader-workspace__left')?.getAttribute('data-open'),
+      rightOpen: document.querySelector('.reader-workspace__right')?.getAttribute('data-open'),
+    }
+  })
+}
+
+function assertNear(actual, expected, tolerance, message) {
+  assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected} +/- ${tolerance}, got ${actual}`)
+}
+
+async function verifyReaderLayout(page, width, height) {
+  await page.setViewportSize({ width, height })
+  await openDirectLecture(page, 'smoke-a', 1)
+  let layout = await readReaderLayout(page)
+  assert.equal(layout.leftOpen, 'false')
+  assert.equal(layout.rightOpen, 'false')
+  assertNear(layout.shell.bottom, height, 2, 'reader shell bottom')
+  assertNear(layout.workspace.bottom, height, 2, 'reader workspace bottom')
+  assert.ok(layout.header.height >= 58 && layout.header.height <= 62, JSON.stringify(layout))
+  assertNear(layout.leftRail.width, 56, 1, 'left activity rail width')
+  assertNear(layout.rightRail.width, 56, 1, 'right activity rail width')
+  assert.ok(layout.stage.width >= layout.main.width * 0.8, JSON.stringify(layout))
+  const defaultStageWidth = layout.stage.width
+
+  await page.locator('.reader-activity-bar--right button').first().click()
+  await page.waitForTimeout(550)
+  layout = await readReaderLayout(page)
+  assert.equal(layout.rightOpen, 'true')
+  assert.ok(layout.right.width >= 378 && layout.right.width <= 442, JSON.stringify(layout))
+  assert.ok(defaultStageWidth - layout.stage.width >= layout.right.width - 3, JSON.stringify(layout))
+  assert.ok(layout.stage.right <= layout.right.left + 2, JSON.stringify(layout))
+
+  await page.locator('.reader-activity-bar--right button').first().click()
+  await page.waitForTimeout(550)
+  layout = await readReaderLayout(page)
+  assertNear(layout.stage.width, defaultStageWidth, 2, 'stage width after closing AI')
+
+  await page.locator('.reader-activity-bar--left button').nth(1).click()
+  await page.locator('.reader-activity-bar--right button').first().click()
+  await page.waitForTimeout(550)
+  layout = await readReaderLayout(page)
+  assert.equal(layout.leftOpen, 'true')
+  assert.equal(layout.rightOpen, 'true')
+  assert.ok(layout.left.width >= 298 && layout.left.width <= 352, JSON.stringify(layout))
+  assert.ok(layout.right.width >= 378 && layout.right.width <= 442, JSON.stringify(layout))
+  assert.ok(layout.left.right <= layout.stage.left + 2, JSON.stringify(layout))
+  assert.ok(layout.stage.right <= layout.right.left + 2, JSON.stringify(layout))
+
+  return {
+    viewport: `${width}x${height}`,
+    headerHeight: layout.header.height,
+    leftPanelWidth: layout.left.width,
+    rightPanelWidth: layout.right.width,
+    stageWidthWithBothPanels: layout.stage.width,
+    defaultStageWidth,
+    workspaceBottom: layout.workspace.bottom,
+  }
 }
 
 let browser
@@ -229,6 +338,11 @@ try {
   })
   await waitForDocument(page, 'Smoke A.pdf', 1)
   await assertNoCanvasLifecycleViolations(page)
+  const firstVisualTiming = await readFirstVisualTiming(page, 1)
+
+  const layoutMeasurements = []
+  layoutMeasurements.push(await verifyReaderLayout(page, 1440, 900))
+  layoutMeasurements.push(await verifyReaderLayout(page, 1920, 1080))
 
   await openLecture(page, 'smoke-landscape', 1)
   const landscape = await readPageGeometry(page, 1)
@@ -310,6 +424,8 @@ try {
     pdfReaderSmoke: 'passed',
     stabilityIterations: 10,
     rangeResponseCount: rangeResponses.filter(response => response.status === 206).length,
+    firstVisualTiming,
+    layoutMeasurements,
   }))
   await context.close()
 } finally {

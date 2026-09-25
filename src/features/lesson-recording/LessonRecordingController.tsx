@@ -46,7 +46,10 @@ export function LessonRecordingController() {
   const chunksRef = useRef<Blob[]>([])
   const chunkOrderRef = useRef(0)
   const chunkWritesRef = useRef<Promise<void>>(Promise.resolve())
-  const recoveryStartedRef = useRef(false)
+  const chunkWriteFailedRef = useRef(false)
+  const activeDraftIdsRef = useRef<Set<string>>(new Set())
+  const recoveryInFlightRef = useRef(false)
+  const recoveryScanRef = useRef<Promise<void>>(Promise.resolve())
   const startingRef = useRef(false)
 
   useEffect(() => {
@@ -126,7 +129,9 @@ export function LessonRecordingController() {
         await markLessonRecordingPending(draftId)
         const recovered = (await readLessonRecordingDrafts(getLessonRecordingOwnerId()))
           .find((item) => item.draft.id === draftId)
-        if (recovered?.blob.size) audioBlob = recovered.blob
+        if (!chunkWriteFailedRef.current && recovered?.blob.size === audioBlob.size) {
+          audioBlob = recovered.blob
+        }
       } catch (error) {
         console.warn('Failed to finalize the persistent recording draft:', error)
       }
@@ -138,57 +143,75 @@ export function LessonRecordingController() {
         console.warn('Failed to remove a submitted recording draft:', error)
       })
     }
+    if (draftId) activeDraftIdsRef.current.delete(draftId)
   }, [processRecording])
 
   const startRecording = useCallback(async () => {
     if (startingRef.current || mediaRecorderRef.current?.state === 'recording') return
     startingRef.current = true
+    let stream: MediaStream | null = null
+    let draftId: string | null = null
+    let draftCreationAttempted = false
 
     try {
       const context = { ...routeContextRef.current }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       const recorder = new MediaRecorder(stream)
-      let draftId: string | null = null
-      try {
-        const draft = await createLessonRecordingDraft({
-          ownerId: getLessonRecordingOwnerId(),
-          courseId: context.courseId,
-          documentId: context.documentId,
-          mimeType: recorder.mimeType || 'audio/webm',
-        })
-        draftId = draft.id
-      } catch (error) {
-        console.warn('Recording draft persistence is unavailable:', error)
-      }
+      await recoveryScanRef.current
+      draftCreationAttempted = true
+      const draft = await createLessonRecordingDraft({
+        ownerId: getLessonRecordingOwnerId(),
+        courseId: context.courseId,
+        documentId: context.documentId,
+        mimeType: recorder.mimeType || 'audio/webm',
+      })
+      draftId = draft.id
+      const createdDraftId = draft.id
 
       chunksRef.current = []
       chunkOrderRef.current = 0
       chunkWritesRef.current = Promise.resolve()
+      chunkWriteFailedRef.current = false
+      activeDraftIdsRef.current.add(createdDraftId)
       streamRef.current = stream
       mediaRecorderRef.current = recorder
 
       recorder.addEventListener('dataavailable', (event) => {
         if (!event.data.size) return
         chunksRef.current.push(event.data)
-        if (!draftId) return
         const order = chunkOrderRef.current++
         chunkWritesRef.current = chunkWritesRef.current
-          .then(() => appendLessonRecordingChunk(draftId, order, event.data))
-          .catch((error) => console.warn('Failed to persist a classroom recording chunk:', error))
+          .then(() => appendLessonRecordingChunk(createdDraftId, order, event.data))
+          .catch((error) => {
+            chunkWriteFailedRef.current = true
+            console.warn('Failed to persist a classroom recording chunk:', error)
+            emitLessonProcessingState('录音暂未完整保存，请正常结束录音并等待上传')
+          })
       })
       recorder.addEventListener(
         'stop',
-        () => void finalizeRecording(recorder, draftId, context),
+        () => void finalizeRecording(recorder, createdDraftId, context),
         { once: true },
       )
 
       recorder.start(1000)
       publishLessonRecordingState(true)
-      emitLessonProcessingState(draftId ? '录音中 · 已开启防丢保护' : '录音中 · 本地保护不可用')
+      emitLessonProcessingState('录音中 · 已开启防丢保护')
     } catch (error) {
       console.warn('Unable to start classroom recording:', error)
+      stream?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+      mediaRecorderRef.current = null
+      if (draftId) {
+        activeDraftIdsRef.current.delete(draftId)
+        await removeLessonRecordingDraft(draftId).catch((cleanupError) => {
+          console.warn('Failed to remove an unstarted recording draft:', cleanupError)
+        })
+      }
       publishLessonRecordingState(false)
-      emitLessonProcessingState('麦克风启动失败')
+      emitLessonProcessingState(
+        draftCreationAttempted ? '录音未开始：本地保存不可用' : stream ? '录音器启动失败' : '麦克风启动失败',
+      )
       window.setTimeout(() => emitLessonProcessingState(''), 3000)
     } finally {
       startingRef.current = false
@@ -202,13 +225,17 @@ export function LessonRecordingController() {
   }, [])
 
   useEffect(() => {
-    if (recoveryStartedRef.current) return
-    recoveryStartedRef.current = true
-
     const recoverInterruptedRecordings = async () => {
+      if (recoveryInFlightRef.current) return
+      recoveryInFlightRef.current = true
+      let finishScan: () => void = () => {}
+      recoveryScanRef.current = new Promise<void>((resolve) => { finishScan = resolve })
       try {
-        const drafts = await readLessonRecordingDrafts(getLessonRecordingOwnerId())
-        const recoverable = drafts.filter((item) => item.blob.size > 0)
+        const drafts = await readLessonRecordingDrafts(getLessonRecordingOwnerId(), true)
+        const recoverable = drafts.filter((item) =>
+          item.blob.size > 0 && !activeDraftIdsRef.current.has(item.draft.id),
+        )
+        finishScan()
         if (!recoverable.length) return
         emitLessonProcessingState(`正在恢复 ${recoverable.length} 段未提交录音`)
         for (const item of recoverable) {
@@ -222,10 +249,15 @@ export function LessonRecordingController() {
       } catch (error) {
         console.warn('Interrupted classroom recording recovery failed:', error)
         emitLessonProcessingState('录音恢复失败，可刷新重试')
+      } finally {
+        finishScan()
+        recoveryInFlightRef.current = false
       }
     }
 
     void recoverInterruptedRecordings()
+    window.addEventListener('online', recoverInterruptedRecordings)
+    return () => window.removeEventListener('online', recoverInterruptedRecordings)
   }, [processRecording])
 
   useEffect(() => {

@@ -153,6 +153,37 @@ class TsinghuaHomeworkTest(unittest.TestCase):
       homework_download_id('another-course', 'assignment-1', 'question-file'),
     )
 
+  def test_unchanged_assignment_reuses_cached_details(self):
+    row = {'zyid': 'assignment-1', 'bt': 'Assignment', '_state': 'pending'}
+    attachment = {
+      'attachmentId': 'question-file',
+      'fileName': 'assignment.pdf',
+      'byteSize': 42,
+      'mimeType': 'application/pdf',
+      'downloadPath': '/download/question-file',
+    }
+    detail_cache = {}
+    with (
+      patch('backend.tsinghua_homework._session', return_value=object()),
+      patch('backend.tsinghua_homework._assignment_rows', return_value=[row]),
+      patch(
+        'backend.tsinghua_homework._detail_attachments',
+        return_value=([attachment], 'Description'),
+      ) as detail,
+    ):
+      for _ in range(2):
+        fetch_homework_catalog(
+          [],
+          course_name='Course',
+          course_code='C1',
+          wlkcid='remote-course',
+          semester_id='2026-1',
+          semester_name='Current',
+          detail_cache=detail_cache,
+        )
+
+    self.assertEqual(1, detail.call_count)
+
   def test_download_writes_valid_pdf_and_hides_private_paths(self):
     response = FakeResponse(
       headers={

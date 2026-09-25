@@ -10,6 +10,8 @@ const SERVER_REFRESH_COOLDOWN_MS = 15_000
 
 export function useKnowledgeLibraryState() {
   const [isReady, setIsReady] = useState(false)
+  const [loadError, setLoadError] = useState(false)
+  const [retryCount, setRetryCount] = useState(0)
   const [version, setVersion] = useState(0)
   const isRefreshingRef = useRef(false)
   const lastServerRefreshAtRef = useRef(0)
@@ -20,6 +22,7 @@ export function useKnowledgeLibraryState() {
     const applyLocalSnapshot = () => {
       if (!cancelled) {
         setIsReady(true)
+        setLoadError(false)
         setVersion((current) => current + 1)
       }
     }
@@ -41,6 +44,7 @@ export function useKnowledgeLibraryState() {
         applyLocalSnapshot()
       } catch (error) {
         console.warn('refreshKnowledgeLibrary failed:', error)
+        if (!cancelled) setLoadError(true)
       } finally {
         isRefreshingRef.current = false
       }
@@ -53,6 +57,7 @@ export function useKnowledgeLibraryState() {
         applyLocalSnapshot()
       } catch (error) {
         console.warn('ensureKnowledgeLibraryLoaded failed:', error)
+        if (!cancelled) setLoadError(true)
       }
     }
 
@@ -72,10 +77,15 @@ export function useKnowledgeLibraryState() {
       window.removeEventListener('focus', handleFocus)
       window.removeEventListener(KNOWLEDGE_LIBRARY_UPDATED_EVENT, handleLibraryUpdated)
     }
-  }, [])
+  }, [retryCount])
 
   return {
     isReady,
+    loadError,
+    retryConnection: () => {
+      setLoadError(false)
+      setRetryCount((count) => count + 1)
+    },
     knowledgeLibrary: loadKnowledgeLibrary(),
     version,
   }

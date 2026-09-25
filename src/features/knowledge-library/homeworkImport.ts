@@ -13,6 +13,7 @@ import type { HomeworkDocument } from '../../types'
 import { applyQuestionPipelineResult } from './pipelineProjection'
 
 const SOURCE_KEY_PREFIX = 'tsinghua-homework:'
+let homeworkProcessingQueue: Promise<void> = Promise.resolve()
 
 export type HomeworkImportOutcome = {
   importedCount: number
@@ -44,12 +45,14 @@ export async function importHomeworkFiles({
   courseId,
   onProgressMessage,
   shouldImport,
+  processingMode = 'await',
 }: {
   remoteFiles: TsinghuaHomeworkFile[]
   fetchFile: (remoteFile: TsinghuaHomeworkFile) => Promise<Blob>
   courseId: string
   onProgressMessage?: (message: string) => void
   shouldImport?: (remoteFile: TsinghuaHomeworkFile) => boolean
+  processingMode?: 'await' | 'background'
 }): Promise<HomeworkImportOutcome> {
   let importedCount = 0
   let importFailedCount = 0
@@ -75,9 +78,29 @@ export async function importHomeworkFiles({
         await readHomeworkAssetPayload(file),
       )
       onProgressMessage?.(`正在解析作业 ${index + 1}/${remoteFiles.length}：${name}...`)
-      const result = await processHomeworkDocumentWithPipeline(file, courseId, 'homework', document.id)
-      replaceDocument(courseId, applyQuestionPipelineResult(document, result))
-      importedCount += 1
+      const savedDocument = document
+      const processDocument = async () => {
+        const result = await processHomeworkDocumentWithPipeline(file, courseId, 'homework', savedDocument.id)
+        replaceDocument(courseId, applyQuestionPipelineResult(savedDocument, result))
+      }
+      if (processingMode === 'background') {
+        homeworkProcessingQueue = homeworkProcessingQueue
+          .catch(() => undefined)
+          .then(processDocument)
+          .catch((error) => {
+            const reason = error instanceof Error ? error.message : 'Homework processing failed'
+            replaceDocument(courseId, {
+              ...savedDocument,
+              status: 'error',
+              errorMessage: reason,
+              updatedAt: new Date().toISOString(),
+            })
+          })
+        importedCount += 1
+      } else {
+        await processDocument()
+        importedCount += 1
+      }
     } catch (error) {
       importFailedCount += 1
       const reason = error instanceof Error ? error.message : '作业保存或解析失败'

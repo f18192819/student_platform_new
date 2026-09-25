@@ -56,6 +56,7 @@ import {
   importHomeworkFiles,
 } from '../features/knowledge-library/homeworkImport'
 import { useKnowledgeLibraryState } from '../features/knowledge-library/useKnowledgeLibraryState'
+import { KnowledgeLibraryConnectionError } from '../features/knowledge-library/KnowledgeLibraryConnectionError'
 import {
   applyQuestionPipelineResult,
   syncLecturePipelineResult,
@@ -240,7 +241,7 @@ function FolderCard({
 export function KnowledgeLibraryPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
-  const { knowledgeLibrary, isReady } = useKnowledgeLibraryState()
+  const { knowledgeLibrary, isReady, loadError, retryConnection } = useKnowledgeLibraryState()
   const courseId = searchParams.get('course')
   const folderTypeParam = searchParams.get('folder')
   const activeCourse =
@@ -900,7 +901,9 @@ export function KnowledgeLibraryPage() {
   let content: ReactNode
 
   if (!isReady) {
-    content = (
+    content = loadError ? (
+      <KnowledgeLibraryConnectionError onRetry={retryConnection} />
+    ) : (
       <section className="octopus-empty-card">
         <strong>正在加载知识库</strong>
         <p>项目目录中的课程与讲义正在同步到当前页面。</p>

@@ -33,6 +33,11 @@ import {
   notifyCoursewareAutoSyncStatus,
   type CoursewareAutoSyncDeletionDetail,
 } from './coursewareSyncEvents'
+import {
+  readAutoSyncLastCheckedAt,
+  shouldRunAutoSync,
+  writeAutoSyncLastCheckedAt,
+} from './autoSyncPolicy'
 
 const DEFAULT_COURSE_ID = 'general-course'
 const SOURCE_KEY_PREFIX = 'tsinghua-courseware:'
@@ -258,7 +263,7 @@ async function syncCoursewareForCourse(
       state: 'syncing',
       message: `已检查《${course.name}》，没有新的课件。`,
     })
-    return
+    return 0
   }
 
   notifyCoursewareAutoSyncStatus({
@@ -277,10 +282,12 @@ async function syncCoursewareForCourse(
       Boolean(getKnowledgeCourse(course.id))
       && !suppressedDuringRun.has(remoteSourceKey(remoteFile.id))
     ),
+    processingMode: 'background',
   })
   if (outcome.importFailedCount) {
     console.warn('[courseware auto sync] course import failed:', course.name, outcome.failureReasons)
   }
+  return newFiles.length
 }
 
 async function syncHomeworkForCourse(
@@ -326,7 +333,7 @@ async function syncHomeworkForCourse(
   })
   if (!newFiles.length) {
     notifyCoursewareAutoSyncStatus({ state: 'syncing', message: `已检查《${course.name}》，没有新的作业。` })
-    return
+    return 0
   }
   notifyCoursewareAutoSyncStatus({ state: 'syncing', message: `正在导入《${course.name}》的 ${newFiles.length} 份新作业。` })
   const outcome = await importHomeworkFiles({
@@ -336,13 +343,17 @@ async function syncHomeworkForCourse(
     onProgressMessage: (message) => notifyCoursewareAutoSyncStatus({ state: 'syncing', message }),
     shouldImport: (remoteFile) => Boolean(getKnowledgeCourse(course.id))
       && !suppressedDuringRun.has(homeworkSourceKey(remoteFile.id)),
+    processingMode: 'background',
   })
   if (outcome.importFailedCount) {
     console.warn('[homework auto sync] course import failed:', course.name, outcome.failureReasons)
   }
+  return newFiles.length
 }
 
 async function runAutoCoursewareSync() {
+  const syncStartedAt = performance.now()
+  const timings: Record<string, number> = {}
   const suppressedDuringRun = new Set<string>()
   const handleCoursewareDeletion = (event: Event) => {
     const detail = (event as CustomEvent<CoursewareAutoSyncDeletionDetail>).detail
@@ -370,6 +381,7 @@ async function runAutoCoursewareSync() {
     const autoSyncState = await loadTsinghuaCoursewareAutoSyncState()
     let sessionId: string | null = null
     try {
+      const sessionStartedAt = performance.now()
       sessionId = (await startTsinghuaSync()).sessionId
       if (!(await waitUntilTsinghuaSyncReady(sessionId))) {
         console.info('[courseware auto sync] network school session is not ready; will retry next launch.')
@@ -379,8 +391,11 @@ async function runAutoCoursewareSync() {
         })
         return
       }
+      timings.sessionReadyMs = Math.round(performance.now() - sessionStartedAt)
 
+      const semesterStartedAt = performance.now()
       const semesterResult = await loadTsinghuaSemesters(sessionId)
+      timings.semesterLoadMs = Math.round(performance.now() - semesterStartedAt)
       const currentSemesterId = String(
         semesterResult.currentSemesterId
           || semesterResult.semesters.find((semester) => semester.isCurrent)?.semesterId
@@ -405,41 +420,58 @@ async function runAutoCoursewareSync() {
         return
       }
 
+      const courseListStartedAt = performance.now()
       const remoteCourses = await resolveRemoteCoursesForLibrary(
         sessionId,
         currentSemesterCourses,
         currentSemesterId,
       )
+      timings.courseListMs = Math.round(performance.now() - courseListStartedAt)
 
+      let queuedResourceCount = 0
       for (const course of currentSemesterCourses) {
         const remoteCourse = remoteCourses.get(course.id)
         if (!remoteCourse) {
           continue
         }
         try {
-          await syncCoursewareForCourse(
+          const coursewareStartedAt = performance.now()
+          queuedResourceCount += await syncCoursewareForCourse(
             sessionId,
             course,
             remoteCourse,
             autoSyncState.suppressed,
             suppressedDuringRun,
           )
+          timings[`courseware:${course.id}`] = Math.round(performance.now() - coursewareStartedAt)
         } catch (error) {
           console.warn('[courseware auto sync] skipped courseware after sync error:', course.name, error)
         }
         try {
-          await syncHomeworkForCourse(
+          const homeworkStartedAt = performance.now()
+          queuedResourceCount += await syncHomeworkForCourse(
             sessionId,
             course,
             remoteCourse,
             autoSyncState.suppressed,
             suppressedDuringRun,
           )
+          timings[`homework:${course.id}`] = Math.round(performance.now() - homeworkStartedAt)
         } catch (error) {
           console.warn('[homework auto sync] skipped homework after sync error:', course.name, error)
         }
       }
-      notifyCoursewareAutoSyncStatus({ state: 'completed', message: '网络学堂课件与作业检查完成。' })
+      if (queuedResourceCount > 0) {
+        notifyCoursewareAutoSyncStatus({
+          state: 'completed',
+          message: `检查完成，${queuedResourceCount} 份新资料已保存，正在后台处理。`,
+        })
+      } else {
+        notifyCoursewareAutoSyncStatus({
+          state: 'completed',
+          message: '网络学堂课件与作业检查完成，没有发现新资料。',
+        })
+      }
     } finally {
       if (sessionId) {
         await closeTsinghuaSync(sessionId).catch((error) => {
@@ -454,14 +486,33 @@ async function runAutoCoursewareSync() {
     })
     throw error
   } finally {
+    console.info('[courseware auto sync timing]', {
+      ...timings,
+      totalMs: Math.round(performance.now() - syncStartedAt),
+    })
     window.removeEventListener(COURSEWARE_AUTO_SYNC_DELETION_EVENT, handleCoursewareDeletion)
   }
 }
 
-export function runAutoCoursewareSyncOnce() {
+export function runAutoCoursewareSyncOnce(options: { force?: boolean } = {}) {
+  if (!options.force) {
+    let lastCheckedAt: number | null = null
+    try {
+      lastCheckedAt = readAutoSyncLastCheckedAt(window.localStorage)
+    } catch (error) {
+      console.warn('[courseware auto sync] failed to read check TTL:', error)
+    }
+    if (!shouldRunAutoSync(lastCheckedAt)) return Promise.resolve()
+  }
   if (!runningAutoCoursewareSync) {
     runningAutoCoursewareSync = runAutoCoursewareSync().finally(() => {
-      runningAutoCoursewareSync = null
+      try {
+        writeAutoSyncLastCheckedAt(window.localStorage)
+      } catch (error) {
+        console.warn('[courseware auto sync] failed to persist check TTL:', error)
+      } finally {
+        runningAutoCoursewareSync = null
+      }
     })
   }
   return runningAutoCoursewareSync

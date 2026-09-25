@@ -18,6 +18,7 @@
   StoredDoubtAnnotation,
 } from '../types'
 import { resolveBackendApiUrl } from './apiConfig'
+import { withKnowledgeLibraryTimeout } from './knowledgeLibraryTimeout'
 import { migrateReaderChatSessions, normalizeDoubtChatSession } from './chatMemory'
 import {
   createKnowledgeCourseRecord,
@@ -703,12 +704,13 @@ async function readResponseError(response: Response, fallback: string) {
 
 async function fetchKnowledgeLibraryFromServer() {
   ensureWindow()
-  const response = await fetch(resolveBackendApiUrl('/api/knowledge/library'))
-  if (!response.ok) {
-    throw new Error(await readResponseError(response, `无法加载知识库 (HTTP ${response.status})`))
-  }
-
-  const payload = (await response.json().catch(() => ({}))) as Partial<KnowledgeLibrary>
+  const payload = await withKnowledgeLibraryTimeout(async (signal) => {
+    const response = await fetch(resolveBackendApiUrl('/api/knowledge/library'), { signal })
+    if (!response.ok) {
+      throw new Error(await readResponseError(response, `无法加载知识库 (HTTP ${response.status})`))
+    }
+    return (await response.json()) as Partial<KnowledgeLibrary>
+  })
   return setKnowledgeLibraryCache(payload)
 }
 

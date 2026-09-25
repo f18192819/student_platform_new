@@ -170,6 +170,14 @@ test('visual priority is current, next, then previous', () => {
   assert.equal(pdfPageRenderPriority(19, 20, 100, page => ready.has(page)), 2)
 })
 
+test('visual priority releases neighbors after the render safety timeout', () => {
+  const neverReady = () => false
+  assert.equal(pdfPageRenderPriority(21, 20, 100, neverReady), null)
+  assert.equal(pdfPageRenderPriority(19, 20, 100, neverReady), null)
+  assert.equal(pdfPageRenderPriority(21, 20, 100, neverReady, true), 1)
+  assert.equal(pdfPageRenderPriority(19, 20, 100, neverReady, true), 2)
+})
+
 test('upload and restore critical paths do not use full text extraction', () => {
   const source = readFileSync('src/pages/PdfWorkspacePage.tsx', 'utf8')
   const upload = source.slice(source.indexOf('const handlePdfChange'), source.indexOf('const handleInspectPageDoubts'))
@@ -178,11 +186,13 @@ test('upload and restore critical paths do not use full text extraction', () => 
   assert.match(source, /openPdfPreviewFromUrlWithFallback/)
 })
 
-test('reader rendering correctness does not depend on DOM-ready races or priority gates', () => {
+test('reader rendering gates neighbors on visual readiness with a timed safety release', () => {
   const source = readFileSync('src/components/PdfPreviewCanvas.tsx', 'utf8')
   const visualReady = source.slice(source.indexOf('const isPageVisualReady'), source.indexOf('const handlePageVisualReady'))
   assert.doesNotMatch(source, /pageRefs\.current\.clear\(\)/)
   assert.doesNotMatch(visualReady, /querySelector/)
-  assert.match(source, /const shouldRenderPage = Math\.abs\(pageNumber - currentPage\) <= 1/)
+  assert.match(source, /priority !== null/)
+  assert.match(source, /prefetch-safety-release/)
+  assert.match(source, /450/)
   assert.doesNotMatch(source, /contentVisibility/)
 })

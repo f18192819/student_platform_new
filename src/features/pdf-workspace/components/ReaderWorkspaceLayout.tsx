@@ -57,9 +57,9 @@ export function ReaderWorkspaceLayout({
       : '习题关联'
   const style = {
     '--reader-left-width': left.panel
-      ? left.panel === 'grading' ? 'clamp(360px, 27vw, 460px)' : 'clamp(280px, 22vw, 360px)'
+      ? left.panel === 'grading' ? 'clamp(400px, 24vw, 460px)' : 'clamp(300px, 20vw, 350px)'
       : '0px',
-    '--reader-right-width': right.panel ? 'clamp(360px, 27vw, 460px)' : '0px',
+    '--reader-right-width': right.panel ? 'clamp(380px, 25vw, 440px)' : '0px',
   } as CSSProperties
   const leftItems = [
     { id: 'classroom' as const, label: '课堂工具', badge: classroomBadge },

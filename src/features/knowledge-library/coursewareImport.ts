@@ -4,9 +4,11 @@ import {
   moveLectureDocumentToCourse,
   processLectureDocumentWithPipeline,
 } from '../../lib/mineru'
-import { extractPdfPreview, probePdfPageCount } from '../../lib/pdf'
+import { probePdfPageCountFromBuffer } from '../../lib/pdf'
 import type { TsinghuaCoursewareFile } from '../../lib/tsinghuaCourses'
 import type { KnowledgeFile } from '../../types'
+
+let coursewareProcessingQueue: Promise<void> = Promise.resolve()
 
 export type CoursewareImportOutcome = {
   importedCount: number
@@ -20,6 +22,7 @@ type ImportCoursewareFilesOptions = {
   resolveCourseId: (remoteFile: TsinghuaCoursewareFile) => Promise<string | null> | string | null
   onProgressMessage?: (message: string) => void
   shouldImport?: (remoteFile: TsinghuaCoursewareFile) => boolean
+  processingMode?: 'await' | 'background'
 }
 
 type StagedCoursewareFile = {
@@ -111,6 +114,7 @@ export async function importCoursewareFiles({
   resolveCourseId,
   onProgressMessage,
   shouldImport,
+  processingMode = 'await',
 }: ImportCoursewareFilesOptions): Promise<CoursewareImportOutcome> {
   let importedCount = 0
   let importFailedCount = 0
@@ -153,20 +157,10 @@ export async function importCoursewareFiles({
         continue
       }
       const pdfBuffer = await importedFile.arrayBuffer()
-      let markdown = ''
-      let pageCount = 0
-
-      try {
-        const preview = await extractPdfPreview(importedFile)
-        markdown = preview.markdown
-        pageCount = preview.pageCount
-      } catch (error) {
-        console.warn('courseware preview extraction failed, falling back to page count only:', error)
-        pageCount = await probePdfPageCount(importedFile).catch((pageCountError) => {
-          console.warn('courseware page-count probe failed:', pageCountError)
-          return 0
-        })
-      }
+      const pageCount = await probePdfPageCountFromBuffer(pdfBuffer).catch((pageCountError) => {
+        console.warn('courseware page-count probe failed:', pageCountError)
+        return 0
+      })
 
       const sourceKey = `tsinghua-courseware:${remoteFile.id}`
       const existingFile = getKnowledgeFileBySourceKey(sourceKey)
@@ -175,7 +169,7 @@ export async function importCoursewareFiles({
         fileName: importedFile.name,
         pageCount,
         byteSize: pdfBuffer.byteLength,
-        markdown,
+        markdown: '',
         layoutBlocks: [],
         pdfBuffer,
         courseId,
@@ -204,7 +198,8 @@ export async function importCoursewareFiles({
     onProgressMessage?.(`全部 ${stagedFiles.length} 份课件已保存，可立即预览；现在开始按队列解析。`)
   }
 
-  for (const [index, stagedFile] of stagedFiles.entries()) {
+  const processStagedFiles = async () => {
+    for (const [index, stagedFile] of stagedFiles.entries()) {
     const { remoteFile, importedFile, savedFile, movedBetweenCourses } = stagedFile
     if (shouldImport && !shouldImport(remoteFile)) {
       continue
@@ -286,7 +281,24 @@ export async function importCoursewareFiles({
         console.warn('failed to persist courseware indexing failure:', statusError)
       })
     }
+    }
   }
+
+  if (processingMode === 'background') {
+    coursewareProcessingQueue = coursewareProcessingQueue
+      .catch(() => undefined)
+      .then(processStagedFiles)
+      .catch((error) => {
+        console.error('background courseware processing failed:', error)
+      })
+    return {
+      importedCount: stagedFiles.length,
+      importFailedCount,
+      failureReasons,
+    }
+  }
+
+  await processStagedFiles()
 
   return {
     importedCount,

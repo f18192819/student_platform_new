@@ -25,6 +25,11 @@ class LearnSyncSession:
   title: str = ''
   cookies: list[dict[str, Any]] = field(default_factory=list)
   course_entries: list[dict[str, str]] = field(default_factory=list)
+  semesters_cache: list[dict[str, Any]] | None = None
+  course_entries_by_semester: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+  homework_detail_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+  metadata_cache_lock: Lock = field(default_factory=Lock, repr=False)
+  performance_timings_ms: dict[str, float] = field(default_factory=dict)
   imported_courses: list[dict[str, str]] = field(default_factory=list)
   downloaded_courseware: list[dict[str, Any]] = field(default_factory=list)
   downloaded_homework: list[dict[str, Any]] = field(default_factory=list)
@@ -53,6 +58,7 @@ class LearnSyncSession:
         'courseSample': sample,
         'importedCourses': self.imported_courses,
         'lastError': self.last_error,
+        'timingsMs': dict(self.performance_timings_ms),
         'createdAt': self.created_at,
         'updatedAt': self.updated_at,
       }
@@ -75,6 +81,7 @@ class LearnSyncSession:
         'courseSample': sample,
         'importedCourses': self.imported_courses,
         'lastError': self.last_error,
+        'timingsMs': dict(self.performance_timings_ms),
         'createdAt': self.created_at,
         'updatedAt': self.updated_at,
       }
@@ -87,6 +94,7 @@ class LearnSyncSession:
         'courseSample': [],
         'importedCourses': self.imported_courses,
         'lastError': self.last_error or str(exc),
+        'timingsMs': dict(self.performance_timings_ms),
         'createdAt': self.created_at,
         'updatedAt': self.updated_at,
       }
@@ -119,6 +127,7 @@ class LearnSyncRegistry:
     self._lock = Lock()
     self._login_lock = Lock()
     self._sessions: dict[str, LearnSyncSession] = {}
+    self._homework_detail_cache: dict[str, dict[str, Any]] = {}
 
   def _new_session_id(self) -> str:
     return f'learn-sync-{time.time_ns()}'
@@ -149,6 +158,7 @@ class LearnSyncRegistry:
       title='网络学堂',
       cookies=persisted_cookies,
       course_entries=course_entries,
+      homework_detail_cache=self._homework_detail_cache,
     )
     with self._lock:
       self._sessions[session_id] = session
@@ -188,6 +198,7 @@ class LearnSyncRegistry:
       updated_at=created_at,
       stage='navigating',
       current_url=self._deps.course_home_url,
+      homework_detail_cache=self._homework_detail_cache,
       title='网络学堂同步中',
     )
 

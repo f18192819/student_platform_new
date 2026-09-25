@@ -16,6 +16,10 @@ test('recording uses periodic IndexedDB chunks and only removes a draft after AS
   assert.match(controllerSource, /return recordingPersisted/)
   assert.match(draftSource, /createIndex\('draftId', 'draftId'/)
   assert.match(draftSource, /state: 'recording' \| 'pending'/)
+  assert.match(controllerSource, /const draft = await createLessonRecordingDraft/)
+  assert.doesNotMatch(controllerSource, /Recording draft persistence is unavailable/)
+  assert.match(controllerSource, /recovered\?\.blob\.size === audioBlob\.size/)
+  assert.match(controllerSource, /await recoveryScanRef\.current/)
 })
 
 test('refresh recovery submits persisted audio with its original context', () => {
@@ -23,6 +27,11 @@ test('refresh recovery submits persisted audio with its original context', () =>
   assert.match(controllerSource, /刷新前的课堂录音/)
   assert.match(controllerSource, /item\.draft\.courseId/)
   assert.match(controllerSource, /if \(saved\) await removeLessonRecordingDraft/)
+  assert.match(controllerSource, /readLessonRecordingDrafts\(getLessonRecordingOwnerId\(\), true\)/)
+  assert.match(controllerSource, /window\.addEventListener\('online', recoverInterruptedRecordings\)/)
+  assert.match(draftSource, /window\.localStorage\.getItem\(OWNER_KEY\)/)
+  assert.match(draftSource, /window\.localStorage\.setItem\(OWNER_KEY, ownerId\)/)
+  assert.match(draftSource, /includeLegacyOwners \|\| draft\.ownerId === ownerId/)
   assert.match(controllerSource, /visibilitychange/)
   assert.match(controllerSource, /requestData\(\)/)
 })

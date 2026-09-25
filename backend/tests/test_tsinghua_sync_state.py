@@ -11,6 +11,11 @@ from backend.tsinghua_courseware_state import (
   restore_deleted_synced_courseware,
 )
 from backend.tsinghua_sync_state import LearnSyncRegistry, LearnSyncRegistryDeps
+from backend.tsinghua_sync_state import LearnSyncSession
+from backend.tsinghua_sync import (
+  _load_course_entries_for_session,
+  _load_semesters_for_session,
+)
 
 
 class TsinghuaSyncStateTest(unittest.TestCase):
@@ -54,6 +59,14 @@ class TsinghuaSyncStateTest(unittest.TestCase):
     self.assertEqual(0, self.login_calls)
     self.assertEqual('course-1', session.course_entries[0]['courseId'])
 
+  def test_homework_detail_cache_survives_session_recreation(self):
+    first = self.registry.create()
+    first.homework_detail_cache['course:assignment'] = {'revision': 'r1'}
+    second = self.registry.create()
+
+    self.assertIs(first.homework_detail_cache, second.homework_detail_cache)
+    self.assertEqual('r1', second.homework_detail_cache['course:assignment']['revision'])
+
   def test_close_is_idempotent_and_removes_runtime_directory(self):
     session = self.registry.create()
 
@@ -75,6 +88,30 @@ class TsinghuaSyncStateTest(unittest.TestCase):
 
       restore_deleted_synced_courseware({'tsinghua-homework:homework-1'})
       self.assertEqual([], load_suppressed_courseware())
+
+  def test_session_loads_semesters_only_once(self):
+    session = LearnSyncSession(session_id='cache-test', cookies=self.cookies)
+    semesters = [{'id': '2026-1', 'semesterName': 'Current', 'isCurrent': True}]
+    with patch('backend.tsinghua_sync._fetch_semesters_via_cookie_session', return_value=semesters) as fetch:
+      self.assertEqual(semesters, _load_semesters_for_session(session))
+      self.assertEqual(semesters, _load_semesters_for_session(session))
+    self.assertEqual(1, fetch.call_count)
+
+  def test_session_loads_each_semester_course_list_only_once(self):
+    session = LearnSyncSession(session_id='course-cache-test', cookies=self.cookies)
+    semesters = [{'id': '2026-1', 'semesterName': 'Current', 'isCurrent': True}]
+    courses = [{'courseId': 'course-1', 'name': 'Course', 'semesterId': '2026-1'}]
+    with (
+      patch('backend.tsinghua_sync._fetch_semesters_via_cookie_session', return_value=semesters) as semester_fetch,
+      patch(
+        'backend.tsinghua_sync._fetch_course_entries_for_semester_via_cookie_session',
+        return_value=courses,
+      ) as course_fetch,
+    ):
+      _load_course_entries_for_session(session, '2026-1')
+      _load_course_entries_for_session(session, '2026-1')
+    self.assertEqual(1, semester_fetch.call_count)
+    self.assertEqual(1, course_fetch.call_count)
 
 
 if __name__ == '__main__':

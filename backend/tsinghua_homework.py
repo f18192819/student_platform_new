@@ -113,6 +113,16 @@ def _assignment_rows(
   return rows
 
 
+def _assignment_revision(row: dict[str, Any]) -> str:
+  observable = {
+    key: value
+    for key, value in row.items()
+    if isinstance(value, (str, int, float, bool)) or value is None
+  }
+  encoded = json.dumps(observable, ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')
+  return hashlib.sha256(encoded).hexdigest()
+
+
 def _parse_byte_size(value: str) -> int:
   match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(B|K|KB|M|MB|G|GB)?', value, re.I)
   if not match:
@@ -220,6 +230,7 @@ def fetch_homework_catalog(
   wlkcid: str,
   semester_id: str,
   semester_name: str,
+  detail_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
   if not wlkcid:
     raise HTTPException(status_code=422, detail='当前课程缺少 wlkcid，无法拉取作业。')
@@ -228,7 +239,20 @@ def fetch_homework_catalog(
   for row in _assignment_rows(session, cookies, wlkcid):
     assignment_id = str(row.get('zyid') or '').strip()
     title = str(row.get('bt') or '未命名作业').strip()
-    attachments, description = _detail_attachments(session, cookies, wlkcid, row)
+    cache_key = f'{wlkcid}:{assignment_id}'
+    revision = _assignment_revision(row)
+    cached = (detail_cache or {}).get(cache_key)
+    if cached and cached.get('revision') == revision:
+      attachments = [dict(item) for item in cached.get('attachments', [])]
+      description = str(cached.get('description') or '')
+    else:
+      attachments, description = _detail_attachments(session, cookies, wlkcid, row)
+      if detail_cache is not None:
+        detail_cache[cache_key] = {
+          'revision': revision,
+          'attachments': [dict(item) for item in attachments],
+          'description': description,
+        }
     for attachment in attachments:
       attachment_id = str(attachment['attachmentId'])
       file_id = homework_download_id(wlkcid, assignment_id, attachment_id)

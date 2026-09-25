@@ -10,6 +10,7 @@ import { StudyPlanPage } from './pages/StudyPlanPage'
 import { LessonRecordingController } from './features/lesson-recording/LessonRecordingController'
 import { runAutoCoursewareSyncOnce } from './features/knowledge-library/autoCoursewareSync'
 import { resumePendingQuestionDocuments } from './lib/questionPipeline'
+import { scheduleStartupTask } from './lib/startupScheduler'
 import {
   COURSEWARE_AUTO_SYNC_STATUS_EVENT,
   type CoursewareAutoSyncStatusDetail,
@@ -21,34 +22,34 @@ function App() {
   const [coursewareSyncStatus, setCoursewareSyncStatus] = useState<CoursewareAutoSyncStatusDetail | null>(null)
 
   useEffect(() => {
-    const startAutoCoursewareSync = () => {
-      void runAutoCoursewareSyncOnce().catch((error) => {
-        console.info('[courseware auto sync] startup check deferred:', error)
-      })
+    let cancelSync: () => void = () => undefined
+    let cancelQuestionRecovery: () => void = () => undefined
+    const scheduleStartupWork = () => {
+      cancelSync()
+      cancelQuestionRecovery()
+      cancelSync = scheduleStartupTask(() => {
+        void runAutoCoursewareSyncOnce().catch((error) => {
+          console.info('[courseware auto sync] startup check deferred:', error)
+        })
+      }, { waitForPdfVisual: isReaderPage })
+      cancelQuestionRecovery = scheduleStartupTask(() => {
+        void resumePendingQuestionDocuments().catch((error) => {
+          console.info('[question pipeline] startup recovery check deferred:', error)
+        })
+      }, { waitForPdfVisual: isReaderPage, delayMs: 1_200 })
     }
 
-    const startupTimer = window.setTimeout(startAutoCoursewareSync, 0)
-    window.addEventListener('pageshow', startAutoCoursewareSync)
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) scheduleStartupWork()
+    }
+    scheduleStartupWork()
+    window.addEventListener('pageshow', handlePageShow)
     return () => {
-      window.clearTimeout(startupTimer)
-      window.removeEventListener('pageshow', startAutoCoursewareSync)
+      cancelSync()
+      cancelQuestionRecovery()
+      window.removeEventListener('pageshow', handlePageShow)
     }
-  }, [])
-
-  useEffect(() => {
-    const checkPendingQuestions = () => {
-      void resumePendingQuestionDocuments().catch((error) => {
-        console.info('[question pipeline] startup recovery check deferred:', error)
-      })
-    }
-
-    const startupTimer = window.setTimeout(checkPendingQuestions, 0)
-    window.addEventListener('pageshow', checkPendingQuestions)
-    return () => {
-      window.clearTimeout(startupTimer)
-      window.removeEventListener('pageshow', checkPendingQuestions)
-    }
-  }, [])
+  }, [isReaderPage])
 
   useEffect(() => {
     let dismissTimer: number | null = null
